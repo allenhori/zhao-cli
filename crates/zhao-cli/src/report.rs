@@ -12,6 +12,10 @@ use zhao_core::diff::Change;
 use zhao_core::model::JoinKind;
 use zhao_core::rules::{Finding, FindingDetail, Severity};
 
+/// The message included in a [`Report`] when the Baseline's merge-base has
+/// fallen behind the target branch's current tip.
+pub const STALENESS_WARNING: &str = "analysis may be stale, consider rebasing";
+
 /// The full JSON payload for a `zhao check` run.
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -19,19 +23,40 @@ pub struct Report {
     pub changes: Vec<ChangeJson>,
     /// Every Rule that fired against those Changes.
     pub findings: Vec<FindingJson>,
+    /// Present when the target branch has moved on since the Baseline's
+    /// merge-base, so this run's analysis may not reflect the target
+    /// branch's latest state. Purely informational: never affects
+    /// [`Report::is_breaking`] or the process exit code, regardless of
+    /// Preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub staleness_warning: Option<String>,
 }
 
 impl Report {
     /// Builds a [`Report`] from the engine's own `Change`/`Finding` output.
+    /// No staleness warning is set -- chain [`Report::with_staleness_warning`]
+    /// to add one.
     pub fn new(changes: &[Change], findings: &[Finding]) -> Self {
         Self {
             changes: changes.iter().map(ChangeJson::from).collect(),
             findings: findings.iter().map(FindingJson::from).collect(),
+            staleness_warning: None,
         }
     }
 
+    /// Sets this report's staleness warning: `Some(`[`STALENESS_WARNING`]`)`
+    /// if the Baseline's merge-base is behind the target branch's current
+    /// tip, `None` otherwise (including when that couldn't be determined
+    /// at all, e.g. outside a git repository -- staleness is purely
+    /// best-effort and informational, never a hard requirement).
+    pub fn with_staleness_warning(mut self, is_stale: bool) -> Self {
+        self.staleness_warning = is_stale.then(|| STALENESS_WARNING.to_string());
+        self
+    }
+
     /// Whether this run's Findings should fail the CI gate: any Finding
-    /// at [`Severity::Error`].
+    /// at [`Severity::Error`]. A staleness warning never contributes here,
+    /// under any Preset.
     pub fn is_breaking(&self) -> bool {
         self.findings
             .iter()
@@ -247,11 +272,17 @@ fn join_kind_slug(kind: JoinKind) -> String {
 /// report (a later, dedicated ticket) -- just enough to make `zhao
 /// check`'s default (non-JSON) output usable today.
 pub fn render_text(report: &Report) -> String {
-    if report.findings.is_empty() && report.changes.is_empty() {
-        return "No changes detected.\n".to_string();
+    let mut out = String::new();
+
+    if let Some(warning) = &report.staleness_warning {
+        out.push_str(&format!("warning: {warning}\n"));
     }
 
-    let mut out = String::new();
+    if report.findings.is_empty() && report.changes.is_empty() {
+        out.push_str("No changes detected.\n");
+        return out;
+    }
+
     for finding in &report.findings {
         out.push_str(&format!(
             "[{:?}] {}\n",

@@ -670,3 +670,160 @@ mod git_native_baseline {
             .stderr(predicate::str::contains("merge-base"));
     }
 }
+
+// ---------------------------------------------------------------------
+// Staleness warning: a non-blocking notice when the target branch has
+// moved on since the Baseline's merge-base. Exercised via `--state` (not
+// git-native Baseline resolution) so these tests only need a real git
+// repo, not a `dbt` install of any kind -- staleness is orthogonal to how
+// the Baseline itself was resolved.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+mod staleness_warning {
+    use super::*;
+    use std::process::Command as StdCommand;
+
+    struct TestRepo {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl TestRepo {
+        fn git(&self, args: &[&str]) {
+            let output = StdCommand::new("git")
+                .current_dir(&self.path)
+                .args(args)
+                .output()
+                .expect("git should be runnable in tests");
+            assert!(
+                output.status.success(),
+                "git {args:?} should succeed: {output:?}"
+            );
+        }
+
+        fn commit(&self, relative_path: &str, contents: &str, message: &str) {
+            std::fs::write(self.path.join(relative_path), contents).expect("should write file");
+            self.git(&["add", "."]);
+            self.git(&["commit", "-m", message]);
+        }
+    }
+
+    /// A repo with one commit on `master`, and a `feature` branch (left
+    /// checked out) one commit ahead -- not yet stale, since `master`
+    /// hasn't moved since `feature` diverged from it.
+    fn up_to_date_repo() -> TestRepo {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = dir.path().to_path_buf();
+        let repo = TestRepo { _dir: dir, path };
+
+        repo.git(&["init", "--initial-branch=master"]);
+        repo.git(&["config", "user.email", "test@zhao.invalid"]);
+        repo.git(&["config", "user.name", "zhao test"]);
+        // Ignored up front so a later `git add .` (e.g. when committing on
+        // `master` in `stale_repo`) never accidentally sweeps up the
+        // untracked `target/manifest.json` written below -- a real dbt
+        // project gitignores `target/` for the same reason.
+        repo.commit(".gitignore", "target/\n", "ignore target/");
+        repo.commit("README.md", "on master\n", "on master");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.commit("README.md", "on feature\n", "feature work, ahead of master");
+
+        std::fs::create_dir_all(repo.path.join("target")).expect("should create target dir");
+        std::fs::copy(
+            fixture("clean_project")
+                .join("target")
+                .join("manifest.json"),
+            repo.path.join("target").join("manifest.json"),
+        )
+        .expect("should copy fixture manifest");
+
+        repo
+    }
+
+    /// Same as [`up_to_date_repo`], but with an extra commit landed on
+    /// `master` after `feature` branched off -- `feature`'s merge-base
+    /// with `master` is now behind `master`'s tip, i.e. stale.
+    fn stale_repo() -> TestRepo {
+        let repo = up_to_date_repo();
+        repo.git(&["checkout", "master"]);
+        repo.commit(
+            "README.md",
+            "on master, updated after feature branched off\n",
+            "a new commit landed on master after feature branched off",
+        );
+        repo.git(&["checkout", "feature"]);
+        repo
+    }
+
+    fn check_command(repo: &TestRepo) -> Command {
+        let mut cmd = Command::cargo_bin("zhao").expect("binary should build");
+        cmd.arg("check")
+            .arg("--state")
+            .arg(fixture("diff_baseline_manifest_clean.json"))
+            .arg("--project-dir")
+            .arg(&repo.path);
+        cmd
+    }
+
+    /// Acceptance criterion 1: a branch whose merge-base matches the
+    /// target branch's current tip produces no staleness warning, in
+    /// either output format.
+    #[test]
+    fn no_warning_when_the_merge_base_matches_the_target_branchs_tip() {
+        let repo = up_to_date_repo();
+
+        check_command(&repo)
+            .arg("--format")
+            .arg("json")
+            .assert()
+            .code(0)
+            .stdout(predicate::str::contains("staleness_warning").not());
+
+        check_command(&repo)
+            .assert()
+            .code(0)
+            .stdout(predicate::str::contains("warning:").not());
+    }
+
+    /// Acceptance criterion 2: a branch whose merge-base is behind the
+    /// target branch's current tip produces the warning, in both JSON and
+    /// human-readable output.
+    #[test]
+    fn warns_when_the_merge_base_is_behind_the_target_branchs_tip() {
+        let repo = stale_repo();
+
+        check_command(&repo)
+            .arg("--format")
+            .arg("json")
+            .assert()
+            .code(0)
+            .stdout(predicate::str::contains(
+                "\"staleness_warning\": \"analysis may be stale, consider rebasing\"",
+            ));
+
+        check_command(&repo)
+            .assert()
+            .code(0)
+            .stdout(predicate::str::contains(
+                "warning: analysis may be stale, consider rebasing",
+            ));
+    }
+
+    /// Acceptance criterion 3: the staleness warning never changes the
+    /// exit code, even under a `strict` Preset (which raises every Rule's
+    /// Severity, including ones that would otherwise be non-breaking).
+    #[test]
+    fn the_warning_never_changes_the_exit_code_even_under_a_strict_preset() {
+        let repo = stale_repo();
+        std::fs::write(repo.path.join("zhao.yml"), "preset: strict\n")
+            .expect("should write zhao.yml");
+
+        check_command(&repo)
+            .arg("--format")
+            .arg("json")
+            .assert()
+            .code(0)
+            .stdout(predicate::str::contains("\"staleness_warning\":"));
+    }
+}

@@ -106,6 +106,16 @@ pub enum GitError {
         #[source]
         source: std::io::Error,
     },
+    /// `ref_name` doesn't resolve to a commit in this repository.
+    #[error("{repo_root}: {ref_name:?} does not resolve to a commit ({stderr})")]
+    RefNotFound {
+        /// The repository `ref_name` was looked up in.
+        repo_root: String,
+        /// The ref that couldn't be resolved.
+        ref_name: String,
+        /// `git`'s captured stderr.
+        stderr: String,
+    },
 }
 
 /// Finds the root of the git repository containing `dir`
@@ -145,6 +155,30 @@ pub fn resolve_merge_base(repo_root: &Path, against: &str) -> Result<String, Git
         });
     }
     Ok(stdout_of(&output))
+}
+
+/// Resolves `ref_name` (a branch, tag, or commit-ish) to its current
+/// commit SHA in the repository at `repo_root`.
+pub fn resolve_ref(repo_root: &Path, ref_name: &str) -> Result<String, GitError> {
+    let output = run_git(repo_root, &["rev-parse", ref_name])?;
+    if !output.status.success() {
+        return Err(GitError::RefNotFound {
+            repo_root: repo_root.display().to_string(),
+            ref_name: ref_name.to_string(),
+            stderr: stderr_of(&output),
+        });
+    }
+    Ok(stdout_of(&output))
+}
+
+/// Whether `HEAD`'s merge-base against `against` has fallen behind
+/// `against`'s current tip -- i.e. whether new commits have landed on
+/// `against` since the branch being checked last diverged from it, making
+/// a git-native Baseline resolved from that merge-base potentially stale.
+pub fn merge_base_is_stale(repo_root: &Path, against: &str) -> Result<bool, GitError> {
+    let merge_base = resolve_merge_base(repo_root, against)?;
+    let tip = resolve_ref(repo_root, against)?;
+    Ok(merge_base != tip)
 }
 
 /// Creates a new worktree in a fresh temporary directory, checked out at
@@ -343,6 +377,50 @@ mod tests {
             }
             other => panic!("expected MergeBaseNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_base_is_stale_is_false_when_the_branch_is_up_to_date_with_master() {
+        let repo = new_test_repo();
+        repo.commit("on master");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.commit("on feature, ahead of master");
+
+        let stale = merge_base_is_stale(&repo.path, "master").expect("should check staleness");
+
+        assert!(
+            !stale,
+            "feature's merge-base with master IS master's tip -- not stale"
+        );
+    }
+
+    #[test]
+    fn merge_base_is_stale_is_true_when_master_has_moved_on_since_the_branch_diverged() {
+        let repo = new_test_repo();
+        repo.commit("on master");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.commit("on feature, ahead of master");
+
+        repo.git(&["checkout", "master"]);
+        repo.commit("a new commit landed on master after feature branched off");
+        repo.git(&["checkout", "feature"]);
+
+        let stale = merge_base_is_stale(&repo.path, "master").expect("should check staleness");
+
+        assert!(
+            stale,
+            "feature's merge-base with master is now behind master's tip -- stale"
+        );
+    }
+
+    #[test]
+    fn resolve_ref_produces_a_clear_error_for_an_unknown_ref() {
+        let repo = new_test_repo();
+        repo.commit("initial");
+
+        let result = resolve_ref(&repo.path, "this-branch-does-not-exist");
+
+        assert!(matches!(result, Err(GitError::RefNotFound { .. })));
     }
 
     #[test]
