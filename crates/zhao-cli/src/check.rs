@@ -50,7 +50,7 @@ pub fn run(args: &CheckArgs) -> ExitCode {
             Ok(json) => println!("{json}"),
             Err(err) => return fail(&format!("could not serialize report as JSON: {err}")),
         },
-        OutputFormat::Text => print!("{}", render_text(&report)),
+        OutputFormat::Text => print!("{}", render_text(&report, DbtAdapter.vocabulary())),
     }
 
     ExitCode::from(if report.is_breaking() {
