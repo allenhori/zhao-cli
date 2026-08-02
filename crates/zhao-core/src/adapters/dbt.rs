@@ -26,7 +26,8 @@
 
 use super::{AdapterVocabulary, TransformationToolAdapter};
 use crate::model::{
-    ColumnLineage, ColumnName, LineageEdge, Node, NodeId, Origin, OriginId, ParsedProject, Upstream,
+    Column, ColumnLineage, ColumnName, JoinKind, LineageEdge, Node, NodeId, Origin, OriginId,
+    ParsedProject, Upstream,
 };
 use serde::Deserialize;
 use sqlparser::ast::{
@@ -139,6 +140,19 @@ struct RawNode {
     depends_on: RawDependsOn,
     #[serde(default)]
     compiled_code: Option<String>,
+    /// Whatever columns this model's `schema.yml` happens to document --
+    /// a partial, optional list, never the real output schema (see the
+    /// module-level doc comment). Only consulted for `data_type`.
+    #[serde(default)]
+    columns: HashMap<String, RawColumnDoc>,
+}
+
+/// A single documented-column entry from a model's `schema.yml`, as
+/// dbt records it in the manifest.
+#[derive(Debug, Default, Deserialize)]
+struct RawColumnDoc {
+    #[serde(default)]
+    data_type: Option<String>,
 }
 
 impl RawNode {
@@ -246,12 +260,12 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
     for model in ordered {
         let node_id = NodeId::new(model.unique_id.clone());
 
-        let local_schema = model
-            .compiled_code
-            .as_deref()
-            .and_then(parse_query)
-            .map(|query| resolve_query(&query, &known_relations, &resolved_schemas))
+        let parsed_query = model.compiled_code.as_deref().and_then(parse_query);
+        let local_schema = parsed_query
+            .as_ref()
+            .map(|query| resolve_query(query, &known_relations, &resolved_schemas))
             .unwrap_or(LocalSchema::Opaque);
+        let joins = parsed_query.as_ref().map(extract_joins).unwrap_or_default();
 
         let columns: Vec<ColumnName> = match &local_schema {
             LocalSchema::Known(cols) => cols
@@ -316,10 +330,23 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
         }
 
         resolved_schemas.insert(node_id.clone(), columns.clone());
+
+        let documented_columns: Vec<Column> = columns
+            .iter()
+            .map(|name| Column {
+                name: name.clone(),
+                data_type: model
+                    .columns
+                    .get(name.as_str())
+                    .and_then(|doc| doc.data_type.clone()),
+            })
+            .collect();
+
         nodes.push(Node {
             id: node_id,
             name: model.name.clone(),
-            columns,
+            columns: documented_columns,
+            joins,
         });
     }
 
@@ -423,6 +450,36 @@ fn parse_query(sql: &str) -> Option<Query> {
         Statement::Query(query) => Some(*query),
         _ => None,
     })
+}
+
+/// The kind of each join in a query's final `SELECT`'s `FROM` clause, in
+/// order. Joins inside CTEs are not included -- only the outermost query's
+/// own joins, which is what actually determines the Node's own output row
+/// set. A join whose kind doesn't map to one of [`JoinKind`]'s variants
+/// (a non-standard construct like `SEMI JOIN`) is omitted rather than
+/// misrepresented as some other kind.
+fn extract_joins(query: &Query) -> Vec<JoinKind> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Vec::new();
+    };
+    select
+        .from
+        .iter()
+        .flat_map(|twj| &twj.joins)
+        .filter_map(|join| join_kind_of(&join.join_operator))
+        .collect()
+}
+
+fn join_kind_of(op: &sqlparser::ast::JoinOperator) -> Option<JoinKind> {
+    use sqlparser::ast::JoinOperator;
+    match op {
+        JoinOperator::Join(_) | JoinOperator::Inner(_) => Some(JoinKind::Inner),
+        JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => Some(JoinKind::Left),
+        JoinOperator::Right(_) | JoinOperator::RightOuter(_) => Some(JoinKind::Right),
+        JoinOperator::FullOuter(_) => Some(JoinKind::Full),
+        JoinOperator::CrossJoin(_) => Some(JoinKind::Cross),
+        _ => None,
+    }
 }
 
 /// Resolves a full query (its CTEs, in order, then its final body) against
