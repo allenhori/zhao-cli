@@ -5,6 +5,20 @@
 //! is delegated to `zhao-core`. See `ARCHITECTURE.md` at the repository
 //! root for the intended command surface as it's implemented.
 
-fn main() {
-    println!("zhao {} (pre-implementation)", zhao_core::version());
+mod check;
+mod cli;
+mod report;
+
+use std::process::ExitCode;
+
+use clap::Parser;
+
+use cli::{Cli, Command};
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Command::Check(args) => check::run(args),
+    }
 }

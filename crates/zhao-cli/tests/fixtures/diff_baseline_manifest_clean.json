@@ -1,0 +1,1039 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+    "dbt_version": "1.10.22",
+    "generated_at": "2026-08-02T15:10:36.059393Z",
+    "invocation_id": "cccad33b-27b9-4d84-ac24-0ecb269b2d20",
+    "invocation_started_at": "2026-08-02T15:10:30.884089+00:00",
+    "env": {},
+    "project_name": "zhao_dbt_test",
+    "project_id": "09dffdab9e9f2e7ac10ae06de1702565",
+    "user_id": "ac1de835-7605-4f32-b323-e544d15cfee6",
+    "send_anonymous_usage_stats": true,
+    "adapter_type": "duckdb",
+    "quoting": {
+      "database": true,
+      "schema": true,
+      "identifier": true,
+      "column": null
+    }
+  },
+  "nodes": {
+    "model.zhao_dbt_test.stg_customers": {
+      "database": "dev",
+      "schema": "main",
+      "name": "stg_customers",
+      "resource_type": "model",
+      "package_name": "zhao_dbt_test",
+      "path": "staging/stg_customers.sql",
+      "original_file_path": "models/staging/stg_customers.sql",
+      "unique_id": "model.zhao_dbt_test.stg_customers",
+      "fqn": [
+        "zhao_dbt_test",
+        "staging",
+        "stg_customers"
+      ],
+      "alias": "stg_customers",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "dcbc438faff37d5d913645ed487b31b2204fc8f27956ae2212e9351eb709f618"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "materialized": "view",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": null,
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "access": "protected",
+        "freshness": null
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "customer_id": {
+          "name": "customer_id",
+          "description": "",
+          "meta": {},
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {},
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "zhao_dbt_test://models/staging/_staging__models.yml",
+      "build_path": null,
+      "unrendered_config": {
+        "materialized": "view"
+      },
+      "created_at": 1785683432.8065531,
+      "relation_name": "\"dev\".\"main\".\"stg_customers\"",
+      "raw_code": "with source as (\n    select * from {{ source('raw', 'raw_customers') }}\n),\n\nrenamed as (\n    select\n        id as customer_id,\n        first_name,\n        last_name\n    from source\n)\n\nselect * from renamed",
+      "doc_blocks": [],
+      "language": "sql",
+      "refs": [],
+      "sources": [
+        [
+          "raw",
+          "raw_customers"
+        ]
+      ],
+      "metrics": [],
+      "depends_on": {
+        "macros": [],
+        "nodes": [
+          "source.zhao_dbt_test.raw.raw_customers"
+        ]
+      },
+      "compiled_path": "target/compiled/zhao_dbt_test/models/staging/stg_customers.sql",
+      "compiled": true,
+      "compiled_code": "with source as (\n    select * from \"dev\".\"main\".\"raw_customers\"\n),\n\nrenamed as (\n    select\n        id as customer_id,\n        first_name,\n        last_name\n    from source\n)\n\nselect * from renamed",
+      "extra_ctes_injected": true,
+      "extra_ctes": [],
+      "contract": {
+        "enforced": false,
+        "alias_types": true,
+        "checksum": null
+      },
+      "access": "protected",
+      "constraints": [],
+      "version": null,
+      "latest_version": null,
+      "deprecation_date": null,
+      "primary_key": [
+        "customer_id"
+      ],
+      "time_spine": null
+    },
+    "model.zhao_dbt_test.stg_payments": {
+      "database": "dev",
+      "schema": "main",
+      "name": "stg_payments",
+      "resource_type": "model",
+      "package_name": "zhao_dbt_test",
+      "path": "staging/stg_payments.sql",
+      "original_file_path": "models/staging/stg_payments.sql",
+      "unique_id": "model.zhao_dbt_test.stg_payments",
+      "fqn": [
+        "zhao_dbt_test",
+        "staging",
+        "stg_payments"
+      ],
+      "alias": "stg_payments",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "d8f23dd688221bb9598e1d74044d25298da6c93990f8c6fd11c7237bfbb7f40d"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "materialized": "view",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": null,
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "access": "protected",
+        "freshness": null
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "payment_id": {
+          "name": "payment_id",
+          "description": "",
+          "meta": {},
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {},
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "zhao_dbt_test://models/staging/_staging__models.yml",
+      "build_path": null,
+      "unrendered_config": {
+        "materialized": "view"
+      },
+      "created_at": 1785683432.807942,
+      "relation_name": "\"dev\".\"main\".\"stg_payments\"",
+      "raw_code": "with source as (\n    select * from {{ source('raw', 'raw_payments') }}\n),\n\nrenamed as (\n    select\n        id as payment_id,\n        order_id,\n        payment_method,\n        {{ cents_to_dollars('amount') }} as amount\n    from source\n)\n\nselect * from renamed",
+      "doc_blocks": [],
+      "language": "sql",
+      "refs": [],
+      "sources": [
+        [
+          "raw",
+          "raw_payments"
+        ]
+      ],
+      "metrics": [],
+      "depends_on": {
+        "macros": [
+          "macro.zhao_dbt_test.cents_to_dollars"
+        ],
+        "nodes": [
+          "source.zhao_dbt_test.raw.raw_payments"
+        ]
+      },
+      "compiled_path": "target/compiled/zhao_dbt_test/models/staging/stg_payments.sql",
+      "compiled": true,
+      "compiled_code": "with source as (\n    select * from \"dev\".\"main\".\"raw_payments\"\n),\n\nrenamed as (\n    select\n        id as payment_id,\n        order_id,\n        payment_method,\n        \n    round(amount / 100.0, 2)\n as amount\n    from source\n)\n\nselect * from renamed",
+      "extra_ctes_injected": true,
+      "extra_ctes": [],
+      "contract": {
+        "enforced": false,
+        "alias_types": true,
+        "checksum": null
+      },
+      "access": "protected",
+      "constraints": [],
+      "version": null,
+      "latest_version": null,
+      "deprecation_date": null,
+      "primary_key": [
+        "payment_id"
+      ],
+      "time_spine": null
+    },
+    "model.zhao_dbt_test.stg_orders": {
+      "database": "dev",
+      "schema": "main",
+      "name": "stg_orders",
+      "resource_type": "model",
+      "package_name": "zhao_dbt_test",
+      "path": "staging/stg_orders.sql",
+      "original_file_path": "models/staging/stg_orders.sql",
+      "unique_id": "model.zhao_dbt_test.stg_orders",
+      "fqn": [
+        "zhao_dbt_test",
+        "staging",
+        "stg_orders"
+      ],
+      "alias": "stg_orders",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "fa843478c344e4167b26598b7ee22f9f22ae5ebe5e6e0d0de8e5e9a323464ca1"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "materialized": "view",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": null,
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "access": "protected",
+        "freshness": null
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "order_id": {
+          "name": "order_id",
+          "description": "",
+          "meta": {},
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {},
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "zhao_dbt_test://models/staging/_staging__models.yml",
+      "build_path": null,
+      "unrendered_config": {
+        "materialized": "view"
+      },
+      "created_at": 1785683432.807244,
+      "relation_name": "\"dev\".\"main\".\"stg_orders\"",
+      "raw_code": "with source as (\n    select * from {{ source('raw', 'raw_orders') }}\n),\n\nrenamed as (\n    select\n        id as order_id,\n        user_id as customer_id,\n        order_date,\n        status\n    from source\n)\n\nselect * from renamed",
+      "doc_blocks": [],
+      "language": "sql",
+      "refs": [],
+      "sources": [
+        [
+          "raw",
+          "raw_orders"
+        ]
+      ],
+      "metrics": [],
+      "depends_on": {
+        "macros": [],
+        "nodes": [
+          "source.zhao_dbt_test.raw.raw_orders"
+        ]
+      },
+      "compiled_path": "target/compiled/zhao_dbt_test/models/staging/stg_orders.sql",
+      "compiled": true,
+      "compiled_code": "with source as (\n    select * from \"dev\".\"main\".\"raw_orders\"\n),\n\nrenamed as (\n    select\n        id as order_id,\n        user_id as customer_id,\n        order_date,\n        status\n    from source\n)\n\nselect * from renamed",
+      "extra_ctes_injected": true,
+      "extra_ctes": [],
+      "contract": {
+        "enforced": false,
+        "alias_types": true,
+        "checksum": null
+      },
+      "access": "protected",
+      "constraints": [],
+      "version": null,
+      "latest_version": null,
+      "deprecation_date": null,
+      "primary_key": [
+        "order_id"
+      ],
+      "time_spine": null
+    },
+    "model.zhao_dbt_test.dim_customers": {
+      "database": "dev",
+      "schema": "main",
+      "name": "dim_customers",
+      "resource_type": "model",
+      "package_name": "zhao_dbt_test",
+      "path": "marts/dim_customers.sql",
+      "original_file_path": "models/marts/dim_customers.sql",
+      "unique_id": "model.zhao_dbt_test.dim_customers",
+      "fqn": [
+        "zhao_dbt_test",
+        "marts",
+        "dim_customers"
+      ],
+      "alias": "dim_customers",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "d398b7af02761cf9e3f78d3b4ad0a724fe2f27945601dbbad351a1d1f227a7d0"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "materialized": "table",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": null,
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "access": "protected",
+        "freshness": null
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "customer_id": {
+          "name": "customer_id",
+          "description": "",
+          "meta": {},
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {},
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "zhao_dbt_test://models/marts/_marts__models.yml",
+      "build_path": null,
+      "unrendered_config": {
+        "materialized": "table"
+      },
+      "created_at": 1785683432.9181728,
+      "relation_name": "\"dev\".\"main\".\"dim_customers\"",
+      "raw_code": "with customers as (\n    select * from {{ ref('stg_customers') }}\n),\n\norders as (\n    select * from {{ ref('stg_orders') }}\n),\n\ncustomer_orders as (\n    select\n        customer_id,\n        min(order_date) as first_order_date,\n        max(order_date) as most_recent_order_date,\n        count(order_id) as number_of_orders\n    from orders\n    group by customer_id\n)\n\nselect\n    customers.customer_id,\n    customers.first_name,\n    customers.last_name,\n    customer_orders.first_order_date,\n    customer_orders.most_recent_order_date,\n    coalesce(customer_orders.number_of_orders, 0) as number_of_orders\nfrom customers\nleft join customer_orders using (customer_id)",
+      "doc_blocks": [],
+      "language": "sql",
+      "refs": [
+        {
+          "name": "stg_customers",
+          "package": null,
+          "version": null
+        },
+        {
+          "name": "stg_orders",
+          "package": null,
+          "version": null
+        }
+      ],
+      "sources": [],
+      "metrics": [],
+      "depends_on": {
+        "macros": [],
+        "nodes": [
+          "model.zhao_dbt_test.stg_customers",
+          "model.zhao_dbt_test.stg_orders"
+        ]
+      },
+      "compiled_path": "target/compiled/zhao_dbt_test/models/marts/dim_customers.sql",
+      "compiled": true,
+      "compiled_code": "with customers as (\n    select * from \"dev\".\"main\".\"stg_customers\"\n),\n\norders as (\n    select * from \"dev\".\"main\".\"stg_orders\"\n),\n\ncustomer_orders as (\n    select\n        customer_id,\n        min(order_date) as first_order_date,\n        max(order_date) as most_recent_order_date,\n        count(order_id) as number_of_orders\n    from orders\n    group by customer_id\n)\n\nselect\n    customers.customer_id,\n    customers.first_name,\n    customers.last_name,\n    customer_orders.first_order_date,\n    customer_orders.most_recent_order_date,\n    coalesce(customer_orders.number_of_orders, 0) as number_of_orders\nfrom customers\nleft join customer_orders using (customer_id)",
+      "extra_ctes_injected": true,
+      "extra_ctes": [],
+      "contract": {
+        "enforced": false,
+        "alias_types": true,
+        "checksum": null
+      },
+      "access": "protected",
+      "constraints": [],
+      "version": null,
+      "latest_version": null,
+      "deprecation_date": null,
+      "primary_key": [
+        "customer_id"
+      ],
+      "time_spine": null
+    },
+    "model.zhao_dbt_test.fct_orders": {
+      "database": "dev",
+      "schema": "main",
+      "name": "fct_orders",
+      "resource_type": "model",
+      "package_name": "zhao_dbt_test",
+      "path": "marts/fct_orders.sql",
+      "original_file_path": "models/marts/fct_orders.sql",
+      "unique_id": "model.zhao_dbt_test.fct_orders",
+      "fqn": [
+        "zhao_dbt_test",
+        "marts",
+        "fct_orders"
+      ],
+      "alias": "fct_orders",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "e063221351d1bcfc98e7aea916ffeddc53a7bafeb8ac953e542caa4343a993e5"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "materialized": "table",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": null,
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "access": "protected",
+        "freshness": null
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "order_id": {
+          "name": "order_id",
+          "description": "",
+          "meta": {},
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {},
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "zhao_dbt_test://models/marts/_marts__models.yml",
+      "build_path": null,
+      "unrendered_config": {
+        "materialized": "table"
+      },
+      "created_at": 1785683432.918535,
+      "relation_name": "\"dev\".\"main\".\"fct_orders\"",
+      "raw_code": "with orders as (\n    select * from {{ ref('stg_orders') }}\n),\n\npayments as (\n    select * from {{ ref('stg_payments') }}\n),\n\norder_payments as (\n    select\n        order_id,\n        sum(amount) as total_amount\n    from payments\n    group by order_id\n)\n\nselect\n    orders.order_id,\n    orders.customer_id,\n    orders.order_date,\n    orders.status,\n    coalesce(order_payments.total_amount, 0) as amount\nfrom orders\nleft join order_payments using (order_id)",
+      "doc_blocks": [],
+      "language": "sql",
+      "refs": [
+        {
+          "name": "stg_orders",
+          "package": null,
+          "version": null
+        },
+        {
+          "name": "stg_payments",
+          "package": null,
+          "version": null
+        }
+      ],
+      "sources": [],
+      "metrics": [],
+      "depends_on": {
+        "macros": [],
+        "nodes": [
+          "model.zhao_dbt_test.stg_orders",
+          "model.zhao_dbt_test.stg_payments"
+        ]
+      },
+      "compiled_path": "target/compiled/zhao_dbt_test/models/marts/fct_orders.sql",
+      "compiled": true,
+      "compiled_code": "with orders as (\n    select * from \"dev\".\"main\".\"stg_orders\"\n),\n\npayments as (\n    select * from \"dev\".\"main\".\"stg_payments\"\n),\n\norder_payments as (\n    select\n        order_id,\n        sum(amount) as total_amount\n    from payments\n    group by order_id\n)\n\nselect\n    orders.order_id,\n    orders.customer_id,\n    orders.order_date,\n    orders.status,\n    coalesce(order_payments.total_amount, 0) as amount\nfrom orders\nleft join order_payments using (order_id)",
+      "extra_ctes_injected": true,
+      "extra_ctes": [],
+      "contract": {
+        "enforced": false,
+        "alias_types": true,
+        "checksum": null
+      },
+      "access": "protected",
+      "constraints": [],
+      "version": null,
+      "latest_version": null,
+      "deprecation_date": null,
+      "primary_key": [
+        "order_id"
+      ],
+      "time_spine": null
+    },
+    "model.zhao_dbt_test.fct_orders_incremental": {
+      "database": "dev",
+      "schema": "main",
+      "name": "fct_orders_incremental",
+      "resource_type": "model",
+      "package_name": "zhao_dbt_test",
+      "path": "marts/fct_orders_incremental.sql",
+      "original_file_path": "models/marts/fct_orders_incremental.sql",
+      "unique_id": "model.zhao_dbt_test.fct_orders_incremental",
+      "fqn": [
+        "zhao_dbt_test",
+        "marts",
+        "fct_orders_incremental"
+      ],
+      "alias": "fct_orders_incremental",
+      "checksum": {
+        "name": "sha256",
+        "checksum": "0120ca4265c49d66dcf9a3a726d878f86355a4abe39cc0f940850158749b7925"
+      },
+      "config": {
+        "enabled": true,
+        "alias": null,
+        "schema": null,
+        "database": null,
+        "tags": [],
+        "meta": {},
+        "group": null,
+        "materialized": "incremental",
+        "incremental_strategy": null,
+        "batch_size": null,
+        "lookback": 1,
+        "begin": null,
+        "persist_docs": {},
+        "post-hook": [],
+        "pre-hook": [],
+        "quoting": {},
+        "column_types": {},
+        "full_refresh": null,
+        "unique_key": "order_id",
+        "on_schema_change": "ignore",
+        "on_configuration_change": "apply",
+        "grants": {},
+        "packages": [],
+        "docs": {
+          "show": true,
+          "node_color": null
+        },
+        "contract": {
+          "enforced": false,
+          "alias_types": true
+        },
+        "event_time": null,
+        "concurrent_batches": null,
+        "access": "protected",
+        "freshness": null
+      },
+      "tags": [],
+      "description": "",
+      "columns": {
+        "order_id": {
+          "name": "order_id",
+          "description": "",
+          "meta": {},
+          "data_type": null,
+          "constraints": [],
+          "quote": null,
+          "config": {
+            "meta": {},
+            "tags": []
+          },
+          "tags": [],
+          "granularity": null,
+          "doc_blocks": []
+        }
+      },
+      "meta": {},
+      "group": null,
+      "docs": {
+        "show": true,
+        "node_color": null
+      },
+      "patch_path": "zhao_dbt_test://models/marts/_marts__models.yml",
+      "build_path": null,
+      "unrendered_config": {
+        "materialized": "incremental",
+        "unique_key": "order_id"
+      },
+      "created_at": 1785683432.918869,
+      "relation_name": "\"dev\".\"main\".\"fct_orders_incremental\"",
+      "raw_code": "{{\n    config(\n        materialized='incremental',\n        unique_key='order_id'\n    )\n}}\n\nwith orders as (\n    select * from {{ ref('stg_orders') }}\n\n    {% if is_incremental() %}\n    where order_date > (select max(order_date) from {{ this }})\n    {% endif %}\n),\n\npayments as (\n    select * from {{ ref('stg_payments') }}\n),\n\norder_payments as (\n    select\n        order_id,\n        sum(amount) as total_amount\n    from payments\n    group by order_id\n)\n\nselect\n    orders.order_id,\n    orders.customer_id,\n    orders.order_date,\n    orders.status,\n    coalesce(order_payments.total_amount, 0) as amount\nfrom orders\nleft join order_payments using (order_id)",
+      "doc_blocks": [],
+      "language": "sql",
+      "refs": [
+        {
+          "name": "stg_orders",
+          "package": null,
+          "version": null
+        },
+        {
+          "name": "stg_payments",
+          "package": null,
+          "version": null
+        }
+      ],
+      "sources": [],
+      "metrics": [],
+      "depends_on": {
+        "macros": [
+          "macro.dbt.is_incremental"
+        ],
+        "nodes": [
+          "model.zhao_dbt_test.stg_orders",
+          "model.zhao_dbt_test.stg_payments"
+        ]
+      },
+      "compiled_path": "target/compiled/zhao_dbt_test/models/marts/fct_orders_incremental.sql",
+      "compiled": true,
+      "compiled_code": "\n\nwith orders as (\n    select * from \"dev\".\"main\".\"stg_orders\"\n\n    \n),\n\npayments as (\n    select * from \"dev\".\"main\".\"stg_payments\"\n),\n\norder_payments as (\n    select\n        order_id,\n        sum(amount) as total_amount\n    from payments\n    group by order_id\n)\n\nselect\n    orders.order_id,\n    orders.customer_id,\n    orders.order_date,\n    orders.status,\n    coalesce(order_payments.total_amount, 0) as amount\nfrom orders\nleft join order_payments using (order_id)",
+      "extra_ctes_injected": true,
+      "extra_ctes": [],
+      "contract": {
+        "enforced": false,
+        "alias_types": true,
+        "checksum": null
+      },
+      "access": "protected",
+      "constraints": [],
+      "version": null,
+      "latest_version": null,
+      "deprecation_date": null,
+      "primary_key": [
+        "order_id"
+      ],
+      "time_spine": null
+    }
+  },
+  "sources": {
+    "source.zhao_dbt_test.raw.raw_customers": {
+      "database": "dev",
+      "schema": "main",
+      "name": "raw_customers",
+      "resource_type": "source",
+      "package_name": "zhao_dbt_test",
+      "path": "models/staging/_staging__sources.yml",
+      "original_file_path": "models/staging/_staging__sources.yml",
+      "unique_id": "source.zhao_dbt_test.raw.raw_customers",
+      "fqn": [
+        "zhao_dbt_test",
+        "staging",
+        "raw",
+        "raw_customers"
+      ],
+      "source_name": "raw",
+      "source_description": "",
+      "loader": "",
+      "identifier": "raw_customers",
+      "quoting": {
+        "database": null,
+        "schema": null,
+        "identifier": null,
+        "column": null
+      },
+      "loaded_at_field": null,
+      "loaded_at_query": null,
+      "freshness": {
+        "warn_after": {
+          "count": null,
+          "period": null
+        },
+        "error_after": {
+          "count": null,
+          "period": null
+        },
+        "filter": null
+      },
+      "external": null,
+      "description": "",
+      "columns": {},
+      "meta": {},
+      "source_meta": {},
+      "tags": [],
+      "config": {
+        "enabled": true,
+        "event_time": null,
+        "freshness": {
+          "warn_after": {
+            "count": null,
+            "period": null
+          },
+          "error_after": {
+            "count": null,
+            "period": null
+          },
+          "filter": null
+        },
+        "loaded_at_field": null,
+        "loaded_at_query": null,
+        "meta": {},
+        "tags": []
+      },
+      "patch_path": null,
+      "unrendered_config": {
+        "loaded_at_field": null,
+        "loaded_at_query": null,
+        "meta": {},
+        "tags": []
+      },
+      "relation_name": "\"dev\".\"main\".\"raw_customers\"",
+      "created_at": 1785683432.94001,
+      "unrendered_database": null,
+      "unrendered_schema": "{{ target.schema if target.name != 'ci' else target.schema ~ '_' ~ var('cleansed_branch_name', 'local') }}",
+      "doc_blocks": []
+    },
+    "source.zhao_dbt_test.raw.raw_orders": {
+      "database": "dev",
+      "schema": "main",
+      "name": "raw_orders",
+      "resource_type": "source",
+      "package_name": "zhao_dbt_test",
+      "path": "models/staging/_staging__sources.yml",
+      "original_file_path": "models/staging/_staging__sources.yml",
+      "unique_id": "source.zhao_dbt_test.raw.raw_orders",
+      "fqn": [
+        "zhao_dbt_test",
+        "staging",
+        "raw",
+        "raw_orders"
+      ],
+      "source_name": "raw",
+      "source_description": "",
+      "loader": "",
+      "identifier": "raw_orders",
+      "quoting": {
+        "database": null,
+        "schema": null,
+        "identifier": null,
+        "column": null
+      },
+      "loaded_at_field": null,
+      "loaded_at_query": null,
+      "freshness": {
+        "warn_after": {
+          "count": null,
+          "period": null
+        },
+        "error_after": {
+          "count": null,
+          "period": null
+        },
+        "filter": null
+      },
+      "external": null,
+      "description": "",
+      "columns": {},
+      "meta": {},
+      "source_meta": {},
+      "tags": [],
+      "config": {
+        "enabled": true,
+        "event_time": null,
+        "freshness": {
+          "warn_after": {
+            "count": null,
+            "period": null
+          },
+          "error_after": {
+            "count": null,
+            "period": null
+          },
+          "filter": null
+        },
+        "loaded_at_field": null,
+        "loaded_at_query": null,
+        "meta": {},
+        "tags": []
+      },
+      "patch_path": null,
+      "unrendered_config": {
+        "loaded_at_field": null,
+        "loaded_at_query": null,
+        "meta": {},
+        "tags": []
+      },
+      "relation_name": "\"dev\".\"main\".\"raw_orders\"",
+      "created_at": 1785683432.941136,
+      "unrendered_database": null,
+      "unrendered_schema": "{{ target.schema if target.name != 'ci' else target.schema ~ '_' ~ var('cleansed_branch_name', 'local') }}",
+      "doc_blocks": []
+    },
+    "source.zhao_dbt_test.raw.raw_payments": {
+      "database": "dev",
+      "schema": "main",
+      "name": "raw_payments",
+      "resource_type": "source",
+      "package_name": "zhao_dbt_test",
+      "path": "models/staging/_staging__sources.yml",
+      "original_file_path": "models/staging/_staging__sources.yml",
+      "unique_id": "source.zhao_dbt_test.raw.raw_payments",
+      "fqn": [
+        "zhao_dbt_test",
+        "staging",
+        "raw",
+        "raw_payments"
+      ],
+      "source_name": "raw",
+      "source_description": "",
+      "loader": "",
+      "identifier": "raw_payments",
+      "quoting": {
+        "database": null,
+        "schema": null,
+        "identifier": null,
+        "column": null
+      },
+      "loaded_at_field": null,
+      "loaded_at_query": null,
+      "freshness": {
+        "warn_after": {
+          "count": null,
+          "period": null
+        },
+        "error_after": {
+          "count": null,
+          "period": null
+        },
+        "filter": null
+      },
+      "external": null,
+      "description": "",
+      "columns": {},
+      "meta": {},
+      "source_meta": {},
+      "tags": [],
+      "config": {
+        "enabled": true,
+        "event_time": null,
+        "freshness": {
+          "warn_after": {
+            "count": null,
+            "period": null
+          },
+          "error_after": {
+            "count": null,
+            "period": null
+          },
+          "filter": null
+        },
+        "loaded_at_field": null,
+        "loaded_at_query": null,
+        "meta": {},
+        "tags": []
+      },
+      "patch_path": null,
+      "unrendered_config": {
+        "loaded_at_field": null,
+        "loaded_at_query": null,
+        "meta": {},
+        "tags": []
+      },
+      "relation_name": "\"dev\".\"main\".\"raw_payments\"",
+      "created_at": 1785683432.941447,
+      "unrendered_database": null,
+      "unrendered_schema": "{{ target.schema if target.name != 'ci' else target.schema ~ '_' ~ var('cleansed_branch_name', 'local') }}",
+      "doc_blocks": []
+    }
+  },
+  "macros": {},
+  "docs": {},
+  "exposures": {},
+  "metrics": {},
+  "groups": {},
+  "selectors": {},
+  "disabled": {},
+  "parent_map": {},
+  "child_map": {},
+  "group_map": {}
+}
