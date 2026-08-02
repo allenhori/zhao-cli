@@ -79,6 +79,38 @@ impl fmt::Display for ColumnName {
     }
 }
 
+/// A single column within a [`Node`]'s or [`Origin`]'s schema: its name
+/// and, where documented, its data type.
+///
+/// `data_type` reflects only what the source project happens to document
+/// (e.g. a dbt `schema.yml` entry) -- zhao never infers a type by
+/// connecting to a real warehouse, so it's absent far more often than
+/// present. A type-level [`crate::adapters::TransformationToolAdapter`]-produced
+/// comparison is only possible when both sides of a comparison happen to
+/// have it documented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Column {
+    /// This column's name.
+    pub name: ColumnName,
+    /// This column's documented data type, if the source project records one.
+    pub data_type: Option<String>,
+}
+
+/// The kind of join a [`Node`]'s definition uses to combine two relations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// An `INNER JOIN` (or a bare `JOIN`, which means the same thing).
+    Inner,
+    /// A `LEFT [OUTER] JOIN`.
+    Left,
+    /// A `RIGHT [OUTER] JOIN`.
+    Right,
+    /// A `FULL OUTER JOIN`.
+    Full,
+    /// A `CROSS JOIN`.
+    Cross,
+}
+
 /// The atomic buildable thing zhao's core reasons about.
 ///
 /// A dbt `model` is translated into a Node by the dbt Transformation Tool
@@ -92,7 +124,12 @@ pub struct Node {
     /// This Node's short, human-facing name (e.g. a dbt model's name).
     pub name: String,
     /// The columns this Node exposes, in output order.
-    pub columns: Vec<ColumnName>,
+    pub columns: Vec<Column>,
+    /// The kind of each join in this Node's definition, in the order they
+    /// appear. Only joins whose kind maps to one of [`JoinKind`]'s variants
+    /// are included -- a non-standard or unrecognized join is omitted
+    /// rather than misrepresented as some other kind.
+    pub joins: Vec<JoinKind>,
 }
 
 /// An external input a [`Node`] reads from but that zhao does not build.

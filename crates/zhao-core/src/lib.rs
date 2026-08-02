@@ -11,6 +11,7 @@
 //! layout as functionality lands here.
 
 pub mod adapters;
+pub mod diff;
 pub mod model;
 
 /// Returns this crate's version, as declared in `Cargo.toml`.

@@ -6,7 +6,7 @@
 use std::path::Path;
 use zhao_core::adapters::TransformationToolAdapter;
 use zhao_core::adapters::dbt::DbtAdapter;
-use zhao_core::model::{NodeId, OriginId, Upstream};
+use zhao_core::model::{JoinKind, NodeId, OriginId, Upstream};
 
 fn fixture_path() -> &'static Path {
     Path::new(concat!(
@@ -55,7 +55,11 @@ fn resolves_a_staging_model_schema_and_source_lineage() {
         .find(|n| n.name == "stg_customers")
         .expect("stg_customers should exist");
 
-    let column_names: Vec<&str> = stg_customers.columns.iter().map(|c| c.as_str()).collect();
+    let column_names: Vec<&str> = stg_customers
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert_eq!(column_names, vec!["customer_id", "first_name", "last_name"]);
 
     let origin_id = OriginId::new("source.zhao_dbt_test.raw.raw_customers");
@@ -99,7 +103,11 @@ fn resolves_column_lineage_through_a_join_across_two_upstream_models() {
         .find(|n| n.name == "dim_customers")
         .expect("dim_customers should exist");
 
-    let column_names: Vec<&str> = dim_customers.columns.iter().map(|c| c.as_str()).collect();
+    let column_names: Vec<&str> = dim_customers
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert_eq!(
         column_names,
         vec![
@@ -214,7 +222,7 @@ fn resolves_a_join_and_aggregation_across_two_upstream_models() {
         .find(|n| n.name == "fct_orders")
         .expect("fct_orders should exist");
 
-    let column_names: Vec<&str> = fct_orders.columns.iter().map(|c| c.as_str()).collect();
+    let column_names: Vec<&str> = fct_orders.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
         column_names,
         vec!["order_id", "customer_id", "order_date", "status", "amount"]
@@ -268,7 +276,11 @@ fn resolves_an_incremental_model_the_same_as_an_equivalent_non_incremental_one()
         .find(|n| n.name == "fct_orders_incremental")
         .expect("fct_orders_incremental should exist");
 
-    let column_names: Vec<&str> = incremental.columns.iter().map(|c| c.as_str()).collect();
+    let column_names: Vec<&str> = incremental
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert_eq!(
         column_names,
         vec!["order_id", "customer_id", "order_date", "status", "amount"]
@@ -300,4 +312,29 @@ fn resolves_an_incremental_model_the_same_as_an_equivalent_non_incremental_one()
         amount_has_no_column_edge,
         "the computed amount column should not have a resolved source on the incremental model either"
     );
+}
+
+#[test]
+fn extracts_the_join_kind_from_a_models_final_select() {
+    let project = DbtAdapter
+        .parse(fixture_path())
+        .expect("fixture should parse");
+
+    let dim_customers = project
+        .nodes
+        .iter()
+        .find(|n| n.name == "dim_customers")
+        .expect("dim_customers should exist");
+
+    // `from customers left join customer_orders using (customer_id)`.
+    assert_eq!(dim_customers.joins, vec![JoinKind::Left]);
+
+    let stg_customers = project
+        .nodes
+        .iter()
+        .find(|n| n.name == "stg_customers")
+        .expect("stg_customers should exist");
+
+    // No joins anywhere in stg_customers' definition.
+    assert_eq!(stg_customers.joins, Vec::<JoinKind>::new());
 }
