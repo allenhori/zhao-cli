@@ -480,6 +480,53 @@ mod tests {
         );
     }
 
+    /// Proves the cascade is genuinely N-level, not hardcoded to exactly
+    /// "root + project": a `zhao.yml` at the intermediate directory
+    /// (`root/services`, between the repo root and the leaf project dir)
+    /// must win over the root's value for the key it sets, while the
+    /// leaf's own `zhao.yml` still wins over that intermediate value for
+    /// the key *it* sets, and the root's value keeps applying for the key
+    /// neither the mid nor the leaf file touches.
+    #[test]
+    fn a_zhao_yml_at_an_intermediate_directory_cascades_correctly() {
+        let repo = fake_repo();
+        let mid_dir = repo.project_dir.parent().expect("project dir has a parent");
+
+        fs::write(
+            repo.root.join("zhao.yml"),
+            "preset: strict\nrules:\n  column-added: warn\n",
+        )
+        .expect("should write root config");
+        fs::write(
+            mid_dir.join("zhao.yml"),
+            "rules:\n  column-added: pass\n  column-type-narrowed: pass\n",
+        )
+        .expect("should write intermediate config");
+        fs::write(
+            repo.project_dir.join("zhao.yml"),
+            "rules:\n  column-type-narrowed: warn\n",
+        )
+        .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        // Leaf wins over the intermediate directory's value for the key
+        // the leaf sets.
+        assert_eq!(
+            config.severity_for(RuleId::ColumnTypeNarrowed),
+            Severity::Warn
+        );
+        // Intermediate directory's value wins over root for the key only
+        // the intermediate file sets (the leaf never touches this key).
+        assert_eq!(config.severity_for(RuleId::ColumnAdded), Severity::Pass);
+        // Root's Preset still applies for a key untouched at every more
+        // specific level.
+        assert_eq!(
+            config.severity_for(RuleId::JoinCardinalityLoosened),
+            Severity::Error
+        );
+    }
+
     #[test]
     fn project_local_preset_wins_over_root_preset() {
         let repo = fake_repo();
