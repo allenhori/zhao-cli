@@ -26,10 +26,11 @@ const EXIT_ERROR: u8 = 2;
 pub fn run(args: &CheckArgs) -> ExitCode {
     let current_manifest = args.project_dir.join("target").join("manifest.json");
 
-    let baseline = match load_manifest(&args.state) {
-        Ok(project) => project,
-        Err(message) => return fail(&message),
-    };
+    let baseline =
+        match crate::baseline::resolve(args.state.as_deref(), &args.project_dir, &args.against) {
+            Ok(project) => project,
+            Err(err) => return fail(&err.to_string()),
+        };
     let current = match load_manifest(&current_manifest) {
         Ok(project) => project,
         Err(message) => return fail(&message),

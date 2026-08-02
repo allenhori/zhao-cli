@@ -79,6 +79,24 @@ pub enum DbtAdapterError {
         #[source]
         source: serde_json::Error,
     },
+    /// The configured `dbt` command couldn't be run at all -- most likely
+    /// dbt isn't installed, or isn't on `PATH`.
+    #[error("could not run {command:?} -- is dbt installed and on PATH? ({source})")]
+    CommandNotFound {
+        /// The command that couldn't be run (ordinarily just `"dbt"`).
+        command: String,
+        /// The underlying I/O error from trying to spawn it.
+        #[source]
+        source: std::io::Error,
+    },
+    /// `dbt compile` ran but exited with a failure.
+    #[error("dbt compile failed in {project_dir}:\n{stderr}")]
+    CompileFailed {
+        /// The project directory `dbt compile` was run in.
+        project_dir: String,
+        /// `dbt compile`'s captured stderr.
+        stderr: String,
+    },
 }
 
 impl TransformationToolAdapter for DbtAdapter {
@@ -100,6 +118,42 @@ impl TransformationToolAdapter for DbtAdapter {
 
     fn vocabulary(&self) -> &dyn AdapterVocabulary {
         &DbtVocabulary
+    }
+}
+
+impl DbtAdapter {
+    /// Runs `dbt compile` in `project_dir`, so its `target/manifest.json`
+    /// reflects the project's current compiled state.
+    ///
+    /// `dbt_command` is the executable to invoke -- ordinarily just
+    /// `"dbt"`, resolved via `PATH` -- exposed as a parameter (rather than
+    /// hardcoded) so tests can point it at a stub script instead of
+    /// depending on whether a real `dbt` happens to be installed wherever
+    /// the tests run.
+    ///
+    /// This is a plain method, not part of [`TransformationToolAdapter`]:
+    /// that trait's `parse` deliberately leaves "how the compiled output
+    /// got there" to the caller, and shelling out to `dbt compile` is
+    /// exactly the kind of dbt-specific concern this adapter's module (not
+    /// the trait) should own.
+    pub fn compile(&self, project_dir: &Path, dbt_command: &str) -> Result<(), DbtAdapterError> {
+        let output = std::process::Command::new(dbt_command)
+            .arg("compile")
+            .current_dir(project_dir)
+            .output()
+            .map_err(|source| DbtAdapterError::CommandNotFound {
+                command: dbt_command.to_string(),
+                source,
+            })?;
+
+        if !output.status.success() {
+            return Err(DbtAdapterError::CompileFailed {
+                project_dir: project_dir.display().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -889,5 +943,79 @@ mod tests {
             }
             other => panic!("expected Known([name sourced from tbl via CTE a]), got {other:?}"),
         }
+    }
+
+    /// Writes an executable shell script to a fresh temp dir and returns
+    /// its path -- stands in for a real `dbt` binary so `compile`'s tests
+    /// don't depend on whether a real `dbt` happens to be installed
+    /// wherever they run.
+    #[cfg(unix)]
+    fn stub_dbt_command(dir: &Path, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("dbt");
+        fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("should write stub dbt script");
+        let mut perms = fs::metadata(&path)
+            .expect("should stat stub script")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("should chmod stub script");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compile_runs_the_configured_dbt_command_in_the_project_dir() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(
+            stub_dir.path(),
+            "mkdir -p target && echo '{}' > target/manifest.json",
+        );
+
+        DbtAdapter
+            .compile(project_dir.path(), dbt.to_str().expect("utf8 path"))
+            .expect("compile should succeed");
+
+        assert!(
+            project_dir
+                .path()
+                .join("target")
+                .join("manifest.json")
+                .exists(),
+            "the stub dbt's output should have landed inside the project dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compile_reports_a_clear_error_when_dbt_compile_fails() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(stub_dir.path(), "echo 'boom' >&2\nexit 1");
+
+        let result = DbtAdapter.compile(project_dir.path(), dbt.to_str().expect("utf8 path"));
+
+        match result {
+            Err(DbtAdapterError::CompileFailed { stderr, .. }) => {
+                assert!(stderr.contains("boom"), "stderr should surface: {stderr:?}");
+            }
+            other => panic!("expected CompileFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_reports_a_clear_error_when_the_command_cannot_be_run_at_all() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+
+        let result = DbtAdapter.compile(
+            project_dir.path(),
+            "definitely-not-a-real-command-zhao-test",
+        );
+
+        assert!(matches!(
+            result,
+            Err(DbtAdapterError::CommandNotFound { .. })
+        ));
     }
 }
