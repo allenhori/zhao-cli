@@ -653,6 +653,7 @@ dependencies = [
  "predicates",
  "serde",
  "serde_json",
+ "tempfile",
  "zhao-core",
 ]
 

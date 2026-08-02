@@ -91,6 +91,18 @@ impl RuleId {
             _ => None,
         }
     }
+
+    /// Every Rule in the v1 catalog, in declaration order. Exists so
+    /// callers (e.g. an "unknown rule name" error message) can list valid
+    /// names without duplicating the catalog themselves.
+    pub fn all() -> [RuleId; 4] {
+        [
+            RuleId::ColumnRemovedWithActiveReferences,
+            RuleId::ColumnTypeNarrowed,
+            RuleId::JoinCardinalityLoosened,
+            RuleId::ColumnAdded,
+        ]
+    }
 }
 
 /// The specifics of a single Rule's match -- exactly the fields relevant

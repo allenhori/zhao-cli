@@ -106,6 +106,17 @@ impl Config {
     }
 }
 
+/// Every valid `zhao.yml` rule name, comma-separated, for an "unknown
+/// rule" error message -- delegates to `RuleId::all()` so this can't drift
+/// out of sync with the actual Rule catalog.
+fn valid_rule_names() -> String {
+    RuleId::all()
+        .iter()
+        .map(|rule| rule.config_name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
@@ -132,6 +143,7 @@ impl RawConfig {
                 RuleId::from_config_name(&rule_name).ok_or_else(|| ConfigError::UnknownRule {
                     path: path.display().to_string(),
                     name: rule_name.clone(),
+                    valid: valid_rule_names(),
                 })?;
             let severity = Severity::from_config_name(&severity_name).ok_or_else(|| {
                 ConfigError::InvalidSeverity {
@@ -177,12 +189,14 @@ pub enum ConfigError {
         name: String,
     },
     /// A key under `rules:` isn't a Rule zhao recognizes.
-    #[error("{path}: unknown rule {name:?} (see the Rule catalog for valid names)")]
+    #[error("{path}: unknown rule {name:?} (expected one of: {valid})")]
     UnknownRule {
         /// The file the unknown rule was declared in.
         path: String,
         /// The unrecognized rule name.
         name: String,
+        /// Every valid rule name, comma-separated.
+        valid: String,
     },
     /// A value under `rules:` isn't a Severity zhao recognizes.
     #[error(

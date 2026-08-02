@@ -270,17 +270,25 @@ fn per_rule_override_wins_only_for_that_rule() {
 /// ignoring the mistake.
 #[test]
 fn invalid_zhao_yml_produces_a_clear_error() {
-    let dir = std::env::temp_dir().join(format!("zhao-invalid-config-test-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("target")).expect("should create temp dir");
+    // A guaranteed-unique, RAII-cleaned-up temp directory via `tempfile`,
+    // not a hand-rolled PID-based name -- the same fix applied to
+    // zhao-core's own config tests after a hand-rolled name collided
+    // under parallel test execution; this test needs the identical fix,
+    // not just a similar one.
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    std::fs::create_dir_all(dir.path().join("target")).expect("should create target dir");
     std::fs::copy(
         fixture("clean_project")
             .join("target")
             .join("manifest.json"),
-        dir.join("target").join("manifest.json"),
+        dir.path().join("target").join("manifest.json"),
     )
     .expect("should copy fixture manifest");
-    std::fs::write(dir.join("zhao.yml"), "rules:\n  not-a-real-rule: error\n")
-        .expect("should write zhao.yml");
+    std::fs::write(
+        dir.path().join("zhao.yml"),
+        "rules:\n  not-a-real-rule: error\n",
+    )
+    .expect("should write zhao.yml");
 
     Command::cargo_bin("zhao")
         .expect("binary should build")
@@ -288,15 +296,13 @@ fn invalid_zhao_yml_produces_a_clear_error() {
         .arg("--state")
         .arg(fixture("diff_baseline_manifest_clean.json"))
         .arg("--project-dir")
-        .arg(&dir)
+        .arg(dir.path())
         .assert()
         .code(2)
         .stderr(
             predicate::str::contains("unknown rule")
                 .and(predicate::str::contains("not-a-real-rule")),
         );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
