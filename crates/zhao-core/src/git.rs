@@ -47,6 +47,16 @@ impl Drop for Worktree {
 /// Everything that can go wrong while resolving a git-native Baseline.
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
+    /// The directory a Baseline was resolved from doesn't exist at all --
+    /// kept distinct from [`GitError::NotAGitRepository`] so a typo'd
+    /// `--project-dir` isn't misdiagnosed as "is git installed?" (spawning
+    /// `git` with a nonexistent working directory fails the same way a
+    /// missing `git` executable would).
+    #[error("{dir}: no such directory")]
+    ProjectDirNotFound {
+        /// The directory that doesn't exist.
+        dir: String,
+    },
     /// `dir` isn't inside a git repository (or `git` couldn't otherwise
     /// determine its toplevel).
     #[error("{dir}: not inside a git repository ({stderr})")]
@@ -58,17 +68,26 @@ pub enum GitError {
     },
     /// No merge-base could be found between `HEAD` and `against` -- most
     /// likely the histories are unrelated, or `against` doesn't exist.
+    ///
+    /// The two causes produce different underlying `git` behavior: a
+    /// nonexistent `against` ref makes `git merge-base` fail loudly with a
+    /// populated stderr, while genuinely unrelated histories make it exit
+    /// quietly with empty stdout *and* stderr -- `stderr_detail` is
+    /// pre-formatted (either empty, or `" (...)"` with a leading space) so
+    /// the error message doesn't end with a stray empty `()` in the second
+    /// case.
     #[error(
         "could not find a merge-base between HEAD and {against:?} in {repo_root} -- the \
-         histories may be unrelated, or {against:?} may not exist ({stderr})"
+         histories may be unrelated, or {against:?} may not exist{stderr_detail}"
     )]
     MergeBaseNotFound {
         /// The repository the merge-base was sought in.
         repo_root: String,
         /// The ref `HEAD` was compared against.
         against: String,
-        /// `git`'s captured stderr.
-        stderr: String,
+        /// `git`'s captured stderr, pre-formatted as `" (...)"`, or empty
+        /// if `git` produced no stderr for this failure.
+        stderr_detail: String,
     },
     /// `git worktree add` ran but exited with a failure.
     #[error("could not create a git worktree for commit {commit} in {repo_root}: {stderr}")]
@@ -92,6 +111,12 @@ pub enum GitError {
 /// Finds the root of the git repository containing `dir`
 /// (`git rev-parse --show-toplevel`).
 pub fn repo_root(dir: &Path) -> Result<PathBuf, GitError> {
+    if !dir.exists() {
+        return Err(GitError::ProjectDirNotFound {
+            dir: dir.display().to_string(),
+        });
+    }
+
     let output = run_git(dir, &["rev-parse", "--show-toplevel"])?;
     if !output.status.success() {
         return Err(GitError::NotAGitRepository {
@@ -107,10 +132,16 @@ pub fn repo_root(dir: &Path) -> Result<PathBuf, GitError> {
 pub fn resolve_merge_base(repo_root: &Path, against: &str) -> Result<String, GitError> {
     let output = run_git(repo_root, &["merge-base", "HEAD", against])?;
     if !output.status.success() {
+        let stderr = stderr_of(&output);
+        let stderr_detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(" ({stderr})")
+        };
         return Err(GitError::MergeBaseNotFound {
             repo_root: repo_root.display().to_string(),
             against: against.to_string(),
-            stderr: stderr_of(&output),
+            stderr_detail,
         });
     }
     Ok(stdout_of(&output))
@@ -245,6 +276,21 @@ mod tests {
         assert!(matches!(result, Err(GitError::NotAGitRepository { .. })));
     }
 
+    /// Regression test: a nonexistent directory must not be misdiagnosed
+    /// as "is git installed?" -- spawning `git` with a missing working
+    /// directory fails with the same I/O error a missing `git` executable
+    /// would, so `repo_root` must check existence itself first rather
+    /// than letting that ambiguous failure through.
+    #[test]
+    fn repo_root_produces_a_clear_error_for_a_nonexistent_directory() {
+        let parent = tempfile::tempdir().expect("should create temp dir");
+        let missing = parent.path().join("does-not-exist");
+
+        let result = repo_root(&missing);
+
+        assert!(matches!(result, Err(GitError::ProjectDirNotFound { .. })));
+    }
+
     #[test]
     fn resolve_merge_base_finds_the_common_ancestor_of_head_and_a_branch() {
         let repo = new_test_repo();
@@ -266,6 +312,37 @@ mod tests {
         let result = resolve_merge_base(&repo.path, "this-branch-does-not-exist");
 
         assert!(matches!(result, Err(GitError::MergeBaseNotFound { .. })));
+    }
+
+    /// Distinct failure mode from "`against` doesn't exist": two branches
+    /// that share no common ancestor at all (`git checkout --orphan`) make
+    /// `git merge-base` exit quietly with empty stdout *and* stderr,
+    /// unlike a nonexistent ref (which fails loudly with a populated
+    /// stderr). Both must still produce a clear `MergeBaseNotFound`, and
+    /// this one specifically must not end with a stray empty `()` from an
+    /// unconditionally-appended, empty stderr detail.
+    #[test]
+    fn resolve_merge_base_produces_a_clear_error_for_genuinely_unrelated_histories() {
+        let repo = new_test_repo();
+        repo.commit("on master");
+
+        let orphan = repo.git(&["checkout", "--orphan", "unrelated"]);
+        assert!(orphan.status.success(), "checkout --orphan should succeed");
+        repo.git(&["rm", "-rf", "--cached", "."]);
+        repo.commit("unrelated root commit, sharing no history with master");
+
+        let result = resolve_merge_base(&repo.path, "master");
+
+        match result {
+            Err(err @ GitError::MergeBaseNotFound { .. }) => {
+                let message = err.to_string();
+                assert!(
+                    !message.trim_end().ends_with("()"),
+                    "an empty stderr detail must not leave a stray '()': {message:?}"
+                );
+            }
+            other => panic!("expected MergeBaseNotFound, got {other:?}"),
+        }
     }
 
     #[test]
