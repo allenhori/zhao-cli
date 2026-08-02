@@ -811,19 +811,57 @@ mod staleness_warning {
     }
 
     /// Acceptance criterion 3: the staleness warning never changes the
-    /// exit code, even under a `strict` Preset (which raises every Rule's
-    /// Severity, including ones that would otherwise be non-breaking).
+    /// exit code -- exercised with a fixture pair that has a *real*
+    /// breaking Change (`join-cardinality-loosened`, `warn` by default but
+    /// escalated to `error` under a `strict` Preset), so this test proves
+    /// the exit code still tracks that finding's severity, staleness
+    /// warning notwithstanding, rather than merely observing "nothing
+    /// changed, so of course the exit code stayed 0" (which a fixture pair
+    /// with zero Changes -- as used by the other two tests in this module
+    /// -- would prove regardless of whether this feature worked at all).
     #[test]
     fn the_warning_never_changes_the_exit_code_even_under_a_strict_preset() {
         let repo = stale_repo();
+        std::fs::create_dir_all(repo.path.join("target")).expect("should create target dir");
+        std::fs::copy(
+            fixture("rules_project")
+                .join("target")
+                .join("manifest.json"),
+            repo.path.join("target").join("manifest.json"),
+        )
+        .expect("should overwrite with a fixture that has a real breaking change");
         std::fs::write(repo.path.join("zhao.yml"), "preset: strict\n")
             .expect("should write zhao.yml");
 
-        check_command(&repo)
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .arg("check")
+            .arg("--state")
+            .arg(fixture("rules_baseline_manifest.json"))
+            .arg("--project-dir")
+            .arg(&repo.path)
             .arg("--format")
             .arg("json")
-            .assert()
-            .code(0)
-            .stdout(predicate::str::contains("\"staleness_warning\":"));
+            .output()
+            .expect("command should run");
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "join-cardinality-loosened should be escalated to error by the strict Preset, \
+             regardless of the simultaneous staleness warning; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
+        assert_eq!(
+            parsed["staleness_warning"], "analysis may be stale, consider rebasing",
+            "the staleness warning should still be present alongside the breaking finding"
+        );
+        assert_eq!(
+            parsed["findings"][0]["rule"], "join-cardinality-loosened",
+            "the exit code should come from this finding's severity, not the staleness warning"
+        );
+        assert_eq!(parsed["findings"][0]["severity"], "error");
     }
 }

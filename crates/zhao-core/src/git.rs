@@ -107,14 +107,21 @@ pub enum GitError {
         source: std::io::Error,
     },
     /// `ref_name` doesn't resolve to a commit in this repository.
-    #[error("{repo_root}: {ref_name:?} does not resolve to a commit ({stderr})")]
+    ///
+    /// `stderr_detail` is pre-formatted the same way as
+    /// [`GitError::MergeBaseNotFound`]'s, for the same reason: `git
+    /// rev-parse` doesn't always populate stderr on failure, and
+    /// unconditionally embedding it would leave a stray empty `()` in that
+    /// case.
+    #[error("{repo_root}: {ref_name:?} does not resolve to a commit{stderr_detail}")]
     RefNotFound {
         /// The repository `ref_name` was looked up in.
         repo_root: String,
         /// The ref that couldn't be resolved.
         ref_name: String,
-        /// `git`'s captured stderr.
-        stderr: String,
+        /// `git`'s captured stderr, pre-formatted as `" (...)"`, or empty
+        /// if `git` produced no stderr for this failure.
+        stderr_detail: String,
     },
 }
 
@@ -142,16 +149,10 @@ pub fn repo_root(dir: &Path) -> Result<PathBuf, GitError> {
 pub fn resolve_merge_base(repo_root: &Path, against: &str) -> Result<String, GitError> {
     let output = run_git(repo_root, &["merge-base", "HEAD", against])?;
     if !output.status.success() {
-        let stderr = stderr_of(&output);
-        let stderr_detail = if stderr.is_empty() {
-            String::new()
-        } else {
-            format!(" ({stderr})")
-        };
         return Err(GitError::MergeBaseNotFound {
             repo_root: repo_root.display().to_string(),
             against: against.to_string(),
-            stderr_detail,
+            stderr_detail: stderr_detail_of(&output),
         });
     }
     Ok(stdout_of(&output))
@@ -165,7 +166,7 @@ pub fn resolve_ref(repo_root: &Path, ref_name: &str) -> Result<String, GitError>
         return Err(GitError::RefNotFound {
             repo_root: repo_root.display().to_string(),
             ref_name: ref_name.to_string(),
-            stderr: stderr_of(&output),
+            stderr_detail: stderr_detail_of(&output),
         });
     }
     Ok(stdout_of(&output))
@@ -242,6 +243,20 @@ fn stdout_of(output: &std::process::Output) -> String {
 
 fn stderr_of(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
+}
+
+/// `stderr_of`, pre-formatted as `" (...)"` for embedding directly in an
+/// error message -- or empty if `git` produced no stderr for this
+/// failure, since some `git` subcommands can exit non-zero with nothing
+/// on stderr at all, and unconditionally embedding an empty `()` would
+/// leave a stray, confusing trailer.
+fn stderr_detail_of(output: &std::process::Output) -> String {
+    let stderr = stderr_of(output);
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(" ({stderr})")
+    }
 }
 
 #[cfg(test)]
@@ -420,7 +435,16 @@ mod tests {
 
         let result = resolve_ref(&repo.path, "this-branch-does-not-exist");
 
-        assert!(matches!(result, Err(GitError::RefNotFound { .. })));
+        match result {
+            Err(err @ GitError::RefNotFound { .. }) => {
+                let message = err.to_string();
+                assert!(
+                    !message.trim_end().ends_with("()"),
+                    "an empty stderr detail must not leave a stray '()': {message:?}"
+                );
+            }
+            other => panic!("expected RefNotFound, got {other:?}"),
+        }
     }
 
     #[test]
