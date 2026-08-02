@@ -13,6 +13,7 @@
 pub mod adapters;
 pub mod diff;
 pub mod model;
+pub mod rules;
 
 /// Returns this crate's version, as declared in `Cargo.toml`.
 ///
