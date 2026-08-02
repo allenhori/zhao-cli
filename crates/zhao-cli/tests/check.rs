@@ -71,6 +71,30 @@ fn exits_zero_when_nothing_breaking_is_found() {
         .stdout(predicate::str::contains("\"findings\": []"));
 }
 
+/// Distinct from `exits_zero_when_nothing_breaking_is_found`: that test
+/// has zero Changes at all. This one has a real Change (a column added)
+/// that simply doesn't match the shipped Rule, to confirm the Rule
+/// correctly declines to fire rather than exiting zero only because
+/// nothing happened.
+#[test]
+fn exits_zero_when_a_change_does_not_match_the_rule() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest_clean.json"))
+        .arg("--project-dir")
+        .arg(fixture("non_matching_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(0)
+        .stdout(
+            predicate::str::contains("\"type\": \"column_added\"")
+                .and(predicate::str::contains("\"findings\": []")),
+        );
+}
+
 #[test]
 fn exits_with_error_code_on_a_missing_baseline_path() {
     Command::cargo_bin("zhao")

@@ -9,6 +9,7 @@
 
 use serde::Serialize;
 use zhao_core::diff::Change;
+use zhao_core::model::JoinKind;
 use zhao_core::rules::{Finding, RuleId, Severity};
 
 /// The full JSON payload for a `zhao check` run.
@@ -92,8 +93,8 @@ impl From<&Change> for ChangeJson {
             } => ChangeJson::JoinChanged {
                 node: node.to_string(),
                 position: *position,
-                from_kind: from_kind.map(|k| format!("{k:?}").to_lowercase()),
-                to_kind: to_kind.map(|k| format!("{k:?}").to_lowercase()),
+                from_kind: from_kind.map(join_kind_slug),
+                to_kind: to_kind.map(join_kind_slug),
             },
         }
     }
@@ -149,6 +150,23 @@ fn rule_id_slug(rule: RuleId) -> &'static str {
     match rule {
         RuleId::ColumnRemovedWithActiveReferences => "column-removed-with-active-references",
     }
+}
+
+/// Maps a [`JoinKind`] to its stable JSON string, via an explicit,
+/// compiler-checked match rather than its `Debug` representation -- a
+/// `Debug`-derived string would silently change this stable output if a
+/// variant were ever renamed for unrelated internal reasons, with no
+/// compiler error to catch it (unlike this match, which fails to compile
+/// if a variant is left unhandled).
+fn join_kind_slug(kind: JoinKind) -> String {
+    match kind {
+        JoinKind::Inner => "inner",
+        JoinKind::Left => "left",
+        JoinKind::Right => "right",
+        JoinKind::Full => "full",
+        JoinKind::Cross => "cross",
+    }
+    .to_string()
 }
 
 /// Renders a [`Report`] as brief, human-readable text.
