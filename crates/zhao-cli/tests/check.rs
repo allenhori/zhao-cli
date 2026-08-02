@@ -133,6 +133,46 @@ fn exits_zero_when_the_only_finding_is_pass_severity() {
         );
 }
 
+/// A dedicated golden fixture pair (a real dbt-compiled manifest, not
+/// synthetic data) for `column-type-narrowed`'s and
+/// `join-cardinality-loosened`'s *positive*/*negative* cases the other
+/// fixtures don't happen to cover: `customer_id` documented type widens
+/// (`int` -> `bigint`, must NOT fire the narrowing Rule) while
+/// `dim_customers`' join loosens (`INNER` -> `LEFT`, must fire).
+#[test]
+fn type_widening_does_not_fire_while_join_loosening_does() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("rules_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("command should run");
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
+    let findings = parsed["findings"]
+        .as_array()
+        .expect("findings should be an array");
+
+    assert_eq!(
+        findings.len(),
+        1,
+        "expected only the join-loosening finding, got: {findings:#?}"
+    );
+    assert_eq!(findings[0]["rule"], "join-cardinality-loosened");
+    assert_eq!(findings[0]["from_kind"], "inner");
+    assert_eq!(findings[0]["to_kind"], "left");
+    assert!(
+        !findings.iter().any(|f| f["rule"] == "column-type-narrowed"),
+        "a type widening (int -> bigint) must not fire column-type-narrowed"
+    );
+}
+
 #[test]
 fn exits_with_error_code_on_a_missing_baseline_path() {
     Command::cargo_bin("zhao")
