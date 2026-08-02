@@ -6,6 +6,14 @@
 //! `zhao.yml` is optional -- a project with none behaves identically to
 //! zhao's hardcoded v1 defaults (see [`crate::rules::RuleId::default_severity`]).
 //!
+//! In a monorepo with multiple dbt projects, [`Config::load_for_project`]
+//! cascades a root-level `zhao.yml` down to a project-local one: each
+//! directory from the repo root (the nearest ancestor containing `.git`)
+//! down to the dbt project directory may have its own `zhao.yml`, and a
+//! project-local value wins over a root value for the same key -- the same
+//! override relationship a Preset already has to individual Rule overrides,
+//! one layer higher.
+//!
 //! Uses `serde_yaml`, which is archived upstream (no longer actively
 //! developed) but remains functionally complete and widely used; YAML
 //! itself isn't a moving target, so this is a deliberate, accepted
@@ -15,7 +23,7 @@ use crate::rules::{RuleId, Severity};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A named bundle of default Severities across the whole Rule catalog,
 /// applied before any per-Rule override in `zhao.yml`.
@@ -85,12 +93,77 @@ impl Config {
             .unwrap_or_else(|| self.preset.severity_for(rule))
     }
 
-    /// Loads `zhao.yml` from the given path. Returns [`Config::default`]
-    /// (unchanged v1 defaults) if the file doesn't exist -- `zhao.yml` is
-    /// optional, not mandatory.
+    /// Loads a single `zhao.yml` from the given path. Returns
+    /// [`Config::default`] (unchanged v1 defaults) if the file doesn't
+    /// exist -- `zhao.yml` is optional, not mandatory.
+    ///
+    /// For a monorepo with multiple dbt projects, prefer
+    /// [`Config::load_for_project`], which also cascades in any root-level
+    /// `zhao.yml`.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
+        Ok(ConfigLayer::load(path)?.into_config())
+    }
+
+    /// Loads the effective `zhao.yml` for a dbt project directory,
+    /// cascading a root-level `zhao.yml` down to a project-local one.
+    ///
+    /// Walks upward from `project_dir` to the repo root -- the nearest
+    /// ancestor directory containing a `.git` entry, inclusive -- and reads
+    /// any `zhao.yml` found at each level along the way. Values are merged
+    /// root-to-leaf: a project-local Preset or per-Rule override wins over
+    /// the same key set at the root, but a root value still applies for any
+    /// key the project-local file leaves unset. If no `.git` is found (the
+    /// project isn't inside a git repository), this behaves identically to
+    /// [`Config::load`] on `project_dir`'s own `zhao.yml`.
+    pub fn load_for_project(project_dir: &Path) -> Result<Config, ConfigError> {
+        let mut layer = ConfigLayer::default();
+        for dir in ancestor_dirs_from_repo_root(project_dir) {
+            layer = ConfigLayer::load(&dir.join("zhao.yml"))?.onto(layer);
+        }
+        Ok(layer.into_config())
+    }
+}
+
+/// The directories to read a possible `zhao.yml` from, root-most first:
+/// every ancestor of `start` up to and including the nearest directory
+/// containing a `.git` entry, or just `start` alone if no `.git` is found
+/// before reaching the filesystem root.
+fn ancestor_dirs_from_repo_root(start: &Path) -> Vec<PathBuf> {
+    let mut chain = vec![start.to_path_buf()];
+    let mut current = start.to_path_buf();
+
+    loop {
+        if current.join(".git").exists() {
+            chain.reverse();
+            return chain;
+        }
+        match current.parent() {
+            Some(parent) => {
+                current = parent.to_path_buf();
+                chain.push(current.clone());
+            }
+            None => return vec![start.to_path_buf()],
+        }
+    }
+}
+
+/// One `zhao.yml`'s worth of settings, parsed but not yet merged with any
+/// other layer -- unlike [`Config`], a field left unset in the file stays
+/// `None` here rather than falling back to a default, so a later
+/// [`ConfigLayer::onto`] call can tell "not set at this level" apart from
+/// "explicitly set to the default."
+#[derive(Debug, Default)]
+struct ConfigLayer {
+    preset: Option<Preset>,
+    overrides: HashMap<RuleId, Severity>,
+}
+
+impl ConfigLayer {
+    /// Parses the `zhao.yml` at `path` into a layer. A missing file
+    /// produces an empty layer (nothing set), not an error.
+    fn load(path: &Path) -> Result<ConfigLayer, ConfigError> {
         if !path.exists() {
-            return Ok(Config::default());
+            return Ok(ConfigLayer::default());
         }
 
         let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -102,7 +175,27 @@ impl Config {
                 path: path.display().to_string(),
                 source,
             })?;
-        parsed.into_config(path)
+        parsed.into_layer(path)
+    }
+
+    /// Layers `self` (the more specific, e.g. project-local, settings) on
+    /// top of `base` (the less specific, e.g. root, settings): `self`'s
+    /// Preset wins if set, otherwise `base`'s Preset is kept; overrides are
+    /// merged key-by-key with `self`'s entries winning on conflict.
+    fn onto(self, base: ConfigLayer) -> ConfigLayer {
+        let mut overrides = base.overrides;
+        overrides.extend(self.overrides);
+        ConfigLayer {
+            preset: self.preset.or(base.preset),
+            overrides,
+        }
+    }
+
+    fn into_config(self) -> Config {
+        Config {
+            preset: self.preset.unwrap_or_default(),
+            overrides: self.overrides,
+        }
     }
 }
 
@@ -126,16 +219,17 @@ struct RawConfig {
 }
 
 impl RawConfig {
-    fn into_config(self, path: &Path) -> Result<Config, ConfigError> {
-        let preset = match self.preset {
-            None => Preset::default(),
-            Some(name) => {
-                Preset::from_config_name(&name).ok_or_else(|| ConfigError::UnknownPreset {
-                    path: path.display().to_string(),
-                    name: name.clone(),
-                })?
-            }
-        };
+    fn into_layer(self, path: &Path) -> Result<ConfigLayer, ConfigError> {
+        let preset =
+            match self.preset {
+                None => None,
+                Some(name) => Some(Preset::from_config_name(&name).ok_or_else(|| {
+                    ConfigError::UnknownPreset {
+                        path: path.display().to_string(),
+                        name: name.clone(),
+                    }
+                })?),
+            };
 
         let mut overrides = HashMap::new();
         for (rule_name, severity_name) in self.rules {
@@ -155,7 +249,7 @@ impl RawConfig {
             overrides.insert(rule, severity);
         }
 
-        Ok(Config { preset, overrides })
+        Ok(ConfigLayer { preset, overrides })
     }
 }
 
@@ -320,5 +414,135 @@ mod tests {
         let result = Config::load(file.path());
 
         assert!(matches!(result, Err(ConfigError::InvalidYaml { .. })));
+    }
+
+    /// Builds a fake repo under a fresh temp dir: a `.git` marker at the
+    /// root, and a nested dbt project directory a few levels down --
+    /// mirroring a real monorepo's shape closely enough to exercise
+    /// [`ancestor_dirs_from_repo_root`] and [`Config::load_for_project`]
+    /// without needing an actual git repository.
+    struct FakeRepo {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        project_dir: PathBuf,
+    }
+
+    fn fake_repo() -> FakeRepo {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let root = dir.path().to_path_buf();
+        fs::create_dir_all(root.join(".git")).expect("should create .git marker");
+        let project_dir = root.join("services").join("analytics");
+        fs::create_dir_all(&project_dir).expect("should create nested project dir");
+        FakeRepo {
+            _dir: dir,
+            root,
+            project_dir,
+        }
+    }
+
+    #[test]
+    fn root_only_zhao_yml_applies_to_a_nested_dbt_project() {
+        let repo = fake_repo();
+        fs::write(repo.root.join("zhao.yml"), "preset: strict\n")
+            .expect("should write root config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        assert_eq!(
+            config.severity_for(RuleId::ColumnTypeNarrowed),
+            Severity::Error
+        );
+    }
+
+    #[test]
+    fn project_local_zhao_yml_wins_per_key_root_still_applies_for_the_rest() {
+        let repo = fake_repo();
+        fs::write(
+            repo.root.join("zhao.yml"),
+            "preset: strict\nrules:\n  column-added: warn\n",
+        )
+        .expect("should write root config");
+        fs::write(
+            repo.project_dir.join("zhao.yml"),
+            "rules:\n  column-added: pass\n",
+        )
+        .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        // Project-local override wins for the key it sets.
+        assert_eq!(config.severity_for(RuleId::ColumnAdded), Severity::Pass);
+        // Root's Preset still applies for every key the project-local file
+        // doesn't touch, including the Preset itself.
+        assert_eq!(
+            config.severity_for(RuleId::ColumnTypeNarrowed),
+            Severity::Error
+        );
+    }
+
+    #[test]
+    fn project_local_preset_wins_over_root_preset() {
+        let repo = fake_repo();
+        fs::write(repo.root.join("zhao.yml"), "preset: strict\n")
+            .expect("should write root config");
+        fs::write(repo.project_dir.join("zhao.yml"), "preset: lenient\n")
+            .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        assert_eq!(
+            config.severity_for(RuleId::ColumnRemovedWithActiveReferences),
+            Severity::Warn
+        );
+    }
+
+    #[test]
+    fn a_single_project_repo_behaves_exactly_like_loading_its_own_zhao_yml() {
+        let repo = fake_repo();
+        fs::write(
+            repo.project_dir.join("zhao.yml"),
+            "preset: strict\nrules:\n  column-added: warn\n",
+        )
+        .expect("should write project config");
+
+        let via_project = Config::load_for_project(&repo.project_dir).expect("should parse");
+        let via_direct_path =
+            Config::load(&repo.project_dir.join("zhao.yml")).expect("should parse");
+
+        assert_eq!(via_project, via_direct_path);
+    }
+
+    #[test]
+    fn no_zhao_yml_anywhere_in_the_chain_produces_the_default_config() {
+        let repo = fake_repo();
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn without_a_git_repo_only_the_project_dirs_own_zhao_yml_is_read() {
+        // No `.git` anywhere -- `ancestor_dirs_from_repo_root` should fall
+        // back to just the project dir itself, not walk arbitrarily far up
+        // the real filesystem the test happens to run on.
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let parent_with_no_git = dir.path().join("not_a_repo_root");
+        let project_dir = parent_with_no_git.join("dbt_project");
+        fs::create_dir_all(&project_dir).expect("should create nested dir");
+        fs::write(parent_with_no_git.join("zhao.yml"), "preset: strict\n")
+            .expect("should write a decoy config one level up");
+        fs::write(project_dir.join("zhao.yml"), "preset: lenient\n")
+            .expect("should write the project's own config");
+
+        let config = Config::load_for_project(&project_dir).expect("should parse");
+
+        // Only `lenient` (the project's own file) should apply -- the
+        // decoy one level up must be ignored since no `.git` ties it to
+        // this project.
+        assert_eq!(
+            config.severity_for(RuleId::ColumnRemovedWithActiveReferences),
+            Severity::Warn
+        );
     }
 }

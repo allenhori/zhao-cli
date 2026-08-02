@@ -264,6 +264,125 @@ fn per_rule_override_wins_only_for_that_rule() {
     );
 }
 
+/// Builds a fake monorepo under a fresh temp dir: a `.git` marker at the
+/// root (so `Config::load_for_project` recognizes it as a repo root) and a
+/// nested dbt project directory, with the given fixture's manifest copied
+/// in as the project's `target/manifest.json`.
+fn fake_monorepo(project_manifest_fixture: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    std::fs::create_dir_all(dir.path().join(".git")).expect("should create .git marker");
+
+    let project_dir = dir.path().join("services").join("analytics");
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create project target dir");
+    std::fs::copy(
+        fixture(project_manifest_fixture)
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy fixture manifest");
+
+    (dir, project_dir)
+}
+
+/// A root-level `zhao.yml`, with no project-local file at all, must still
+/// apply to a nested dbt project -- the monorepo case with only one policy
+/// for the whole repo.
+#[test]
+fn a_root_only_zhao_yml_applies_to_a_nested_dbt_project() {
+    let (repo, project_dir) = fake_monorepo("rules_project");
+    std::fs::write(repo.path().join("zhao.yml"), "preset: strict\n")
+        .expect("should write root zhao.yml");
+
+    // Under the default Preset this Rule is `warn` (see
+    // `strict_preset_changes_a_warn_rule_to_error`); the root `zhao.yml`'s
+    // `strict` Preset must still raise it to `error` for the nested
+    // project, purely from the root file.
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("rules_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(&project_dir)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("\"rule\": \"join-cardinality-loosened\"")
+                .and(predicate::str::contains("\"severity\": \"error\"")),
+        );
+}
+
+/// A project-local `zhao.yml` must win over the root `zhao.yml` for the
+/// keys it sets, while the root's Preset still governs everything else --
+/// the same override relationship a Preset already has to an individual
+/// Rule override, one layer higher.
+#[test]
+fn a_project_local_zhao_yml_overrides_the_root_one_per_key() {
+    let (repo, project_dir) = fake_monorepo("rules_project");
+    std::fs::write(repo.path().join("zhao.yml"), "preset: strict\n")
+        .expect("should write root zhao.yml");
+    std::fs::write(
+        project_dir.join("zhao.yml"),
+        "rules:\n  join-cardinality-loosened: warn\n",
+    )
+    .expect("should write project-local zhao.yml");
+
+    // The project-local override pins this one Rule back to `warn` despite
+    // the root's `strict` Preset, so the gate passes.
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("rules_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(&project_dir)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(0)
+        .stdout(
+            predicate::str::contains("\"rule\": \"join-cardinality-loosened\"")
+                .and(predicate::str::contains("\"severity\": \"warn\"")),
+        );
+}
+
+/// A single-project repo (a `.git` at the same level as the dbt project,
+/// no monorepo nesting) must keep behaving exactly as it did in #8: its
+/// own `zhao.yml` applies, nothing more.
+#[test]
+fn a_single_project_repo_behaves_exactly_as_before_monorepo_support() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    std::fs::create_dir_all(dir.path().join(".git")).expect("should create .git marker");
+    std::fs::create_dir_all(dir.path().join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture("rules_project")
+            .join("target")
+            .join("manifest.json"),
+        dir.path().join("target").join("manifest.json"),
+    )
+    .expect("should copy fixture manifest");
+    std::fs::write(dir.path().join("zhao.yml"), "preset: strict\n").expect("should write zhao.yml");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("rules_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(dir.path())
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("\"rule\": \"join-cardinality-loosened\"")
+                .and(predicate::str::contains("\"severity\": \"error\"")),
+        );
+}
+
 /// An unknown Rule name or invalid Severity value in `zhao.yml` must
 /// produce a clear, actionable error (exit code 2, the same "zhao itself
 /// failed" code other config/IO errors use) rather than silently
