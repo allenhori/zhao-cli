@@ -1,0 +1,3 @@
+preset: strict
+rules:
+  column-added: pass

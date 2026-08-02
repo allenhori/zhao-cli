@@ -11,6 +11,7 @@
 //! layout as functionality lands here.
 
 pub mod adapters;
+pub mod config;
 pub mod diff;
 pub mod model;
 pub mod rules;

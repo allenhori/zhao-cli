@@ -173,6 +173,132 @@ fn type_widening_does_not_fire_while_join_loosening_does() {
     );
 }
 
+/// A project with no `zhao.yml` at all must behave identically to the v1
+/// hardcoded defaults -- this fixture is the same manifest pair as
+/// `type_widening_does_not_fire_while_join_loosening_does`, just without
+/// a config file, so the two tests together prove the "no config" and
+/// "with config" paths diverge only when a `zhao.yml` is actually present.
+#[test]
+fn no_zhao_yml_behaves_identically_to_v1_defaults() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("rules_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(0) // join-cardinality-loosened defaults to `warn`, not `error`
+        .stdout(
+            predicate::str::contains("\"rule\": \"join-cardinality-loosened\"")
+                .and(predicate::str::contains("\"severity\": \"warn\"")),
+        );
+}
+
+/// A `zhao.yml` selecting the `strict` Preset must change at least one
+/// Rule's outcome from `warn` to `error` versus no config at all -- same
+/// fixture as the no-config test above, but with `preset: strict` in
+/// `zhao.yml`, changing the exit code from 0 to 1.
+#[test]
+fn strict_preset_changes_a_warn_rule_to_error() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("rules_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("config_strict_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("\"rule\": \"join-cardinality-loosened\"")
+                .and(predicate::str::contains("\"severity\": \"error\"")),
+        );
+}
+
+/// A per-Rule override in `zhao.yml` must win over the Preset for that
+/// Rule only, leaving every other Rule at the Preset's value: `preset:
+/// strict` plus an override pinning `column-added` back to `pass` --
+/// `column-type-narrowed` (not overridden) must still become `error`
+/// under strict, while `column-added` stays `pass` despite strict.
+#[test]
+fn per_rule_override_wins_only_for_that_rule() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("config_override_project"))
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("command should run");
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
+    let findings = parsed["findings"]
+        .as_array()
+        .expect("findings should be an array");
+
+    let type_narrowed = findings
+        .iter()
+        .find(|f| f["rule"] == "column-type-narrowed")
+        .expect("column-type-narrowed should fire");
+    assert_eq!(
+        type_narrowed["severity"], "error",
+        "not overridden -- should follow the strict Preset"
+    );
+
+    let column_added = findings
+        .iter()
+        .find(|f| f["rule"] == "column-added")
+        .expect("column-added should fire");
+    assert_eq!(
+        column_added["severity"], "pass",
+        "overridden -- should stay pass despite the strict Preset"
+    );
+}
+
+/// An unknown Rule name or invalid Severity value in `zhao.yml` must
+/// produce a clear, actionable error (exit code 2, the same "zhao itself
+/// failed" code other config/IO errors use) rather than silently
+/// ignoring the mistake.
+#[test]
+fn invalid_zhao_yml_produces_a_clear_error() {
+    let dir = std::env::temp_dir().join(format!("zhao-invalid-config-test-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("target")).expect("should create temp dir");
+    std::fs::copy(
+        fixture("clean_project")
+            .join("target")
+            .join("manifest.json"),
+        dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy fixture manifest");
+    std::fs::write(dir.join("zhao.yml"), "rules:\n  not-a-real-rule: error\n")
+        .expect("should write zhao.yml");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest_clean.json"))
+        .arg("--project-dir")
+        .arg(&dir)
+        .assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("unknown rule")
+                .and(predicate::str::contains("not-a-real-rule")),
+        );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn exits_with_error_code_on_a_missing_baseline_path() {
     Command::cargo_bin("zhao")
