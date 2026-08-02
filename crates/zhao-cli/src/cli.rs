@@ -24,15 +24,24 @@ pub enum Command {
 /// Arguments to `zhao check`.
 #[derive(Debug, clap::Args)]
 pub struct CheckArgs {
-    /// Path to the Baseline's compiled dbt manifest (`manifest.json`).
+    /// Path to the Baseline's compiled dbt manifest (`manifest.json`). If
+    /// omitted, zhao resolves its own Baseline: it finds the merge-base
+    /// commit between `HEAD` and `--against`, checks it out into a
+    /// temporary git worktree, compiles it with `dbt`, and uses that as
+    /// the Baseline instead.
     #[arg(long)]
-    pub state: PathBuf,
+    pub state: Option<PathBuf>,
 
     /// The dbt project directory to check. Its current compiled manifest
     /// is read from `<project-dir>/target/manifest.json` -- run `dbt
     /// compile` in the project before invoking `zhao check`.
     #[arg(long, default_value = ".")]
     pub project_dir: PathBuf,
+
+    /// The ref to resolve a git-native Baseline's merge-base against.
+    /// Ignored when `--state` is given.
+    #[arg(long, default_value = "master")]
+    pub against: String,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]

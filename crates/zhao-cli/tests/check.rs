@@ -437,3 +437,236 @@ fn exits_with_error_code_on_a_missing_baseline_path() {
         .code(2)
         .stderr(predicate::str::contains("error:"));
 }
+
+// ---------------------------------------------------------------------
+// Git-native Baseline resolution (no `--state`): a throwaway git repo
+// with a real merge-base, and a stub `dbt` on `PATH` standing in for a
+// real dbt install -- these tests exercise zhao's own merge-base
+// resolution, worktree creation, and `dbt compile` invocation end to end,
+// without depending on whether a real `dbt` happens to be installed
+// wherever they run.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+mod git_native_baseline {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command as StdCommand;
+
+    /// A throwaway git repository, with helpers for the handful of git
+    /// operations these tests need.
+    struct TestRepo {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl TestRepo {
+        fn git(&self, args: &[&str]) {
+            let output = StdCommand::new("git")
+                .current_dir(&self.path)
+                .args(args)
+                .output()
+                .expect("git should be runnable in tests");
+            assert!(
+                output.status.success(),
+                "git {args:?} should succeed: {output:?}"
+            );
+        }
+
+        fn write(&self, relative_path: &str, contents: &str) {
+            let path = self.path.join(relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("should create parent dir");
+            }
+            std::fs::write(path, contents).expect("should write file");
+        }
+
+        fn commit(&self, message: &str) {
+            self.git(&["add", "."]);
+            self.git(&["commit", "-m", message]);
+        }
+    }
+
+    fn new_test_repo() -> TestRepo {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = dir.path().to_path_buf();
+        let repo = TestRepo { _dir: dir, path };
+
+        repo.git(&["init", "--initial-branch=master"]);
+        repo.git(&["config", "user.email", "test@zhao.invalid"]);
+        repo.git(&["config", "user.name", "zhao test"]);
+        repo
+    }
+
+    /// Writes an executable stub `dbt` to a fresh temp dir: `dbt compile`
+    /// just copies `dbt_manifest_source.json` (committed alongside the
+    /// project, so its content differs per commit) into
+    /// `target/manifest.json` -- close enough to real `dbt compile`'s
+    /// contract (produce `target/manifest.json` reflecting the checked-out
+    /// state) for these tests, without needing a real dbt install.
+    fn stub_dbt_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = dir.path().join("dbt");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nmkdir -p target\ncp dbt_manifest_source.json target/manifest.json\n",
+        )
+        .expect("should write stub dbt script");
+        let mut perms = std::fs::metadata(&path)
+            .expect("should stat stub script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("should chmod stub script");
+        dir
+    }
+
+    fn path_with_stub_dbt_prepended(stub_dir: &tempfile::TempDir) -> String {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        format!("{}:{existing}", stub_dir.path().display())
+    }
+
+    /// Builds a repo with one commit on `master` (whose
+    /// `dbt_manifest_source.json` is `baseline_manifest`) and a `feature`
+    /// branch one commit ahead (so `master`'s tip is the merge-base), with
+    /// `current_manifest` written directly as the working tree's
+    /// `target/manifest.json` -- the file `zhao check` reads for "current"
+    /// state regardless of Baseline resolution mode.
+    fn repo_with_baseline_and_current(baseline_manifest: &str, current_manifest: &str) -> TestRepo {
+        let repo = new_test_repo();
+        repo.write("dbt_manifest_source.json", baseline_manifest);
+        repo.commit("baseline state");
+
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("README.md", "an unrelated change on the feature branch\n");
+        repo.commit("feature work, ahead of master");
+
+        repo.write("target/manifest.json", current_manifest);
+        repo
+    }
+
+    fn rules_baseline_manifest_json() -> String {
+        std::fs::read_to_string(fixture("rules_baseline_manifest.json"))
+            .expect("should read fixture")
+    }
+
+    fn rules_project_current_manifest_json() -> String {
+        std::fs::read_to_string(
+            fixture("rules_project")
+                .join("target")
+                .join("manifest.json"),
+        )
+        .expect("should read fixture")
+    }
+
+    /// Acceptance criterion 1 & 2: with no `--state`, inside a git repo
+    /// with a real merge-base, `zhao check` resolves and compiles that
+    /// commit as the Baseline, and the resulting output matches what an
+    /// equivalent `--state <manifest>` run produces for the same diff --
+    /// this is the same fixture pair `type_widening_does_not_fire_while_join_loosening_does`
+    /// uses via `--state`, so the two tests' assertions being identical
+    /// *is* the equivalence proof.
+    #[test]
+    fn resolves_and_compiles_the_merge_base_commit_as_the_baseline() {
+        let stub_dir = stub_dbt_dir();
+        let repo = repo_with_baseline_and_current(
+            &rules_baseline_manifest_json(),
+            &rules_project_current_manifest_json(),
+        );
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env("PATH", path_with_stub_dbt_prepended(&stub_dir))
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .arg("--format")
+            .arg("json")
+            .output()
+            .expect("command should run");
+
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "expected exit 0 or 1, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
+        let findings = parsed["findings"]
+            .as_array()
+            .expect("findings should be an array");
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected only the join-loosening finding, got: {findings:#?}"
+        );
+        assert_eq!(findings[0]["rule"], "join-cardinality-loosened");
+        assert_eq!(findings[0]["from_kind"], "inner");
+        assert_eq!(findings[0]["to_kind"], "left");
+        assert!(
+            !findings.iter().any(|f| f["rule"] == "column-type-narrowed"),
+            "a type widening (int -> bigint) must not fire column-type-narrowed"
+        );
+    }
+
+    /// Acceptance criterion 3: a clear, actionable error (exit 2) when
+    /// `dbt` isn't invokable. `PATH` is overridden to a directory holding
+    /// only a `git` symlink -- deterministic regardless of whether a real
+    /// `dbt` happens to be installed on the machine running this test.
+    #[test]
+    fn produces_a_clear_error_when_dbt_is_not_invokable() {
+        let repo = repo_with_baseline_and_current(
+            &rules_baseline_manifest_json(),
+            &rules_project_current_manifest_json(),
+        );
+
+        let git_path = String::from_utf8(
+            StdCommand::new("sh")
+                .arg("-c")
+                .arg("command -v git")
+                .output()
+                .expect("should locate git")
+                .stdout,
+        )
+        .expect("git path should be utf8")
+        .trim()
+        .to_string();
+        let git_only_dir = tempfile::tempdir().expect("should create temp dir");
+        std::os::unix::fs::symlink(&git_path, git_only_dir.path().join("git"))
+            .expect("should symlink git");
+
+        Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env("PATH", git_only_dir.path())
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("dbt").and(predicate::str::contains("PATH")));
+    }
+
+    /// Acceptance criterion 4: a clear, actionable error (exit 2) when a
+    /// merge-base can't be determined -- here, because `--against` names a
+    /// ref that doesn't exist at all.
+    #[test]
+    fn produces_a_clear_error_when_a_merge_base_cannot_be_determined() {
+        let repo = repo_with_baseline_and_current(
+            &rules_baseline_manifest_json(),
+            &rules_project_current_manifest_json(),
+        );
+
+        Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .arg("--against")
+            .arg("this-branch-does-not-exist")
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("merge-base"));
+    }
+}
