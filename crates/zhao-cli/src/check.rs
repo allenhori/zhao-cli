@@ -42,7 +42,8 @@ pub fn run(args: &CheckArgs) -> ExitCode {
 
     let changes = diff(&baseline, &current);
     let findings = evaluate(&baseline, &changes, &config);
-    let report = Report::new(&changes, &findings);
+    let report = Report::new(&changes, &findings)
+        .with_staleness_warning(is_stale(&args.project_dir, &args.against));
 
     match args.format {
         OutputFormat::Json => match serde_json::to_string_pretty(&report) {
@@ -57,6 +58,17 @@ pub fn run(args: &CheckArgs) -> ExitCode {
     } else {
         EXIT_PASS
     })
+}
+
+/// Whether the Baseline's merge-base against `against` has fallen behind
+/// `against`'s current tip. Best-effort and purely informational: any
+/// failure to determine this (e.g. `project_dir` isn't inside a git
+/// repository at all) is treated as "not stale" rather than failing the
+/// whole command -- staleness is a courtesy warning, not a requirement.
+fn is_stale(project_dir: &Path, against: &str) -> bool {
+    zhao_core::git::repo_root(project_dir)
+        .and_then(|repo_root| zhao_core::git::merge_base_is_stale(&repo_root, against))
+        .unwrap_or(false)
 }
 
 fn load_manifest(path: &Path) -> Result<zhao_core::model::ParsedProject, String> {
