@@ -121,22 +121,60 @@ struct RawNode {
     unique_id: String,
     resource_type: String,
     name: String,
-    database: String,
-    schema: String,
-    alias: String,
+    // `manifest.nodes` holds every resource type (models, seeds,
+    // snapshots, tests, ...) in one map, so this struct must deserialize
+    // successfully for all of them even though only "model" entries are
+    // used. These three are optional (rather than required, non-`Option`
+    // fields) so that some future or older dbt version's non-model node
+    // shape lacking one of them doesn't fail parsing the *entire*
+    // manifest -- see `build_parsed_project`, which skips any "model"
+    // entry missing one, rather than using it with a bogus default.
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    schema: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
     #[serde(default)]
     depends_on: RawDependsOn,
     #[serde(default)]
     compiled_code: Option<String>,
 }
 
+impl RawNode {
+    /// This model's fully-qualified relation name, if all three parts are
+    /// present -- `None` for a malformed or unexpectedly-shaped entry.
+    fn qualified_name(&self) -> Option<QualifiedName> {
+        Some((
+            self.database.clone()?,
+            self.schema.clone()?,
+            self.alias.clone()?,
+        ))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawSource {
     unique_id: String,
     name: String,
-    database: String,
-    schema: String,
-    identifier: String,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    schema: Option<String>,
+    #[serde(default)]
+    identifier: Option<String>,
+}
+
+impl RawSource {
+    /// This source's fully-qualified relation name, if all three parts
+    /// are present -- `None` for a malformed or unexpectedly-shaped entry.
+    fn qualified_name(&self) -> Option<QualifiedName> {
+        Some((
+            self.database.clone()?,
+            self.schema.clone()?,
+            self.identifier.clone()?,
+        ))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -154,15 +192,24 @@ type QualifiedName = (String, String, String);
 // ---------------------------------------------------------------------
 
 fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
+    // Only "model" entries missing a usable qualified name are skipped
+    // (rather than failing the whole manifest) -- see the doc comment on
+    // `RawNode`'s `database`/`schema`/`alias` fields for why those are
+    // optional in the first place.
     let models: Vec<&RawNode> = manifest
         .nodes
         .values()
-        .filter(|n| n.resource_type == "model")
+        .filter(|n| n.resource_type == "model" && n.qualified_name().is_some())
         .collect();
 
-    let origins: Vec<Origin> = manifest
+    let sources: Vec<&RawSource> = manifest
         .sources
         .values()
+        .filter(|s| s.qualified_name().is_some())
+        .collect();
+
+    let origins: Vec<Origin> = sources
+        .iter()
         .map(|s| Origin {
             id: OriginId::new(s.unique_id.clone()),
             name: s.name.clone(),
@@ -174,23 +221,15 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
     // to `"database"."schema"."identifier"`) can be matched back to a
     // specific Node or Origin.
     let mut known_relations: HashMap<QualifiedName, Upstream> = HashMap::new();
-    for source in manifest.sources.values() {
+    for source in &sources {
         known_relations.insert(
-            (
-                source.database.clone(),
-                source.schema.clone(),
-                source.identifier.clone(),
-            ),
+            source.qualified_name().expect("filtered above"),
             Upstream::Origin(OriginId::new(source.unique_id.clone())),
         );
     }
     for model in &models {
         known_relations.insert(
-            (
-                model.database.clone(),
-                model.schema.clone(),
-                model.alias.clone(),
-            ),
+            model.qualified_name().expect("filtered above"),
             Upstream::Node(NodeId::new(model.unique_id.clone())),
         );
     }
@@ -260,11 +299,12 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
             LocalSchema::Passthrough(Upstream::Origin(_)) | LocalSchema::Opaque => {}
         }
 
-        // Baseline node-level edges from dbt's own dependency list -- the
-        // authoritative source, since it accounts for macro expansions and
-        // references our own SQL resolution might miss (e.g. in a WHERE
-        // clause). Column-level edges above are additive detail, not a
-        // replacement for these.
+        // Baseline node-level edges from dbt's own dependency list, for
+        // Node/Origin dependencies (see `resolve_dependency_id`) -- more
+        // reliable than our own SQL resolution alone, since it accounts
+        // for macro expansions and references our resolution might miss
+        // (e.g. in a WHERE clause). Column-level edges above are additive
+        // detail, not a replacement for these.
         for dep in &model.depends_on.nodes {
             if let Some(upstream) = resolve_dependency_id(dep, manifest) {
                 edges.push(LineageEdge {
@@ -290,7 +330,14 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
     }
 }
 
-/// Resolves a `depends_on.nodes` entry (a dbt `unique_id`) to an [`Upstream`].
+/// Resolves a `depends_on.nodes` entry (a dbt `unique_id`) to an
+/// [`Upstream`]. Returns `None` for a dependency on anything other than a
+/// model or a source (a seed or snapshot, for instance) -- v1 only
+/// represents Nodes (models) and Origins (sources), so a dependency on
+/// some other resource type currently produces no edge at all, not even a
+/// node-level one. This is a deliberate v1 scope limitation, not an
+/// oversight: extending Node/Origin to cover other dbt resource types is
+/// future work.
 fn resolve_dependency_id(unique_id: &str, manifest: &RawManifest) -> Option<Upstream> {
     if let Some(node) = manifest.nodes.get(unique_id) {
         if node.resource_type == "model" {
@@ -347,7 +394,7 @@ fn topological_order<'a>(models: &[&'a RawNode]) -> Vec<&'a RawNode> {
 
 /// A resolved column: its output name, and, if traceable to a single
 /// upstream Node/Origin column, where it comes from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedColumn {
     name: String,
     source: Option<(Upstream, String)>,
@@ -477,34 +524,56 @@ fn resolve_from(
     known_relations: &HashMap<QualifiedName, Upstream>,
     resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
 ) -> HashMap<String, LocalSchema> {
-    let mut result = HashMap::new();
+    let mut collected: Vec<(String, LocalSchema)> = Vec::new();
     for twj in from {
-        resolve_table_factor(
+        collect_table_factor(
             &twj.relation,
             scope,
             known_relations,
             resolved_schemas,
-            &mut result,
+            &mut collected,
         );
         for join in &twj.joins {
-            resolve_table_factor(
+            collect_table_factor(
                 &join.relation,
                 scope,
                 known_relations,
                 resolved_schemas,
-                &mut result,
+                &mut collected,
             );
         }
     }
-    result
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (alias, _) in &collected {
+        *counts.entry(alias.clone()).or_insert(0) += 1;
+    }
+
+    // A duplicate alias (two unaliased relations that happen to share a
+    // trailing name, or a base table shadowing an earlier CTE) means we
+    // can no longer trust which relation a later reference to it meant.
+    // Mark it opaque rather than silently keeping whichever one happened
+    // to be inserted last -- a wrong column-lineage guess is worse than
+    // an admittedly-unresolved one.
+    collected
+        .into_iter()
+        .map(|(alias, schema)| {
+            let schema = if counts[alias.as_str()] > 1 {
+                LocalSchema::Opaque
+            } else {
+                schema
+            };
+            (alias, schema)
+        })
+        .collect()
 }
 
-fn resolve_table_factor(
+fn collect_table_factor(
     factor: &TableFactor,
     scope: &HashMap<String, LocalSchema>,
     known_relations: &HashMap<QualifiedName, Upstream>,
     _resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
-    result: &mut HashMap<String, LocalSchema>,
+    collected: &mut Vec<(String, LocalSchema)>,
 ) {
     if let TableFactor::Table { name, alias, .. } = factor {
         let parts: Vec<String> = name
@@ -531,7 +600,7 @@ fn resolve_table_factor(
             LocalSchema::Opaque
         };
 
-        result.insert(effective_alias, resolved);
+        collected.push((effective_alias, resolved));
     }
     // Derived subqueries / table functions in FROM: not attempted (see
     // module-level "Known limitations").
@@ -625,18 +694,38 @@ fn resolve_unqualified(
         let only = from_scope.values().next()?;
         return source_of(only, column);
     }
-    // Ambiguous across multiple FROM items: only resolve if exactly one
-    // of them can actually provide this column.
-    let mut found = None;
-    for schema in from_scope.values() {
-        if let Some(hit) = source_of(schema, column) {
-            if found.is_some() {
-                return None; // genuinely ambiguous
-            }
-            found = Some(hit);
-        }
+
+    // A `Known` relation's columns are enumerated -- it either definitely
+    // has this column or definitely doesn't, so a `Known` hit is
+    // authoritative and wins over merely-possible matches.
+    let known_hits: Vec<(Upstream, String)> = from_scope
+        .values()
+        .filter_map(|schema| match schema {
+            LocalSchema::Known(_) => source_of(schema, column),
+            _ => None,
+        })
+        .collect();
+    match known_hits.len() {
+        1 => return known_hits.into_iter().next(),
+        n if n > 1 => return None, // genuinely ambiguous among Known relations
+        _ => {}
     }
-    found
+
+    // No `Known` relation claims this column -- fall back to
+    // `Passthrough` relations, whose real columns we can't enumerate to
+    // either confirm or rule out, so only resolve if exactly one is in
+    // scope (more than one is genuinely ambiguous).
+    let passthrough_hits: Vec<(Upstream, String)> = from_scope
+        .values()
+        .filter_map(|schema| match schema {
+            LocalSchema::Passthrough(upstream) => Some((upstream.clone(), column.to_string())),
+            _ => None,
+        })
+        .collect();
+    match passthrough_hits.len() {
+        1 => passthrough_hits.into_iter().next(),
+        _ => None,
+    }
 }
 
 fn resolve_qualified(
@@ -656,5 +745,92 @@ fn source_of(schema: &LocalSchema, column: &str) -> Option<(Upstream, String)> {
             .find(|c| c.name == column)
             .and_then(|c| c.source.clone()),
         LocalSchema::Opaque => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin(id: &str) -> Upstream {
+        Upstream::Origin(OriginId::new(id))
+    }
+
+    /// Regression test: two unaliased relations that happen to share a
+    /// trailing name (e.g. `"s1"."t"` and `"s2"."t"`) must not let the
+    /// second silently shadow the first in `from_scope` -- a reference to
+    /// the shared alias should come out unresolved, not confidently (and
+    /// wrongly) attributed to whichever one happened to be inserted last.
+    #[test]
+    fn duplicate_unaliased_relation_names_become_unresolved_not_silently_wrong() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s1".to_string(), "t".to_string()),
+            origin("origin.s1.t"),
+        );
+        known_relations.insert(
+            ("db".to_string(), "s2".to_string(), "t".to_string()),
+            origin("origin.s2.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query =
+            parse_query(r#"select t.x from "db"."s1"."t", "db"."s2"."t""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert!(
+                    cols[0].source.is_none(),
+                    "an alias collision between two relations must not silently resolve to either one"
+                );
+            }
+            other => panic!("expected Known([x]) with an unresolved source, got {other:?}"),
+        }
+    }
+
+    /// Regression test: when one relation's columns are fully known (a CTE
+    /// with an explicit projection list) and another is a passthrough of
+    /// an upstream we can't enumerate, a column that's definitely on the
+    /// known relation must resolve there -- not get discarded as
+    /// "ambiguous" just because the passthrough can't be ruled out.
+    #[test]
+    fn known_relation_match_wins_over_an_unruled_out_passthrough_candidate() {
+        // "tbl" backs CTE "a", which has an explicit projection list -- so
+        // "a" resolves to `Known([id, name])` in the outer query's scope,
+        // not a `Passthrough`. "t2" is a raw base-table reference, which
+        // always resolves to `Passthrough` (its real columns are never
+        // enumerated). The outer query's unqualified `name` must resolve
+        // to the `Known` side, since that's the only one we can actually
+        // confirm has a `name` column.
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "tbl".to_string()),
+            origin("origin.s.tbl"),
+        );
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t2".to_string()),
+            origin("origin.s.t2"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"with a as (select id, name from "db"."s"."tbl") select name from a, "db"."s"."t2""#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "name");
+                assert_eq!(
+                    cols[0].source,
+                    Some((origin("origin.s.tbl"), "name".to_string()))
+                );
+            }
+            other => panic!("expected Known([name sourced from tbl via CTE a]), got {other:?}"),
+        }
     }
 }

@@ -251,3 +251,53 @@ fn resolves_a_join_and_aggregation_across_two_upstream_models() {
         "a computed (coalesce) column should not have a resolved source"
     );
 }
+
+#[test]
+fn resolves_an_incremental_model_the_same_as_an_equivalent_non_incremental_one() {
+    let project = DbtAdapter
+        .parse(fixture_path())
+        .expect("fixture should parse");
+
+    // fct_orders_incremental has the same shape as fct_orders (it's the
+    // same query, just wrapped in dbt's `is_incremental()` macro, which
+    // compiles to nothing on a from-scratch build) -- resolution must not
+    // regress for the incremental materialization specifically.
+    let incremental = project
+        .nodes
+        .iter()
+        .find(|n| n.name == "fct_orders_incremental")
+        .expect("fct_orders_incremental should exist");
+
+    let column_names: Vec<&str> = incremental.columns.iter().map(|c| c.as_str()).collect();
+    assert_eq!(
+        column_names,
+        vec!["order_id", "customer_id", "order_date", "status", "amount"]
+    );
+
+    let stg_orders_id = NodeId::new("model.zhao_dbt_test.stg_orders");
+    let incremental_id = NodeId::new("model.zhao_dbt_test.fct_orders_incremental");
+
+    let order_id_traced = project.edges.iter().any(|e| {
+        e.upstream == Upstream::Node(stg_orders_id.clone())
+            && e.downstream == incremental_id
+            && e.column.as_ref().is_some_and(|c| {
+                c.upstream_column.as_str() == "order_id"
+                    && c.downstream_column.as_str() == "order_id"
+            })
+    });
+    assert!(
+        order_id_traced,
+        "expected order_id to trace back to stg_orders on the incremental model too"
+    );
+
+    let amount_has_no_column_edge = !project.edges.iter().any(|e| {
+        e.downstream == incremental_id
+            && e.column
+                .as_ref()
+                .is_some_and(|c| c.downstream_column.as_str() == "amount")
+    });
+    assert!(
+        amount_has_no_column_edge,
+        "the computed amount column should not have a resolved source on the incremental model either"
+    );
+}
