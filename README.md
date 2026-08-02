@@ -10,4 +10,18 @@ reaches — so CI runs only what matters, deterministically, offline, with no ex
 
 ## Status
 
-Pre-implementation.
+Early development. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the code is organized.
+
+## Building
+
+```bash
+cargo build --workspace
+cargo test --workspace
+```
+
+Requires a recent stable Rust toolchain (edition 2024). Before opening a PR, also run:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```

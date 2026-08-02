@@ -1,0 +1,18 @@
+[package]
+name = "zhao-cli"
+description = "Deterministic, offline change-review and CI gate for data transformation projects."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zhao"
+path = "src/main.rs"
+
+[dependencies]
+zhao-core = { path = "../zhao-core" }

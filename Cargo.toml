@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/zhao-core", "crates/zhao-cli"]
+
+# Shared package metadata. Individual crates opt in with `field.workspace = true`
+# so there's a single place to bump the version, change the license, etc.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/allenhori/zhao-cli"
+
+# Lint policy lives here, once, rather than being copy-pasted (and drifting)
+# across every crate's own Cargo.toml. Each member opts in with `[lints]
+# workspace = true`.
+[workspace.lints.rust]
+# Every public item must be documented. This is the enforcement mechanism
+# for the project's "no undocumented public API" requirement -- it fails
+# the build itself, not just a separate CI step, so it can't be skipped.
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
