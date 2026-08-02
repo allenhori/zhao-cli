@@ -350,6 +350,16 @@ fn join_kind_slug(kind: JoinKind) -> String {
 /// `WARN` with the specific reference and Rule that fired), and a summary
 /// line. Every Node reference goes through `vocabulary` (e.g. "model" for
 /// dbt), never zhao's own internal "Node"/"Origin" terms.
+///
+/// ## Known limitation
+///
+/// `vocabulary.origin_term()` (e.g. "source" for dbt) is never actually
+/// used here: neither [`Change`] nor [`FindingDetail`] can reference an
+/// Origin today -- `diff()` only ever compares Nodes -- so there's
+/// currently no path through this report that could render one. This
+/// isn't a gap in this function specifically; it'll start mattering once
+/// the diff engine itself gains the ability to detect an Origin-level
+/// change (e.g. a source's declared schema changing).
 pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary) -> String {
     let mut out = String::new();
     let node_term = vocabulary.node_term();

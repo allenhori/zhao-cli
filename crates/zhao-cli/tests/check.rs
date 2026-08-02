@@ -125,6 +125,41 @@ fn downstream_impact_lists_only_nodes_actually_reached_with_reason_and_rule() {
     );
 }
 
+/// Acceptance criterion 3's "not the whole DAG" half, proven directly:
+/// `breaking_project`'s manifest has six models total, but only
+/// `stg_customers` and `dim_customers` are actually changed or reached.
+/// The other four -- `stg_payments`, `stg_orders`, `fct_orders`,
+/// `fct_orders_incremental` -- are unrelated and must appear in neither
+/// "Changed" nor "Downstream impact", even though they're real models in
+/// the same project's dependency graph.
+#[test]
+fn unrelated_models_in_the_same_project_do_not_appear_in_either_section() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .output()
+        .expect("command should run");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+
+    for unrelated in [
+        "stg_payments",
+        "stg_orders",
+        "fct_orders",
+        "fct_orders_incremental",
+    ] {
+        assert!(
+            !stdout.contains(unrelated),
+            "{unrelated} is unrelated to this diff and must not appear anywhere in the \
+             report, but it did: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn exits_non_zero_and_reports_the_breaking_change_as_json() {
     Command::cargo_bin("zhao")
