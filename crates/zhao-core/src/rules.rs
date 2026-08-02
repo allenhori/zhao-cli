@@ -15,6 +15,7 @@
 //!   semantics in the same sense the others are, and comparing it against
 //!   them would overstate what this Rule actually knows.
 
+use crate::config::Config;
 use crate::diff::Change;
 use crate::model::{ColumnName, JoinKind, NodeId, ParsedProject, Upstream};
 
@@ -29,9 +30,21 @@ pub enum Severity {
     Pass,
 }
 
+impl Severity {
+    /// Parses a Severity's `zhao.yml` configuration name.
+    pub fn from_config_name(name: &str) -> Option<Severity> {
+        match name {
+            "error" => Some(Severity::Error),
+            "warn" => Some(Severity::Warn),
+            "pass" => Some(Severity::Pass),
+            _ => None,
+        }
+    }
+}
+
 /// One of zhao's built-in Rules: a specific, named kind of semantic Change
 /// the engine can detect and classify.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleId {
     /// A column was removed from a Node while a downstream Node still
     /// held an active (column-level-resolved) reference to it in the
@@ -54,6 +67,41 @@ impl RuleId {
             RuleId::JoinCardinalityLoosened => Severity::Warn,
             RuleId::ColumnAdded => Severity::Pass,
         }
+    }
+
+    /// This Rule's canonical name in `zhao.yml` configuration.
+    pub fn config_name(self) -> &'static str {
+        match self {
+            RuleId::ColumnRemovedWithActiveReferences => "column-removed-with-active-references",
+            RuleId::ColumnTypeNarrowed => "column-type-narrowed",
+            RuleId::JoinCardinalityLoosened => "join-cardinality-loosened",
+            RuleId::ColumnAdded => "column-added",
+        }
+    }
+
+    /// Parses a Rule's `zhao.yml` configuration name back into a `RuleId`.
+    pub fn from_config_name(name: &str) -> Option<RuleId> {
+        match name {
+            "column-removed-with-active-references" => {
+                Some(RuleId::ColumnRemovedWithActiveReferences)
+            }
+            "column-type-narrowed" => Some(RuleId::ColumnTypeNarrowed),
+            "join-cardinality-loosened" => Some(RuleId::JoinCardinalityLoosened),
+            "column-added" => Some(RuleId::ColumnAdded),
+            _ => None,
+        }
+    }
+
+    /// Every Rule in the v1 catalog, in declaration order. Exists so
+    /// callers (e.g. an "unknown rule name" error message) can list valid
+    /// names without duplicating the catalog themselves.
+    pub fn all() -> [RuleId; 4] {
+        [
+            RuleId::ColumnRemovedWithActiveReferences,
+            RuleId::ColumnTypeNarrowed,
+            RuleId::JoinCardinalityLoosened,
+            RuleId::ColumnAdded,
+        ]
     }
 }
 
@@ -131,23 +179,26 @@ pub struct Finding {
 /// Evaluates every Rule against a Change list, using `baseline`'s Lineage
 /// Edges where a Rule needs to know what was actively referenced before
 /// the Change happened (a removed column's own Lineage Edge no longer
-/// exists in the current state, so only the Baseline can answer that).
-pub fn evaluate(baseline: &ParsedProject, changes: &[Change]) -> Vec<Finding> {
+/// exists in the current state, so only the Baseline can answer that),
+/// and `config` to resolve each Rule's configured Severity.
+pub fn evaluate(baseline: &ParsedProject, changes: &[Change], config: &Config) -> Vec<Finding> {
     changes
         .iter()
-        .flat_map(|change| evaluate_change(baseline, change))
+        .flat_map(|change| evaluate_change(baseline, change, config))
         .collect()
 }
 
-fn evaluate_change(baseline: &ParsedProject, change: &Change) -> Vec<Finding> {
+fn evaluate_change(baseline: &ParsedProject, change: &Change, config: &Config) -> Vec<Finding> {
     match change {
-        Change::ColumnRemoved { .. } => column_removed_with_active_references(baseline, change),
+        Change::ColumnRemoved { .. } => {
+            column_removed_with_active_references(baseline, change, config)
+        }
         Change::ColumnTypeChanged {
             node,
             column,
             from_type,
             to_type,
-        } => column_type_narrowed(node, column, from_type, to_type)
+        } => column_type_narrowed(node, column, from_type, to_type, config)
             .into_iter()
             .collect(),
         Change::JoinChanged {
@@ -155,21 +206,24 @@ fn evaluate_change(baseline: &ParsedProject, change: &Change) -> Vec<Finding> {
             position,
             from_kind,
             to_kind,
-        } => join_cardinality_loosened(node, *position, *from_kind, *to_kind)
+        } => join_cardinality_loosened(node, *position, *from_kind, *to_kind, config)
             .into_iter()
             .collect(),
         Change::ColumnAdded { node, column } => {
-            vec![finding(FindingDetail::ColumnAdded {
-                node: node.clone(),
-                column: column.clone(),
-            })]
+            vec![finding(
+                config,
+                FindingDetail::ColumnAdded {
+                    node: node.clone(),
+                    column: column.clone(),
+                },
+            )]
         }
     }
 }
 
-fn finding(detail: FindingDetail) -> Finding {
+fn finding(config: &Config, detail: FindingDetail) -> Finding {
     Finding {
-        severity: detail.rule().default_severity(),
+        severity: config.severity_for(detail.rule()),
         detail,
     }
 }
@@ -177,6 +231,7 @@ fn finding(detail: FindingDetail) -> Finding {
 fn column_removed_with_active_references(
     baseline: &ParsedProject,
     change: &Change,
+    config: &Config,
 ) -> Vec<Finding> {
     let Change::ColumnRemoved { node, column } = change else {
         return Vec::new();
@@ -189,12 +244,15 @@ fn column_removed_with_active_references(
         .filter_map(|edge| {
             let lineage = edge.column.as_ref()?;
             (&lineage.upstream_column == column).then(|| {
-                finding(FindingDetail::ColumnRemovedWithActiveReferences {
-                    node: node.clone(),
-                    column: column.clone(),
-                    reached: edge.downstream.clone(),
-                    reached_column: lineage.downstream_column.clone(),
-                })
+                finding(
+                    config,
+                    FindingDetail::ColumnRemovedWithActiveReferences {
+                        node: node.clone(),
+                        column: column.clone(),
+                        reached: edge.downstream.clone(),
+                        reached_column: lineage.downstream_column.clone(),
+                    },
+                )
             })
         })
         .collect()
@@ -224,16 +282,20 @@ fn column_type_narrowed(
     column: &ColumnName,
     from_type: &str,
     to_type: &str,
+    config: &Config,
 ) -> Option<Finding> {
     let from_rank = integer_width_rank(from_type)?;
     let to_rank = integer_width_rank(to_type)?;
     (to_rank < from_rank).then(|| {
-        finding(FindingDetail::ColumnTypeNarrowed {
-            node: node.clone(),
-            column: column.clone(),
-            from_type: from_type.to_string(),
-            to_type: to_type.to_string(),
-        })
+        finding(
+            config,
+            FindingDetail::ColumnTypeNarrowed {
+                node: node.clone(),
+                column: column.clone(),
+                from_type: from_type.to_string(),
+                to_type: to_type.to_string(),
+            },
+        )
     })
 }
 
@@ -251,18 +313,22 @@ fn join_cardinality_loosened(
     position: usize,
     from_kind: Option<JoinKind>,
     to_kind: Option<JoinKind>,
+    config: &Config,
 ) -> Option<Finding> {
     let from_kind = from_kind?;
     let to_kind = to_kind?;
     let from_rank = looseness_rank(from_kind)?;
     let to_rank = looseness_rank(to_kind)?;
     (to_rank > from_rank).then(|| {
-        finding(FindingDetail::JoinCardinalityLoosened {
-            node: node.clone(),
-            position,
-            from_kind,
-            to_kind,
-        })
+        finding(
+            config,
+            FindingDetail::JoinCardinalityLoosened {
+                node: node.clone(),
+                position,
+                from_kind,
+                to_kind,
+            },
+        )
     })
 }
 
@@ -320,7 +386,7 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&baseline, &changes),
+            evaluate(&baseline, &changes, &Config::default()),
             vec![Finding {
                 severity: Severity::Error,
                 detail: FindingDetail::ColumnRemovedWithActiveReferences {
@@ -354,7 +420,10 @@ mod tests {
             column: column("x"),
         }];
 
-        assert_eq!(evaluate(&baseline, &changes), Vec::new());
+        assert_eq!(
+            evaluate(&baseline, &changes, &Config::default()),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -374,7 +443,10 @@ mod tests {
             column: column("x"),
         }];
 
-        assert_eq!(evaluate(&baseline, &changes), Vec::new());
+        assert_eq!(
+            evaluate(&baseline, &changes, &Config::default()),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -387,7 +459,7 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes),
+            evaluate(&empty_project(), &changes, &Config::default()),
             vec![Finding {
                 severity: Severity::Warn,
                 detail: FindingDetail::ColumnTypeNarrowed {
@@ -409,7 +481,10 @@ mod tests {
             to_type: "bigint".to_string(),
         }];
 
-        assert_eq!(evaluate(&empty_project(), &changes), Vec::new());
+        assert_eq!(
+            evaluate(&empty_project(), &changes, &Config::default()),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -422,7 +497,10 @@ mod tests {
             to_type: "varchar(50)".to_string(),
         }];
 
-        assert_eq!(evaluate(&empty_project(), &changes), Vec::new());
+        assert_eq!(
+            evaluate(&empty_project(), &changes, &Config::default()),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -435,7 +513,7 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes),
+            evaluate(&empty_project(), &changes, &Config::default()),
             vec![Finding {
                 severity: Severity::Warn,
                 detail: FindingDetail::JoinCardinalityLoosened {
@@ -457,7 +535,10 @@ mod tests {
             to_kind: Some(JoinKind::Full),
         }];
 
-        assert_eq!(evaluate(&empty_project(), &changes).len(), 1);
+        assert_eq!(
+            evaluate(&empty_project(), &changes, &Config::default()).len(),
+            1
+        );
     }
 
     #[test]
@@ -470,7 +551,10 @@ mod tests {
             to_kind: Some(JoinKind::Inner),
         }];
 
-        assert_eq!(evaluate(&empty_project(), &changes), Vec::new());
+        assert_eq!(
+            evaluate(&empty_project(), &changes, &Config::default()),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -488,8 +572,14 @@ mod tests {
             to_kind: None,
         }];
 
-        assert_eq!(evaluate(&empty_project(), &added), Vec::new());
-        assert_eq!(evaluate(&empty_project(), &removed), Vec::new());
+        assert_eq!(
+            evaluate(&empty_project(), &added, &Config::default()),
+            Vec::new()
+        );
+        assert_eq!(
+            evaluate(&empty_project(), &removed, &Config::default()),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -500,7 +590,7 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes),
+            evaluate(&empty_project(), &changes, &Config::default()),
             vec![Finding {
                 severity: Severity::Pass,
                 detail: FindingDetail::ColumnAdded {
@@ -553,7 +643,7 @@ mod tests {
             },
         ];
 
-        let findings = evaluate(&baseline, &changes);
+        let findings = evaluate(&baseline, &changes, &Config::default());
         assert_eq!(findings.len(), 4);
 
         let rules: Vec<RuleId> = findings.iter().map(|f| f.detail.rule()).collect();

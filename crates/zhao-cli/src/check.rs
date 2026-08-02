@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use zhao_core::adapters::TransformationToolAdapter;
 use zhao_core::adapters::dbt::DbtAdapter;
+use zhao_core::config::Config;
 use zhao_core::diff::diff;
 use zhao_core::rules::evaluate;
 
@@ -24,6 +25,7 @@ const EXIT_ERROR: u8 = 2;
 /// Runs `zhao check` and returns the process exit code.
 pub fn run(args: &CheckArgs) -> ExitCode {
     let current_manifest = args.project_dir.join("target").join("manifest.json");
+    let config_path = args.project_dir.join("zhao.yml");
 
     let baseline = match load_manifest(&args.state) {
         Ok(project) => project,
@@ -33,9 +35,13 @@ pub fn run(args: &CheckArgs) -> ExitCode {
         Ok(project) => project,
         Err(message) => return fail(&message),
     };
+    let config = match Config::load(&config_path) {
+        Ok(config) => config,
+        Err(err) => return fail(&err.to_string()),
+    };
 
     let changes = diff(&baseline, &current);
-    let findings = evaluate(&baseline, &changes);
+    let findings = evaluate(&baseline, &changes, &config);
     let report = Report::new(&changes, &findings);
 
     match args.format {
