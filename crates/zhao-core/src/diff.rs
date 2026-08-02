@@ -1,6 +1,19 @@
 //! Computing the set of [`Change`]s between two [`ParsedProject`] states
 //! (a Baseline and a current state, both produced by the same
 //! [`crate::adapters::TransformationToolAdapter`]).
+//!
+//! ## Known limitations
+//!
+//! Join comparison aligns the Baseline's and current state's join-kind
+//! sequences via their longest common subsequence rather than comparing
+//! index-by-index, so that a join inserted or removed in the middle of a
+//! sequence is reported as
+//! exactly that, not a cascade of unrelated-looking kind changes in every
+//! join after it. The one honest caveat: when the same [`JoinKind`]
+//! appears more than once in a Node's definition, this alignment can pair
+//! a "kept" occurrence with a different occurrence than a human reading
+//! the SQL would assume -- joins are only ever compared by kind here,
+//! never by what they actually join on.
 
 use crate::model::{Column, ColumnName, JoinKind, Node, NodeId, ParsedProject};
 
@@ -117,20 +130,111 @@ fn column_type_change(node: &NodeId, baseline: &Column, current: &Column) -> Opt
     })
 }
 
+/// A single step in an edit script transforming one join-kind sequence
+/// into another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinEditOp {
+    /// This join is present, unchanged, in both sequences.
+    Keep(JoinKind),
+    /// This join is only in the Baseline.
+    Remove(JoinKind),
+    /// This join is only in the current state.
+    Add(JoinKind),
+}
+
+/// Compares two join-kind sequences positionally is unsound: inserting or
+/// removing a join anywhere but the end shifts every later join's index,
+/// which a naive index-by-index comparison reports as that many
+/// independent kind changes -- wrong, not just imprecise (see the
+/// module-level doc comment's rationale for "no Change is better than a
+/// wrong one"). This aligns the two sequences via their longest common
+/// subsequence first, so an insertion/removal in the middle is reported
+/// as exactly that, not a cascade of unrelated-looking changes.
+///
+/// One honest caveat: when the same [`JoinKind`] appears more than once
+/// in a sequence, LCS alignment may pair a "kept" occurrence with a
+/// different occurrence than a human skimming the SQL would assume --
+/// the joins are structurally interchangeable from this function's point
+/// of view, since it only ever sees their kind, never what they join on.
+fn join_edit_script(baseline: &[JoinKind], current: &[JoinKind]) -> Vec<JoinEditOp> {
+    let (m, n) = (baseline.len(), current.len());
+    let mut lcs_length = vec![vec![0usize; n + 1]; m + 1];
+    for i in 1..=m {
+        for j in 1..=n {
+            lcs_length[i][j] = if baseline[i - 1] == current[j - 1] {
+                lcs_length[i - 1][j - 1] + 1
+            } else {
+                lcs_length[i - 1][j].max(lcs_length[i][j - 1])
+            };
+        }
+    }
+
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (m, n);
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && baseline[i - 1] == current[j - 1] {
+            ops.push(JoinEditOp::Keep(baseline[i - 1]));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || lcs_length[i][j - 1] >= lcs_length[i - 1][j]) {
+            ops.push(JoinEditOp::Add(current[j - 1]));
+            j -= 1;
+        } else {
+            ops.push(JoinEditOp::Remove(baseline[i - 1]));
+            i -= 1;
+        }
+    }
+    ops.reverse();
+    ops
+}
+
 fn diff_joins(baseline: &Node, current: &Node) -> Vec<Change> {
-    let longest = baseline.joins.len().max(current.joins.len());
-    (0..longest)
-        .filter_map(|position| {
-            let from_kind = baseline.joins.get(position).copied();
-            let to_kind = current.joins.get(position).copied();
-            (from_kind != to_kind).then_some(Change::JoinChanged {
-                node: current.id.clone(),
-                position,
-                from_kind,
-                to_kind,
-            })
-        })
-        .collect()
+    let ops = join_edit_script(&baseline.joins, &current.joins);
+
+    let mut changes = Vec::new();
+    let mut position = 0;
+    let mut i = 0;
+    while i < ops.len() {
+        match ops[i] {
+            JoinEditOp::Keep(_) => {
+                position += 1;
+                i += 1;
+            }
+            JoinEditOp::Remove(from_kind) => {
+                // A removal immediately followed by an addition is a kind
+                // change at the same position, not two independent edits.
+                if let Some(JoinEditOp::Add(to_kind)) = ops.get(i + 1) {
+                    changes.push(Change::JoinChanged {
+                        node: current.id.clone(),
+                        position,
+                        from_kind: Some(from_kind),
+                        to_kind: Some(*to_kind),
+                    });
+                    position += 1;
+                    i += 2;
+                } else {
+                    changes.push(Change::JoinChanged {
+                        node: current.id.clone(),
+                        position,
+                        from_kind: Some(from_kind),
+                        to_kind: None,
+                    });
+                    i += 1;
+                }
+            }
+            JoinEditOp::Add(to_kind) => {
+                changes.push(Change::JoinChanged {
+                    node: current.id.clone(),
+                    position,
+                    from_kind: None,
+                    to_kind: Some(to_kind),
+                });
+                position += 1;
+                i += 1;
+            }
+        }
+    }
+    changes
 }
 
 #[cfg(test)]
@@ -247,6 +351,34 @@ mod tests {
                 position: 0,
                 from_kind: None,
                 to_kind: Some(JoinKind::Inner)
+            }]
+        );
+    }
+
+    /// Regression test: a join inserted in the *middle* of a sequence
+    /// (not at the end) must be reported as one addition, not as a false
+    /// kind-change cascading through every join that shifted position
+    /// after it. Naive index-by-index comparison gets this wrong.
+    #[test]
+    fn a_join_inserted_in_the_middle_reports_one_addition_not_a_cascade() {
+        let baseline = project(vec![node(
+            "model.a",
+            vec![],
+            vec![JoinKind::Inner, JoinKind::Left],
+        )]);
+        let current = project(vec![node(
+            "model.a",
+            vec![],
+            vec![JoinKind::Cross, JoinKind::Inner, JoinKind::Left],
+        )]);
+
+        assert_eq!(
+            diff(&baseline, &current),
+            vec![Change::JoinChanged {
+                node: NodeId::new("model.a"),
+                position: 0,
+                from_kind: None,
+                to_kind: Some(JoinKind::Cross),
             }]
         );
     }
