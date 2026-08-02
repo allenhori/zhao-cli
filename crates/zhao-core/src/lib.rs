@@ -10,6 +10,9 @@
 //! See `ARCHITECTURE.md` at the repository root for the intended module
 //! layout as functionality lands here.
 
+pub mod adapters;
+pub mod model;
+
 /// Returns this crate's version, as declared in `Cargo.toml`.
 ///
 /// Exists so that consumers (starting with `zhao-cli`) can report the exact
