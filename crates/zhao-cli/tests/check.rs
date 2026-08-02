@@ -11,6 +11,155 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(name)
 }
 
+/// Acceptance criteria 1, 2, 4, 5 together: with no `--format json`,
+/// `zhao check` produces the three-part human-readable report, the
+/// "Changed" section lists exactly the Nodes that changed with the
+/// precise change described, the summary line's counts match the
+/// underlying data, and every reference uses dbt's vocabulary
+/// ("model"), never zhao's internal "Node"/"Origin" terms.
+#[test]
+fn default_text_output_produces_the_three_part_human_readable_report() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .output()
+        .expect("command should run");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+
+    assert!(stdout.contains("Changed:\n"), "{stdout}");
+    assert!(stdout.contains("Downstream impact:\n"), "{stdout}");
+    assert!(stdout.contains("Summary:"), "{stdout}");
+
+    // "Changed" lists exactly the two Nodes with real Changes, each with
+    // its precise change described (not just a generic "something
+    // changed").
+    assert!(
+        stdout.contains("model model.zhao_dbt_test.stg_customers:"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("model model.zhao_dbt_test.dim_customers:"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("~ column type changed: customer_id (bigint -> int)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("+ column added: marketing_source"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("- column removed: last_name"), "{stdout}");
+    assert!(
+        stdout.contains("~ join changed at position 0: left -> inner"),
+        "{stdout}"
+    );
+
+    // Summary counts match the fixture's known 5 Changes / 3 Findings
+    // exactly (see `all_applicable_rules_fire_together_on_a_fixture_with_simultaneous_changes`
+    // for the same fixture's JSON-shaped equivalent of these counts): 2
+    // Nodes changed, 4 of the 5 Changes are column-level (the join
+    // change isn't), 1 error-severity Finding, 1 warn-severity Finding
+    // (the pass-severity `column-added` Finding isn't counted here).
+    assert!(
+        stdout.contains("Summary: 2 model(s) changed, 4 column(s) changed, 1 breaking, 1 warning"),
+        "{stdout}"
+    );
+
+    // Vocabulary: "model", never zhao's internal terms.
+    assert!(!stdout.contains("Node "), "{stdout}");
+    assert!(!stdout.contains("Origin "), "{stdout}");
+}
+
+/// Acceptance criterion 3: "Downstream impact" lists only Nodes actually
+/// reached by a breaking/warning Finding (not the whole DAG, and not a
+/// Node that merely changed without producing a Finding), each with the
+/// specific reference and Rule name -- and a `pass`-severity Finding
+/// (informational, not impact) must not appear there at all, even though
+/// its underlying Change does appear in "Changed".
+#[test]
+fn downstream_impact_lists_only_nodes_actually_reached_with_reason_and_rule() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .output()
+        .expect("command should run");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let downstream_impact = stdout
+        .split("Downstream impact:\n")
+        .nth(1)
+        .expect("Downstream impact section should be present")
+        .split("\nSummary:")
+        .next()
+        .expect("Summary should follow Downstream impact");
+
+    assert!(
+        downstream_impact.contains(
+            "[BREAKING] last_name removed from model model.zhao_dbt_test.stg_customers \
+             breaks reference via last_name (column-removed-with-active-references)"
+        ),
+        "{downstream_impact}"
+    );
+    assert!(
+        downstream_impact
+            .contains("[WARN] customer_id type narrowed from bigint to int (column-type-narrowed)"),
+        "{downstream_impact}"
+    );
+    // `marketing_source` (the pass-severity `column-added` Change) must
+    // not appear in this section at all -- it's informational, not
+    // downstream impact.
+    assert!(
+        !downstream_impact.contains("marketing_source"),
+        "a pass-severity finding must not appear in Downstream impact: {downstream_impact}"
+    );
+}
+
+/// Acceptance criterion 3's "not the whole DAG" half, proven directly:
+/// `breaking_project`'s manifest has six models total, but only
+/// `stg_customers` and `dim_customers` are actually changed or reached.
+/// The other four -- `stg_payments`, `stg_orders`, `fct_orders`,
+/// `fct_orders_incremental` -- are unrelated and must appear in neither
+/// "Changed" nor "Downstream impact", even though they're real models in
+/// the same project's dependency graph.
+#[test]
+fn unrelated_models_in_the_same_project_do_not_appear_in_either_section() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .output()
+        .expect("command should run");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+
+    for unrelated in [
+        "stg_payments",
+        "stg_orders",
+        "fct_orders",
+        "fct_orders_incremental",
+    ] {
+        assert!(
+            !stdout.contains(unrelated),
+            "{unrelated} is unrelated to this diff and must not appear anywhere in the \
+             report, but it did: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn exits_non_zero_and_reports_the_breaking_change_as_json() {
     Command::cargo_bin("zhao")
