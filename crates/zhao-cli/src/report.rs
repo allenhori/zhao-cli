@@ -10,7 +10,7 @@
 use serde::Serialize;
 use zhao_core::diff::Change;
 use zhao_core::model::JoinKind;
-use zhao_core::rules::{Finding, RuleId, Severity};
+use zhao_core::rules::{Finding, FindingDetail, Severity};
 
 /// The full JSON payload for a `zhao check` run.
 #[derive(Debug, Serialize)]
@@ -35,7 +35,7 @@ impl Report {
     pub fn is_breaking(&self) -> bool {
         self.findings
             .iter()
-            .any(|f| f.severity == SeverityJson::Error)
+            .any(|f| f.severity() == SeverityJson::Error)
     }
 }
 
@@ -123,32 +123,104 @@ impl From<Severity> for SeverityJson {
 }
 
 /// A [`Finding`], reshaped for JSON output.
+///
+/// Tagged by `rule` via serde directly from each variant's name (rather
+/// than a hand-written slug function): renaming a variant automatically
+/// changes its JSON tag with the compiler enforcing every variant stays
+/// handled, instead of a parallel string-mapping function that could
+/// silently drift out of sync.
 #[derive(Debug, Serialize)]
-pub struct FindingJson {
-    rule: String,
-    severity: SeverityJson,
-    node: String,
-    column: String,
-    reached: String,
-    reached_column: String,
+#[serde(tag = "rule", rename_all = "kebab-case")]
+pub enum FindingJson {
+    /// See [`FindingDetail::ColumnRemovedWithActiveReferences`].
+    ColumnRemovedWithActiveReferences {
+        severity: SeverityJson,
+        node: String,
+        column: String,
+        reached: String,
+        reached_column: String,
+    },
+    /// See [`FindingDetail::ColumnTypeNarrowed`].
+    ColumnTypeNarrowed {
+        severity: SeverityJson,
+        node: String,
+        column: String,
+        from_type: String,
+        to_type: String,
+    },
+    /// See [`FindingDetail::JoinCardinalityLoosened`].
+    JoinCardinalityLoosened {
+        severity: SeverityJson,
+        node: String,
+        position: usize,
+        from_kind: String,
+        to_kind: String,
+    },
+    /// See [`FindingDetail::ColumnAdded`].
+    ColumnAdded {
+        severity: SeverityJson,
+        node: String,
+        column: String,
+    },
 }
 
-impl From<&Finding> for FindingJson {
-    fn from(finding: &Finding) -> Self {
-        Self {
-            rule: rule_id_slug(finding.rule).to_string(),
-            severity: finding.severity.into(),
-            node: finding.node.to_string(),
-            column: finding.column.to_string(),
-            reached: finding.reached.to_string(),
-            reached_column: finding.reached_column.to_string(),
+impl FindingJson {
+    fn severity(&self) -> SeverityJson {
+        match self {
+            FindingJson::ColumnRemovedWithActiveReferences { severity, .. }
+            | FindingJson::ColumnTypeNarrowed { severity, .. }
+            | FindingJson::JoinCardinalityLoosened { severity, .. }
+            | FindingJson::ColumnAdded { severity, .. } => *severity,
         }
     }
 }
 
-fn rule_id_slug(rule: RuleId) -> &'static str {
-    match rule {
-        RuleId::ColumnRemovedWithActiveReferences => "column-removed-with-active-references",
+impl From<&Finding> for FindingJson {
+    fn from(finding: &Finding) -> Self {
+        let severity = finding.severity.into();
+        match &finding.detail {
+            FindingDetail::ColumnRemovedWithActiveReferences {
+                node,
+                column,
+                reached,
+                reached_column,
+            } => FindingJson::ColumnRemovedWithActiveReferences {
+                severity,
+                node: node.to_string(),
+                column: column.to_string(),
+                reached: reached.to_string(),
+                reached_column: reached_column.to_string(),
+            },
+            FindingDetail::ColumnTypeNarrowed {
+                node,
+                column,
+                from_type,
+                to_type,
+            } => FindingJson::ColumnTypeNarrowed {
+                severity,
+                node: node.to_string(),
+                column: column.to_string(),
+                from_type: from_type.clone(),
+                to_type: to_type.clone(),
+            },
+            FindingDetail::JoinCardinalityLoosened {
+                node,
+                position,
+                from_kind,
+                to_kind,
+            } => FindingJson::JoinCardinalityLoosened {
+                severity,
+                node: node.to_string(),
+                position: *position,
+                from_kind: join_kind_slug(*from_kind),
+                to_kind: join_kind_slug(*to_kind),
+            },
+            FindingDetail::ColumnAdded { node, column } => FindingJson::ColumnAdded {
+                severity,
+                node: node.to_string(),
+                column: column.to_string(),
+            },
+        }
     }
 }
 
@@ -182,8 +254,9 @@ pub fn render_text(report: &Report) -> String {
     let mut out = String::new();
     for finding in &report.findings {
         out.push_str(&format!(
-            "[{:?}] {} removed from {} breaks {} (referenced via {})\n",
-            finding.severity, finding.column, finding.node, finding.reached, finding.reached_column
+            "[{:?}] {}\n",
+            finding.severity(),
+            describe(finding)
         ));
     }
     if report.findings.is_empty() {
@@ -193,4 +266,41 @@ pub fn render_text(report: &Report) -> String {
         ));
     }
     out
+}
+
+fn describe(finding: &FindingJson) -> String {
+    match finding {
+        FindingJson::ColumnRemovedWithActiveReferences {
+            node,
+            column,
+            reached,
+            reached_column,
+            ..
+        } => {
+            format!(
+                "{column} removed from {node} breaks {reached} (referenced via {reached_column})"
+            )
+        }
+        FindingJson::ColumnTypeNarrowed {
+            node,
+            column,
+            from_type,
+            to_type,
+            ..
+        } => {
+            format!("{node}.{column} type narrowed from {from_type} to {to_type}")
+        }
+        FindingJson::JoinCardinalityLoosened {
+            node,
+            position,
+            from_kind,
+            to_kind,
+            ..
+        } => {
+            format!("{node}'s join at position {position} loosened from {from_kind} to {to_kind}")
+        }
+        FindingJson::ColumnAdded { node, column, .. } => {
+            format!("{column} added to {node}")
+        }
+    }
 }
