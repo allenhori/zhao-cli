@@ -1177,6 +1177,94 @@ mod git_native_baseline {
         );
     }
 
+    /// Acceptance criterion 1 (issue #26), `dependencies.yml` variant: the
+    /// same trigger condition, but via the other filename `resolve()`
+    /// checks for.
+    #[test]
+    fn dbt_deps_runs_before_compile_when_dependencies_yml_is_present_at_the_baseline() {
+        let log_dir = tempfile::tempdir().expect("should create temp dir");
+        let invocation_log = log_dir.path().join("invocations.log");
+
+        let repo = new_test_repo();
+        repo.write("dependencies.yml", "packages: []\n");
+        repo.write("dbt_manifest_source.json", &rules_baseline_manifest_json());
+        repo.commit("baseline state, with dependencies.yml");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("README.md", "an unrelated change on the feature branch\n");
+        repo.commit("feature work, ahead of master");
+        repo.write(
+            "target/manifest.json",
+            &rules_project_current_manifest_json(),
+        );
+
+        let stub_dir = logging_stub_dbt_dir(&invocation_log);
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env("PATH", path_with_stub_dbt_prepended(&stub_dir))
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .output()
+            .expect("command should run");
+        assert!(
+            output.status.code() == Some(0) || output.status.code() == Some(1),
+            "zhao itself should run to completion: {output:?}"
+        );
+
+        let log = std::fs::read_to_string(&invocation_log).expect("should read invocation log");
+        let subcommands: Vec<&str> = log
+            .lines()
+            .map(|line| line.split(' ').next().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            subcommands,
+            vec!["deps", "compile"],
+            "dbt deps should run, before dbt compile, when dependencies.yml is present: {log}"
+        );
+    }
+
+    /// Acceptance criteria 1 & 3 (issue #26) together: `--dbt-arg` values
+    /// reach `dbt deps` too, not just `dbt compile` -- exercised with
+    /// `packages.yml` present so `deps` actually runs.
+    #[test]
+    fn dbt_arg_values_are_appended_to_both_deps_and_compile_invocations() {
+        let log_dir = tempfile::tempdir().expect("should create temp dir");
+        let invocation_log = log_dir.path().join("invocations.log");
+
+        let repo = new_test_repo();
+        repo.write("packages.yml", "packages: []\n");
+        repo.write("dbt_manifest_source.json", &rules_baseline_manifest_json());
+        repo.commit("baseline state, with packages.yml");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("README.md", "an unrelated change on the feature branch\n");
+        repo.commit("feature work, ahead of master");
+        repo.write(
+            "target/manifest.json",
+            &rules_project_current_manifest_json(),
+        );
+
+        let stub_dir = logging_stub_dbt_dir(&invocation_log);
+
+        Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env("PATH", path_with_stub_dbt_prepended(&stub_dir))
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .arg("--dbt-arg")
+            .arg("--target=ci")
+            .assert()
+            .code(predicate::in_iter([0, 1]));
+
+        let log = std::fs::read_to_string(&invocation_log).expect("should read invocation log");
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            vec!["deps --target=ci", "compile --target=ci"],
+            "--dbt-arg values should be appended to both the deps and compile invocations: {log}"
+        );
+    }
+
     /// Acceptance criterion 3 (issue #26): repeated `--dbt-arg` values are
     /// appended, in order, to the `dbt compile` invocation (and would be to
     /// `dbt deps` too, were it running -- there's no `packages.yml` here,

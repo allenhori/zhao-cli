@@ -1130,6 +1130,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn deps_appends_extra_args_after_the_subcommand() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(stub_dir.path(), "echo \"$@\" > args.txt");
+
+        DbtAdapter
+            .deps(
+                project_dir.path(),
+                dbt.to_str().expect("utf8 path"),
+                &["--target".to_string(), "ci".to_string()],
+            )
+            .expect("deps should succeed");
+
+        let recorded_args =
+            fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
+        assert_eq!(recorded_args.trim(), "deps --target ci");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn deps_reports_a_clear_error_when_dbt_deps_fails() {
         let project_dir = tempfile::tempdir().expect("should create temp dir");
         let stub_dir = tempfile::tempdir().expect("should create temp dir");
