@@ -55,12 +55,19 @@ pub(crate) fn print_report(report: &Report, args: &CheckArgs) -> Result<(), Stri
     Ok(())
 }
 
+/// Exit code for "couldn't even run" (bad paths, unparsable manifests,
+/// invalid `zhao.yml`, ...) -- shared by `zhao check` and `zhao diff`,
+/// distinct from either command's own "ran successfully" exit codes so a
+/// caller can always tell "zhao itself failed" apart from any outcome the
+/// engine actually produced.
+const EXIT_ERROR: u8 = 2;
+
 /// Prints `message` to stderr as `error: {message}` and returns
-/// `exit_code` as an [`ExitCode`] -- the shared shape both `zhao check`
-/// and `zhao diff` use for "couldn't even run" failures.
-pub(crate) fn fail(message: &str, exit_code: u8) -> ExitCode {
+/// [`EXIT_ERROR`] -- the shared shape both `zhao check` and `zhao diff`
+/// use for "couldn't even run" failures.
+pub(crate) fn fail(message: &str) -> ExitCode {
     eprintln!("error: {message}");
-    ExitCode::from(exit_code)
+    ExitCode::from(EXIT_ERROR)
 }
 
 /// Whether the Baseline's merge-base against `against` has fallen behind

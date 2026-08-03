@@ -90,6 +90,44 @@ fn diff_exits_zero_on_a_clean_fixture_too() {
         .code(0);
 }
 
+/// Acceptance criterion 2, isolating `warn` specifically: a fixture whose
+/// only Finding is `warn`-severity (`join-cardinality-loosened`, no
+/// `error`-severity Finding at all) still exits zero -- proves "regardless
+/// of what Severity outcomes are present" isn't only true for `error`.
+#[test]
+fn diff_exits_zero_when_the_only_finding_is_warn_severity() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("diff")
+        .arg("--state")
+        .arg(fixture("rules_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("\"severity\": \"warn\""));
+}
+
+/// `zhao diff` must still exit non-zero (2, matching `zhao check`'s own
+/// "couldn't even run" exit code) when zhao itself fails to run --
+/// "always exits zero" is about Severity outcomes the engine actually
+/// produced, not about zhao crashing before it could produce any.
+#[test]
+fn diff_exits_with_error_code_on_a_missing_baseline_path() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("diff")
+        .arg("--state")
+        .arg(fixture("does_not_exist.json"))
+        .arg("--project-dir")
+        .arg(fixture("clean_project"))
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("error:"));
+}
+
 /// Acceptance criterion 3: `zhao diff` supports `--format json` output,
 /// same shape as `zhao check`'s.
 #[test]

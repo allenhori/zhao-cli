@@ -11,19 +11,15 @@ use crate::engine::{build_report, fail, print_report};
 const EXIT_PASS: u8 = 0;
 /// Exit code for "at least one Rule fired at `error` Severity."
 const EXIT_BREAKING: u8 = 1;
-/// Exit code for "couldn't even run the check" (bad paths, unparsable
-/// manifests, ...) -- distinct from a breaking-change result so a caller
-/// can tell "your change broke something" apart from "zhao itself failed."
-const EXIT_ERROR: u8 = 2;
 
 /// Runs `zhao check` and returns the process exit code.
 pub fn run(args: &CheckArgs) -> ExitCode {
     let report = match build_report(args) {
         Ok(report) => report,
-        Err(message) => return fail(&message, EXIT_ERROR),
+        Err(message) => return fail(&message),
     };
     if let Err(message) = print_report(&report, args) {
-        return fail(&message, EXIT_ERROR);
+        return fail(&message);
     }
 
     ExitCode::from(if report.is_breaking() {

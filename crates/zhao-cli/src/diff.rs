@@ -13,18 +13,15 @@ use crate::engine::{build_report, fail, print_report};
 /// Severity outcomes present. `zhao diff` is an inspection tool, not a
 /// gate; use `zhao check` for CI.
 const EXIT_OK: u8 = 0;
-/// Exit code for "couldn't even run" (bad paths, unparsable manifests,
-/// ...), matching `zhao check`'s own error exit code.
-const EXIT_ERROR: u8 = 2;
 
 /// Runs `zhao diff` and returns the process exit code.
 pub fn run(args: &CheckArgs) -> ExitCode {
     let report = match build_report(args) {
         Ok(report) => report,
-        Err(message) => return fail(&message, EXIT_ERROR),
+        Err(message) => return fail(&message),
     };
     if let Err(message) = print_report(&report, args) {
-        return fail(&message, EXIT_ERROR);
+        return fail(&message);
     }
 
     ExitCode::from(EXIT_OK)
