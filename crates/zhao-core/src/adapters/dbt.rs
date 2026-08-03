@@ -55,6 +55,23 @@ impl AdapterVocabulary for DbtVocabulary {
     fn origin_term(&self) -> &'static str {
         "source"
     }
+
+    fn recommended_validation_command(&self, node_ids: &[String]) -> Option<String> {
+        if node_ids.is_empty() {
+            return None;
+        }
+        // A dbt `unique_id` is always shaped `<resource_type>.<package>.<name>`
+        // (dbt itself constructs it that way; model names can't contain
+        // `.`), so the bare, selectable name is just the last segment --
+        // no need to look up a full `Node`, which may not even exist
+        // (e.g. a Node reached only via the Baseline that no longer
+        // exists in the current state).
+        let names: Vec<&str> = node_ids
+            .iter()
+            .map(|id| id.rsplit('.').next().unwrap_or(id))
+            .collect();
+        Some(format!("dbt build --select {}", names.join(" ")))
+    }
 }
 
 /// Everything that can go wrong while an adapter reads and parses a dbt
@@ -1017,5 +1034,36 @@ mod tests {
             result,
             Err(DbtAdapterError::CommandNotFound { .. })
         ));
+    }
+
+    #[test]
+    fn recommended_validation_command_derives_bare_names_from_unique_ids() {
+        let command = DbtVocabulary.recommended_validation_command(&[
+            "model.zhao_dbt_test.stg_customers".to_string(),
+            "model.zhao_dbt_test.dim_customers".to_string(),
+        ]);
+
+        assert_eq!(
+            command.as_deref(),
+            Some("dbt build --select stg_customers dim_customers")
+        );
+    }
+
+    /// The Node's own bare name is derivable straight from its `NodeId`
+    /// string -- no lookup against a real `Node` needed -- so even an ID
+    /// with no corresponding `Node` anywhere (e.g. one that only ever
+    /// existed in a Baseline that's since been deleted) still produces a
+    /// sensible, selectable name.
+    #[test]
+    fn recommended_validation_command_works_without_a_real_node_to_look_up() {
+        let command = DbtVocabulary
+            .recommended_validation_command(&["model.zhao_dbt_test.long_gone".to_string()]);
+
+        assert_eq!(command.as_deref(), Some("dbt build --select long_gone"));
+    }
+
+    #[test]
+    fn recommended_validation_command_is_none_for_an_empty_list() {
+        assert_eq!(DbtVocabulary.recommended_validation_command(&[]), None);
     }
 }

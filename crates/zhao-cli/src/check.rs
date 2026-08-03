@@ -44,7 +44,8 @@ pub fn run(args: &CheckArgs) -> ExitCode {
     let changes = diff(&baseline, &current);
     let findings = evaluate(&baseline, &changes, &config);
     let report = Report::new(&changes, &findings)
-        .with_staleness_warning(is_stale(&args.project_dir, &args.against));
+        .with_staleness_warning(is_stale(&args.project_dir, &args.against))
+        .with_recommended_command(DbtAdapter.vocabulary());
 
     match args.format {
         OutputFormat::Json => match serde_json::to_string_pretty(&report) {
