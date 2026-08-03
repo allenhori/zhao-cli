@@ -60,17 +60,21 @@ impl AdapterVocabulary for DbtVocabulary {
         if node_ids.is_empty() {
             return None;
         }
+        let names: Vec<String> = node_ids
+            .iter()
+            .map(|id| self.node_display_name(id))
+            .collect();
+        Some(format!("dbt build --select {}", names.join(" ")))
+    }
+
+    fn node_display_name(&self, node_id: &str) -> String {
         // A dbt `unique_id` is always shaped `<resource_type>.<package>.<name>`
         // (dbt itself constructs it that way; model names can't contain
         // `.`), so the bare, selectable name is just the last segment --
         // no need to look up a full `Node`, which may not even exist
         // (e.g. a Node reached only via the Baseline that no longer
         // exists in the current state).
-        let names: Vec<&str> = node_ids
-            .iter()
-            .map(|id| id.rsplit('.').next().unwrap_or(id))
-            .collect();
-        Some(format!("dbt build --select {}", names.join(" ")))
+        node_id.rsplit('.').next().unwrap_or(node_id).to_string()
     }
 }
 
@@ -1065,5 +1069,21 @@ mod tests {
     #[test]
     fn recommended_validation_command_is_none_for_an_empty_list() {
         assert_eq!(DbtVocabulary.recommended_validation_command(&[]), None);
+    }
+
+    #[test]
+    fn node_display_name_extracts_the_bare_name_from_a_unique_id() {
+        assert_eq!(
+            DbtVocabulary.node_display_name("model.zhao_dbt_test.stg_customers"),
+            "stg_customers"
+        );
+    }
+
+    #[test]
+    fn node_display_name_falls_back_to_the_whole_string_if_there_is_no_dot() {
+        assert_eq!(
+            DbtVocabulary.node_display_name("stg_customers"),
+            "stg_customers"
+        );
     }
 }

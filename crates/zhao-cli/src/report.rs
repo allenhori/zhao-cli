@@ -10,7 +10,7 @@
 use serde::Serialize;
 use zhao_core::adapters::AdapterVocabulary;
 use zhao_core::diff::Change;
-use zhao_core::model::JoinKind;
+use zhao_core::model::{JoinKind, NodeId, ParsedProject, Upstream};
 use zhao_core::rules::{Finding, FindingDetail, Severity};
 
 /// The message included in a [`Report`] when the Baseline's merge-base has
@@ -38,20 +38,50 @@ pub struct Report {
     /// report was built without [`Report::with_recommended_command`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommended_command: Option<String>,
+    /// The computed dbt `--defer` plan: which Nodes need building (the
+    /// same set `recommended_command` selects) and which of their
+    /// upstream dependencies can be deferred to an existing state
+    /// instead. `None` under the same conditions as `recommended_command`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_plan: Option<DeferPlanJson>,
 }
 
 impl Report {
     /// Builds a [`Report`] from the engine's own `Change`/`Finding` output.
-    /// No staleness warning or recommended command is set -- chain
-    /// [`Report::with_staleness_warning`]/[`Report::with_recommended_command`]
-    /// to add them.
+    /// No staleness warning, recommended command, or defer plan is set --
+    /// chain [`Report::with_staleness_warning`]/
+    /// [`Report::with_recommended_command`]/[`Report::with_defer_plan`] to
+    /// add them.
     pub fn new(changes: &[Change], findings: &[Finding]) -> Self {
         Self {
             changes: changes.iter().map(ChangeJson::from).collect(),
             findings: findings.iter().map(FindingJson::from).collect(),
             staleness_warning: None,
             recommended_command: None,
+            defer_plan: None,
         }
+    }
+
+    /// The exact set of Nodes named in the Downstream impact section --
+    /// every non-`pass` Finding's [`FindingJson::impacted_node`],
+    /// deduplicated, in first-seen order. Shared by
+    /// [`Report::with_recommended_command`] and
+    /// [`Report::with_defer_plan`], which both need precisely this set:
+    /// the former to name it in the adapter's selector syntax, the latter
+    /// as the `--defer` plan's "build" set.
+    fn impacted_node_ids(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut node_ids = Vec::new();
+        for finding in &self.findings {
+            if finding.severity() == SeverityJson::Pass {
+                continue;
+            }
+            let node_id = finding.impacted_node().to_string();
+            if seen.insert(node_id.clone()) {
+                node_ids.push(node_id);
+            }
+        }
+        node_ids
     }
 
     /// Sets this report's staleness warning: `Some(`[`STALENESS_WARNING`]`)`
@@ -83,18 +113,35 @@ impl Report {
     /// from the ID string instead (e.g. dbt's `unique_id` shape already
     /// contains the bare model name).
     pub fn with_recommended_command(mut self, vocabulary: &dyn AdapterVocabulary) -> Self {
-        let mut seen = std::collections::HashSet::new();
-        let mut node_ids = Vec::new();
-        for finding in &self.findings {
-            if finding.severity() == SeverityJson::Pass {
-                continue;
-            }
-            let node_id = finding.impacted_node().to_string();
-            if seen.insert(node_id.clone()) {
-                node_ids.push(node_id);
-            }
-        }
-        self.recommended_command = vocabulary.recommended_validation_command(&node_ids);
+        self.recommended_command =
+            vocabulary.recommended_validation_command(&self.impacted_node_ids());
+        self
+    }
+
+    /// Sets this report's `--defer` plan: `build` is the same impacted-Node
+    /// set [`Report::with_recommended_command`] selects; `defer` is every
+    /// Node those Nodes depend on (directly or transitively, through
+    /// `current`'s Lineage Edges) that isn't itself in `build` -- Nodes a
+    /// CI job building only the impacted set should treat as already
+    /// available (via `dbt ... --defer --state <path>`) rather than
+    /// rebuild from scratch. Pure computation: this method never connects
+    /// to a warehouse or provisions anything.
+    ///
+    /// `None` when nothing is impacted at all (nothing to build, so no
+    /// plan makes sense); `Some` with an empty `defer` list is meaningful
+    /// otherwise -- it means every dependency of the build set is an
+    /// Origin, not a Node, so there's genuinely nothing to defer.
+    pub fn with_defer_plan(
+        mut self,
+        current: &ParsedProject,
+        vocabulary: &dyn AdapterVocabulary,
+    ) -> Self {
+        let build = self.impacted_node_ids();
+        self.defer_plan = if build.is_empty() {
+            None
+        } else {
+            Some(DeferPlanJson::compute(current, build, vocabulary))
+        };
         self
     }
 
@@ -105,6 +152,72 @@ impl Report {
         self.findings
             .iter()
             .any(|f| f.severity() == SeverityJson::Error)
+    }
+}
+
+/// The computed dbt `--defer` plan for a run -- see
+/// [`Report::with_defer_plan`].
+#[derive(Debug, Serialize)]
+pub struct DeferPlanJson {
+    /// Nodes that need to be built: the same set named in Downstream
+    /// impact / the recommended command's selector.
+    pub build: Vec<String>,
+    /// Nodes `build`'s Nodes depend on (directly or transitively) that
+    /// aren't themselves in `build` -- these should be deferred to an
+    /// existing state (`dbt ... --defer --state <path>`) rather than
+    /// rebuilt.
+    pub defer: Vec<String>,
+}
+
+impl DeferPlanJson {
+    /// Computes the plan: `build` is used as given (the caller already
+    /// determined the impacted set); `defer` is `build`'s full transitive
+    /// upstream Node closure (walking `current`'s Lineage Edges), minus
+    /// `build` itself. Origins are never included -- dbt never builds a
+    /// source in the first place, so there's nothing to defer for one.
+    /// The graph walk itself works in zhao's own `NodeId` strings; both
+    /// `build` and `defer` are rendered through `vocabulary` at the end,
+    /// same as [`Report::with_recommended_command`], so a `--defer` plan
+    /// names Nodes the same way the recommended command does rather than
+    /// mixing zhao's internal IDs with the adapter's own names.
+    fn compute(
+        current: &ParsedProject,
+        build: Vec<String>,
+        vocabulary: &dyn AdapterVocabulary,
+    ) -> Self {
+        let build_set: std::collections::HashSet<&str> = build.iter().map(String::as_str).collect();
+        let mut visited: std::collections::HashSet<String> = build.iter().cloned().collect();
+        let mut deferred = std::collections::BTreeSet::new();
+        let mut frontier: Vec<NodeId> = build.iter().map(|id| NodeId::new(id.clone())).collect();
+
+        while let Some(node_id) = frontier.pop() {
+            for edge in &current.edges {
+                if edge.downstream != node_id {
+                    continue;
+                }
+                let Upstream::Node(upstream_id) = &edge.upstream else {
+                    continue;
+                };
+                let upstream_id_string = upstream_id.to_string();
+                if visited.insert(upstream_id_string.clone()) {
+                    if !build_set.contains(upstream_id_string.as_str()) {
+                        deferred.insert(upstream_id_string);
+                    }
+                    frontier.push(upstream_id.clone());
+                }
+            }
+        }
+
+        Self {
+            build: build
+                .iter()
+                .map(|id| vocabulary.node_display_name(id))
+                .collect(),
+            defer: deferred
+                .iter()
+                .map(|id| vocabulary.node_display_name(id))
+                .collect(),
+        }
     }
 }
 
@@ -503,6 +616,19 @@ pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary, use_colo
 
     if let Some(command) = &report.recommended_command {
         out.push_str(&format!("\nRecommended: {command}\n"));
+    }
+
+    if let Some(plan) = &report.defer_plan {
+        out.push_str("\nDefer plan:\n");
+        out.push_str(&format!("  Build: {}\n", plan.build.join(", ")));
+        out.push_str(&format!(
+            "  Defer (assumed available): {}\n",
+            if plan.defer.is_empty() {
+                "none".to_string()
+            } else {
+                plan.defer.join(", ")
+            }
+        ));
     }
 
     out
@@ -930,5 +1056,165 @@ mod tests {
         let text = render_text(&report, &DbtVocabulary, false);
 
         assert!(!text.contains("Recommended:"), "{text}");
+    }
+
+    /// A minimal `ParsedProject` with one Node per `(id, name)` pair and
+    /// the given `LineageEdge`s -- enough to exercise
+    /// `Report::with_defer_plan`'s graph walk without needing a real
+    /// compiled manifest.
+    fn project_with_edges(edges: Vec<zhao_core::model::LineageEdge>) -> ParsedProject {
+        ParsedProject {
+            nodes: Vec::new(),
+            origins: Vec::new(),
+            edges,
+        }
+    }
+
+    fn node_edge(upstream: &str, downstream: &str) -> zhao_core::model::LineageEdge {
+        zhao_core::model::LineageEdge {
+            upstream: Upstream::Node(NodeId::new(upstream)),
+            downstream: NodeId::new(downstream),
+            column: None,
+        }
+    }
+
+    /// Acceptance criterion 1: given a Change reaching a subset of Nodes,
+    /// the plan correctly separates build (the impacted set) from defer
+    /// (their upstream dependencies) -- including a Node reached only
+    /// transitively (`model.zhao_dbt_test.raw_base`, two hops upstream of
+    /// the single impacted Node), proving this is a real transitive
+    /// closure, not just direct parents.
+    #[test]
+    fn with_defer_plan_separates_build_from_transitive_upstream_dependencies() {
+        let current = project_with_edges(vec![
+            node_edge(
+                "model.zhao_dbt_test.stg_orders",
+                "model.zhao_dbt_test.dim_customers",
+            ),
+            node_edge(
+                "model.zhao_dbt_test.raw_base",
+                "model.zhao_dbt_test.stg_orders",
+            ),
+        ]);
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::ColumnTypeNarrowed {
+                node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                column: zhao_core::model::ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        }];
+        let report = Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary);
+
+        let plan = report.defer_plan.expect("plan should be present");
+        assert_eq!(plan.build, vec!["dim_customers"]);
+        assert_eq!(plan.defer, vec!["raw_base", "stg_orders"]);
+    }
+
+    /// A build Node whose only upstream dependency is an Origin (a
+    /// source, not a Node) produces an empty (not absent) defer list --
+    /// dbt never builds a source, so there's genuinely nothing to defer,
+    /// but that's still meaningful information, not "no plan at all."
+    #[test]
+    fn with_defer_plan_defer_is_empty_not_absent_when_only_an_origin_is_upstream() {
+        let current = project_with_edges(vec![zhao_core::model::LineageEdge {
+            upstream: Upstream::Origin(zhao_core::model::OriginId::new("source.raw.customers")),
+            downstream: NodeId::new("model.zhao_dbt_test.stg_customers"),
+            column: None,
+        }]);
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::ColumnTypeNarrowed {
+                node: NodeId::new("model.zhao_dbt_test.stg_customers"),
+                column: zhao_core::model::ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        }];
+        let report = Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary);
+
+        let plan = report.defer_plan.expect("plan should be present");
+        assert_eq!(plan.build, vec!["stg_customers"]);
+        assert!(plan.defer.is_empty());
+    }
+
+    /// A Node already in the build set is never also listed in defer,
+    /// even if another build Node depends on it directly.
+    #[test]
+    fn with_defer_plan_never_defers_a_node_thats_also_being_built() {
+        let current = project_with_edges(vec![node_edge(
+            "model.zhao_dbt_test.stg_customers",
+            "model.zhao_dbt_test.dim_customers",
+        )]);
+        let findings = vec![
+            Finding {
+                severity: Severity::Warn,
+                detail: FindingDetail::ColumnTypeNarrowed {
+                    node: NodeId::new("model.zhao_dbt_test.stg_customers"),
+                    column: zhao_core::model::ColumnName::new("amount"),
+                    from_type: "bigint".to_string(),
+                    to_type: "int".to_string(),
+                },
+            },
+            Finding {
+                severity: Severity::Warn,
+                detail: FindingDetail::ColumnTypeNarrowed {
+                    node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                    column: zhao_core::model::ColumnName::new("amount"),
+                    from_type: "bigint".to_string(),
+                    to_type: "int".to_string(),
+                },
+            },
+        ];
+        let report = Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary);
+
+        let plan = report.defer_plan.expect("plan should be present");
+        assert!(!plan.defer.contains(&"stg_customers".to_string()));
+    }
+
+    /// A run with zero impacted Nodes produces no defer plan at all.
+    #[test]
+    fn with_defer_plan_is_none_when_nothing_is_impactful() {
+        let current = project_with_edges(Vec::new());
+        let report = Report::new(&[], &[]).with_defer_plan(&current, &DbtVocabulary);
+
+        assert!(report.defer_plan.is_none());
+    }
+
+    #[test]
+    fn render_text_appends_the_defer_plan_when_present() {
+        let current = project_with_edges(vec![node_edge(
+            "model.zhao_dbt_test.stg_orders",
+            "model.zhao_dbt_test.dim_customers",
+        )]);
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::ColumnTypeNarrowed {
+                node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                column: zhao_core::model::ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        }];
+        let report = Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(text.contains("Defer plan:"), "{text}");
+        assert!(text.contains("Build: dim_customers"), "{text}");
+        assert!(
+            text.contains("Defer (assumed available): stg_orders"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_text_omits_the_defer_plan_section_when_absent() {
+        let report = Report::new(&[], &[]);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(!text.contains("Defer plan:"), "{text}");
     }
 }
