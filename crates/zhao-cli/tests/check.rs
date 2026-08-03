@@ -26,6 +26,7 @@ fn default_text_output_produces_the_three_part_human_readable_report() {
         .arg(fixture("diff_baseline_manifest.json"))
         .arg("--project-dir")
         .arg(fixture("breaking_project"))
+        .arg("--no-color")
         .output()
         .expect("command should run");
 
@@ -92,6 +93,7 @@ fn downstream_impact_lists_only_nodes_actually_reached_with_reason_and_rule() {
         .arg(fixture("diff_baseline_manifest.json"))
         .arg("--project-dir")
         .arg(fixture("breaking_project"))
+        .arg("--no-color")
         .output()
         .expect("command should run");
 
@@ -141,6 +143,7 @@ fn unrelated_models_in_the_same_project_do_not_appear_in_either_section() {
         .arg(fixture("diff_baseline_manifest.json"))
         .arg("--project-dir")
         .arg(fixture("breaking_project"))
+        .arg("--no-color")
         .output()
         .expect("command should run");
 
@@ -158,6 +161,79 @@ fn unrelated_models_in_the_same_project_do_not_appear_in_either_section() {
              report, but it did: {stdout}"
         );
     }
+}
+
+/// `--no-color`, verified byte-for-byte against a plain-text snapshot (not
+/// just "doesn't contain an escape somewhere") -- the exact stdout must be
+/// exactly the plain-text rendering, nothing more.
+#[test]
+fn no_color_flag_produces_byte_for_byte_plain_text() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest_clean.json"))
+        .arg("--project-dir")
+        .arg(fixture("clean_project"))
+        .arg("--no-color")
+        .assert()
+        .code(0)
+        .stdout("No changes detected.\n");
+}
+
+/// Auto-detection: with no `--no-color` flag and no CI environment
+/// variable forcing color on, stdout being piped (as it always is when
+/// captured by `assert_cmd`, exactly like being piped to a file) must
+/// suppress color on its own. `GITHUB_ACTIONS`/`NO_COLOR` are explicitly
+/// removed from the child's environment first, since this test itself may
+/// be running inside zhao-cli's own GitHub Actions CI, which would
+/// otherwise force color on and mask a real auto-detection regression.
+#[test]
+fn auto_detection_suppresses_color_when_stdout_is_not_a_tty() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("NO_COLOR")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .output()
+        .expect("command should run");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "piped (non-TTY) stdout outside any CI environment should auto-suppress color: \
+         {stdout:?}"
+    );
+}
+
+/// Acceptance criterion 1: color codes are emitted in a color-capable
+/// environment -- simulated via `GITHUB_ACTIONS=true` (assert_cmd's
+/// captured stdout is never a real TTY, so this is the only reliable way
+/// to exercise the "color enabled" path through the actual binary rather
+/// than only through `report.rs`'s unit tests).
+#[test]
+fn color_codes_are_emitted_in_a_color_capable_environment() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .env("GITHUB_ACTIONS", "true")
+        .env_remove("NO_COLOR")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .output()
+        .expect("command should run");
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains('\u{1b}'),
+        "a color-capable environment (GITHUB_ACTIONS=true) should emit ANSI escapes: {stdout:?}"
+    );
 }
 
 #[test]
@@ -911,7 +987,13 @@ mod staleness_warning {
             .arg("--state")
             .arg(fixture("diff_baseline_manifest_clean.json"))
             .arg("--project-dir")
-            .arg(&repo.path);
+            .arg(&repo.path)
+            // Determinism: without this, whether the report's text output
+            // contains ANSI color codes would depend on the environment
+            // these tests happen to run in (e.g. GitHub Actions, which
+            // zhao-cli's own CI runs on, enables color even though stdout
+            // isn't a real TTY there).
+            .arg("--no-color");
         cmd
     }
 

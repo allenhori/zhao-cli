@@ -343,6 +343,26 @@ fn join_kind_slug(kind: JoinKind) -> String {
     .to_string()
 }
 
+/// The ANSI escape sequence `BREAKING` labels are wrapped in when color is
+/// enabled -- bold red.
+const BREAKING_COLOR: &str = "\x1b[1;31m";
+/// The ANSI escape sequence `WARN` labels are wrapped in when color is
+/// enabled -- bold yellow.
+const WARN_COLOR: &str = "\x1b[1;33m";
+/// Resets any color started by [`BREAKING_COLOR`]/[`WARN_COLOR`].
+const COLOR_RESET: &str = "\x1b[0m";
+
+/// Wraps `text` in `color`, or returns it unchanged if `use_color` is
+/// `false` -- the single point every color decision in this module goes
+/// through, so no ANSI code can leak out when color is supposed to be off.
+fn colorize(text: &str, color: &str, use_color: bool) -> String {
+    if use_color {
+        format!("{color}{text}{COLOR_RESET}")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Renders a [`Report`] as the three-part human-readable report: a
 /// "Changed" section (each Node that actually changed, and precisely what
 /// changed about it), a "Downstream impact" section (only Nodes actually
@@ -350,6 +370,13 @@ fn join_kind_slug(kind: JoinKind) -> String {
 /// `WARN` with the specific reference and Rule that fired), and a summary
 /// line. Every Node reference goes through `vocabulary` (e.g. "model" for
 /// dbt), never zhao's own internal "Node"/"Origin" terms.
+///
+/// When `use_color` is `true`, `BREAKING`/`WARN` labels are wrapped in
+/// ANSI color codes (red/yellow); when `false`, the output is plain text
+/// with no escape sequences anywhere -- deciding *whether* color is
+/// appropriate (a TTY, `--no-color`, `NO_COLOR`, known CI environments
+/// like GitHub Actions that render ANSI without being a real TTY, ...) is
+/// the caller's responsibility, not this function's.
 ///
 /// ## Known limitation
 ///
@@ -360,7 +387,7 @@ fn join_kind_slug(kind: JoinKind) -> String {
 /// isn't a gap in this function specifically; it'll start mattering once
 /// the diff engine itself gains the ability to detect an Origin-level
 /// change (e.g. a source's declared schema changing).
-pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary) -> String {
+pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary, use_color: bool) -> String {
     let mut out = String::new();
     let node_term = vocabulary.node_term();
 
@@ -392,8 +419,8 @@ pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary) -> Strin
             out.push_str(&format!("  {node_term} {node}:\n"));
             for finding in findings {
                 let label = match finding.severity() {
-                    SeverityJson::Error => "BREAKING",
-                    SeverityJson::Warn => "WARN",
+                    SeverityJson::Error => colorize("BREAKING", BREAKING_COLOR, use_color),
+                    SeverityJson::Warn => colorize("WARN", WARN_COLOR, use_color),
                     SeverityJson::Pass => unreachable!("filtered out above"),
                 };
                 out.push_str(&format!(
@@ -574,7 +601,7 @@ mod tests {
         let report = Report::new(&[], &[]);
 
         assert_eq!(
-            render_text(&report, &DbtVocabulary),
+            render_text(&report, &DbtVocabulary, false),
             "No changes detected.\n"
         );
     }
@@ -602,7 +629,7 @@ mod tests {
         }];
         let report = Report::new(&changes, &findings);
 
-        let text = render_text(&report, &DbtVocabulary);
+        let text = render_text(&report, &DbtVocabulary, false);
 
         // Uses dbt's vocabulary ("model"), never zhao's internal terms.
         assert!(text.contains("model model.a"), "{text}");
@@ -652,7 +679,7 @@ mod tests {
         }];
         let report = Report::new(&changes, &findings);
 
-        let text = render_text(&report, &DbtVocabulary);
+        let text = render_text(&report, &DbtVocabulary, false);
 
         assert!(text.contains("Changed:"), "{text}");
         assert!(
@@ -660,5 +687,74 @@ mod tests {
             "a pass-severity finding must not produce a Downstream impact section: {text}"
         );
         assert!(text.contains("0 breaking, 0 warning"), "{text}");
+    }
+
+    /// With `use_color: false`, no ANSI escape byte appears anywhere in
+    /// the output -- the property `--no-color`'s "byte-for-byte plain
+    /// text" acceptance criterion ultimately rests on.
+    #[test]
+    fn render_text_with_use_color_false_contains_no_ansi_escapes() {
+        let changes = vec![Change::ColumnRemoved {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("id"),
+        }];
+        let findings = vec![Finding {
+            severity: Severity::Error,
+            detail: FindingDetail::ColumnRemovedWithActiveReferences {
+                node: NodeId::new("model.a"),
+                column: zhao_core::model::ColumnName::new("id"),
+                reached: NodeId::new("model.b"),
+                reached_column: zhao_core::model::ColumnName::new("a_id"),
+            },
+        }];
+        let report = Report::new(&changes, &findings);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(
+            !text.contains('\x1b'),
+            "no ANSI escape byte should appear when use_color is false: {text:?}"
+        );
+    }
+
+    /// With `use_color: true`, `BREAKING`/`WARN` labels carry an ANSI
+    /// escape somewhere in the output -- checked for *presence* only, not
+    /// the exact byte sequence, so this doesn't snapshot-lock the specific
+    /// color codes chosen.
+    #[test]
+    fn render_text_with_use_color_true_contains_ansi_escapes_for_breaking_and_warn() {
+        let node = NodeId::new("model.a");
+        let findings = vec![
+            Finding {
+                severity: Severity::Error,
+                detail: FindingDetail::ColumnRemovedWithActiveReferences {
+                    node: node.clone(),
+                    column: zhao_core::model::ColumnName::new("id"),
+                    reached: NodeId::new("model.b"),
+                    reached_column: zhao_core::model::ColumnName::new("a_id"),
+                },
+            },
+            Finding {
+                severity: Severity::Warn,
+                detail: FindingDetail::ColumnTypeNarrowed {
+                    node,
+                    column: zhao_core::model::ColumnName::new("amount"),
+                    from_type: "bigint".to_string(),
+                    to_type: "int".to_string(),
+                },
+            },
+        ];
+        let report = Report::new(&[], &findings);
+
+        let text = render_text(&report, &DbtVocabulary, true);
+
+        assert!(
+            text.contains('\x1b'),
+            "an ANSI escape byte should appear somewhere when use_color is true: {text:?}"
+        );
+        // Still contains the plain label text -- color wraps it, doesn't
+        // replace it.
+        assert!(text.contains("BREAKING"), "{text}");
+        assert!(text.contains("WARN"), "{text}");
     }
 }
