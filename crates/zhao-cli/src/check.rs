@@ -21,9 +21,7 @@ pub fn run(args: &CheckArgs) -> ExitCode {
     if let Err(message) = print_report(&output.report, args) {
         return fail(&message);
     }
-    if let Err(message) = write_run_metadata(&output, args) {
-        return fail(&message);
-    }
+    write_run_metadata(&output, args);
 
     ExitCode::from(if output.report.is_breaking() {
         EXIT_BREAKING

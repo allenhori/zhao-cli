@@ -115,15 +115,31 @@ pub struct ColumnLineageJson {
 
 /// Writes `<project_dir>/target/zhao/run-metadata.json`, creating the
 /// `target/zhao/` directory if it doesn't already exist.
+///
+/// Written atomically: the JSON is written to a temp file in the same
+/// directory first, then renamed into place, so a failure partway through
+/// (disk full, process killed, ...) can never leave a truncated or
+/// otherwise corrupt `run-metadata.json` where a valid one used to be --
+/// the old file (if any) stays exactly as it was until the new one is
+/// fully written and ready to swap in.
 pub fn write(metadata: &RunMetadata, project_dir: &Path) -> Result<(), String> {
     let dir = project_dir.join("target").join("zhao");
     std::fs::create_dir_all(&dir)
         .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
 
-    let path = dir.join("run-metadata.json");
     let json = serde_json::to_string_pretty(metadata)
         .map_err(|err| format!("could not serialize run metadata as JSON: {err}"))?;
-    std::fs::write(&path, json).map_err(|err| format!("could not write {}: {err}", path.display()))
+
+    let mut temp_file = tempfile::NamedTempFile::new_in(&dir)
+        .map_err(|err| format!("could not create a temp file in {}: {err}", dir.display()))?;
+    std::io::Write::write_all(&mut temp_file, json.as_bytes())
+        .map_err(|err| format!("could not write run metadata: {err}"))?;
+
+    let path = dir.join("run-metadata.json");
+    temp_file
+        .persist(&path)
+        .map_err(|err| format!("could not finalize {}: {err}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]

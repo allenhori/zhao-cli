@@ -52,9 +52,20 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
 /// Writes `target/zhao/run-metadata.json` for this run -- see
 /// [`crate::metadata`]. Called by both `zhao check` and `zhao diff`, since
 /// every run writes it, not just gated ones.
-pub(crate) fn write_run_metadata(output: &EngineOutput, args: &CheckArgs) -> Result<(), String> {
+///
+/// A failure here (permission denied, disk full, a read-only `target/` in
+/// some sandboxed runner, ...) is reported to stderr as a warning, but
+/// deliberately doesn't change the process exit code: by the time this
+/// runs, the report has already been printed and the real gate result
+/// already computed, so a sidecar file failing to write shouldn't turn an
+/// otherwise-successful (or otherwise-correctly-failing) run into "zhao
+/// itself failed" -- that would let something orthogonal to the actual
+/// Change/Finding analysis flip a CI job's outcome.
+pub(crate) fn write_run_metadata(output: &EngineOutput, args: &CheckArgs) {
     let metadata = crate::metadata::RunMetadata::new(&output.report, &output.current);
-    crate::metadata::write(&metadata, &args.project_dir)
+    if let Err(message) = crate::metadata::write(&metadata, &args.project_dir) {
+        eprintln!("warning: could not write run metadata: {message}");
+    }
 }
 
 /// Prints `report` in `args.format` -- JSON or the color-aware text
