@@ -62,4 +62,12 @@ pub trait AdapterVocabulary {
     /// but its ID string is still enough to name it. `None` if `node_ids`
     /// is empty: there's nothing to recommend validating.
     fn recommended_validation_command(&self, node_ids: &[String]) -> Option<String>;
+
+    /// Derives this tool's own selectable/display name for a single Node
+    /// from its zhao `NodeId` string -- the same name
+    /// [`AdapterVocabulary::recommended_validation_command`] uses for each
+    /// Node it names, exposed separately so a caller building its own
+    /// Node list (e.g. a `--defer` plan's build/defer sets) can render
+    /// them the same way, without needing a full `Node` to look up either.
+    fn node_display_name(&self, node_id: &str) -> String;
 }

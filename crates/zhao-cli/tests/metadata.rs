@@ -198,7 +198,11 @@ fn run_metadata_json_field_set_is_exactly_this_and_nothing_else() {
         "findings",
         "staleness_warning",
         "recommended_command",
+        "defer_plan",
         "lineage_edges",
+        // DeferPlanJson fields.
+        "build",
+        "defer",
         // ChangeJson / FindingJson variants' fields.
         "type",
         "rule",

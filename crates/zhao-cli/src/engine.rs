@@ -30,7 +30,7 @@ pub(crate) struct EngineOutput {
 
 /// Runs the full engine pipeline -- Baseline resolution, diff, Rule
 /// evaluation -- and builds the resulting [`Report`], including its
-/// staleness warning and recommended command.
+/// staleness warning, recommended command, and `--defer` plan.
 pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     let current_manifest = args.project_dir.join("target").join("manifest.json");
 
@@ -44,7 +44,8 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     let findings = evaluate(&baseline, &changes, &config);
     let report = Report::new(&changes, &findings)
         .with_staleness_warning(is_stale(&args.project_dir, &args.against))
-        .with_recommended_command(DbtAdapter.vocabulary());
+        .with_recommended_command(DbtAdapter.vocabulary())
+        .with_defer_plan(&current, DbtAdapter.vocabulary());
 
     Ok(EngineOutput { report, current })
 }

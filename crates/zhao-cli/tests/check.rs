@@ -148,6 +148,17 @@ fn unrelated_models_in_the_same_project_do_not_appear_in_either_section() {
         .expect("command should run");
 
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    // Scoped to "Changed"/"Downstream impact" (everything before the
+    // Summary line) -- unlike those two sections, the later Defer plan
+    // section legitimately names upstream dependencies of the build set
+    // (e.g. stg_orders, which dim_customers depends on) that were never
+    // changed or reached themselves, so it's expected to mention Nodes
+    // this test's "unrelated" list intentionally excludes from Changed/
+    // Downstream impact.
+    let changed_and_downstream_impact = stdout
+        .split("\nSummary:")
+        .next()
+        .expect("Summary should follow Changed/Downstream impact");
 
     for unrelated in [
         "stg_payments",
@@ -156,9 +167,9 @@ fn unrelated_models_in_the_same_project_do_not_appear_in_either_section() {
         "fct_orders_incremental",
     ] {
         assert!(
-            !stdout.contains(unrelated),
-            "{unrelated} is unrelated to this diff and must not appear anywhere in the \
-             report, but it did: {stdout}"
+            !changed_and_downstream_impact.contains(unrelated),
+            "{unrelated} is unrelated to this diff and must not appear in Changed or \
+             Downstream impact, but it did: {changed_and_downstream_impact}"
         );
     }
 }
@@ -205,7 +216,11 @@ fn no_color_flag_produces_byte_for_byte_plain_text() {
              \n\
              Summary: 2 model(s) changed, 4 column(s) changed, 1 breaking, 1 warning\n\
              \n\
-             Recommended: dbt build --select stg_customers dim_customers\n",
+             Recommended: dbt build --select stg_customers dim_customers\n\
+             \n\
+             Defer plan:\n\
+             \x20 Build: stg_customers, dim_customers\n\
+             \x20 Defer (assumed available): stg_orders\n",
         );
 }
 
@@ -411,6 +426,79 @@ fn no_recommended_command_when_nothing_is_impactful() {
         .assert()
         .code(0)
         .stdout(predicate::str::contains("recommended_command").not());
+}
+
+/// Acceptance criterion 1: given a fixture project and a Change reaching a
+/// subset of Nodes, the computed `--defer` plan correctly identifies
+/// which Nodes need building (`stg_customers`, `dim_customers` -- the same
+/// set the recommended command selects) versus which can be deferred to
+/// an existing state (`stg_orders`, a real upstream dependency of
+/// `dim_customers` that was never itself changed or reached).
+#[test]
+fn defer_plan_identifies_build_and_defer_sets_correctly() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("\"defer_plan\":")
+                .and(predicate::str::contains("\"stg_customers\","))
+                .and(predicate::str::contains("\"dim_customers\""))
+                .and(predicate::str::contains(
+                    "\"defer\": [\n      \"stg_orders\"\n    ]",
+                )),
+        );
+}
+
+/// Acceptance criterion 2: exposed in human-readable output too, same as
+/// `--format json`.
+#[test]
+fn defer_plan_appears_in_human_readable_output() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .arg("--no-color")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("Defer plan:\n")
+                .and(predicate::str::contains(
+                    "Build: stg_customers, dim_customers",
+                ))
+                .and(predicate::str::contains(
+                    "Defer (assumed available): stg_orders",
+                )),
+        );
+}
+
+/// A run with zero impacted Nodes produces no defer plan (nothing to
+/// build, so no plan makes sense) -- mirrors
+/// `no_recommended_command_when_nothing_is_impactful`.
+#[test]
+fn no_defer_plan_when_nothing_is_impactful() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest_clean.json"))
+        .arg("--project-dir")
+        .arg(fixture("clean_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("defer_plan").not());
 }
 
 /// Distinct from `exits_zero_when_nothing_breaking_is_found`: that test
