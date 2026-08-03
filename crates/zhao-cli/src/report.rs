@@ -10,7 +10,7 @@
 use serde::Serialize;
 use zhao_core::adapters::AdapterVocabulary;
 use zhao_core::diff::Change;
-use zhao_core::model::{JoinKind, NodeId, ParsedProject};
+use zhao_core::model::JoinKind;
 use zhao_core::rules::{Finding, FindingDetail, Severity};
 
 /// The message included in a [`Report`] when the Baseline's merge-base has
@@ -66,34 +66,35 @@ impl Report {
 
     /// Sets this report's recommended validation command: the exact set
     /// of Nodes named in the Downstream impact section (every non-`pass`
-    /// Finding's [`FindingJson::impacted_node`], deduplicated), resolved
-    /// back to `current`'s own Node names and handed to `vocabulary` to
-    /// render in the adapter's own selector syntax.
+    /// Finding's [`FindingJson::impacted_node`], deduplicated), handed to
+    /// `vocabulary` as zhao's own `NodeId` strings to render in the
+    /// adapter's own selector syntax.
     ///
-    /// A Node whose ID can't be resolved against `current` (shouldn't
-    /// happen in practice -- every impacted Node came from diffing against
-    /// `current` in the first place) is silently skipped rather than
-    /// erroring, since this command is a courtesy suggestion, not a
-    /// requirement the rest of the report depends on.
-    pub fn with_recommended_command(
-        mut self,
-        current: &ParsedProject,
-        vocabulary: &dyn AdapterVocabulary,
-    ) -> Self {
+    /// Deliberately does *not* look a Node up by ID first (an earlier
+    /// version of this method did, resolving each ID against a
+    /// `ParsedProject`): an impacted Node reached only via the Baseline
+    /// (e.g. one deleted entirely in the current state, for
+    /// `ColumnRemovedWithActiveReferences`) may have no corresponding
+    /// `Node` in the current state to look up at all, even though it's
+    /// still correctly named in the Downstream impact section from its ID
+    /// string alone -- looking it up first would silently drop it from
+    /// this command, undermining the "matches Downstream impact exactly"
+    /// contract. `vocabulary` is expected to derive its own name straight
+    /// from the ID string instead (e.g. dbt's `unique_id` shape already
+    /// contains the bare model name).
+    pub fn with_recommended_command(mut self, vocabulary: &dyn AdapterVocabulary) -> Self {
         let mut seen = std::collections::HashSet::new();
-        let mut node_names = Vec::new();
+        let mut node_ids = Vec::new();
         for finding in &self.findings {
             if finding.severity() == SeverityJson::Pass {
                 continue;
             }
-            let node_id = finding.impacted_node();
-            if seen.insert(node_id.to_string()) {
-                if let Some(node) = current.node(&NodeId::new(node_id)) {
-                    node_names.push(node.name.clone());
-                }
+            let node_id = finding.impacted_node().to_string();
+            if seen.insert(node_id.clone()) {
+                node_ids.push(node_id);
             }
         }
-        self.recommended_command = vocabulary.recommended_validation_command(&node_names);
+        self.recommended_command = vocabulary.recommended_validation_command(&node_ids);
         self
     }
 
@@ -804,52 +805,28 @@ mod tests {
         assert!(text.contains("WARN"), "{text}");
     }
 
-    /// A minimal `ParsedProject` with one Node per `(id, name)` pair --
-    /// enough to exercise `Report::with_recommended_command`'s NodeId ->
-    /// bare-name resolution without needing a real compiled manifest.
-    fn project_with_nodes(nodes: &[(&str, &str)]) -> ParsedProject {
-        ParsedProject {
-            nodes: nodes
-                .iter()
-                .map(|(id, name)| zhao_core::model::Node {
-                    id: NodeId::new(*id),
-                    name: name.to_string(),
-                    columns: Vec::new(),
-                    joins: Vec::new(),
-                })
-                .collect(),
-            origins: Vec::new(),
-            edges: Vec::new(),
-        }
-    }
-
     /// Acceptance criterion 1: the generated selector set exactly matches
     /// the Nodes listed in the Downstream impact section -- no more (a
-    /// Node that only appears in "Changed", like `model.c` here via a
+    /// Node that only appears in "Changed", like `stg_orders` here via a
     /// pass-severity Finding, must be excluded), no less, and
-    /// deduplicated (both Findings below share `model.a` as their
+    /// deduplicated (both Findings below share `stg_customers` as their
     /// impacted Node).
     #[test]
     fn with_recommended_command_includes_exactly_the_downstream_impact_nodes() {
-        let current = project_with_nodes(&[
-            ("model.a", "stg_customers"),
-            ("model.b", "dim_customers"),
-            ("model.c", "stg_orders"),
-        ]);
         let findings = vec![
             Finding {
                 severity: Severity::Error,
                 detail: FindingDetail::ColumnRemovedWithActiveReferences {
-                    node: NodeId::new("model.a"),
+                    node: NodeId::new("model.zhao_dbt_test.stg_customers"),
                     column: zhao_core::model::ColumnName::new("id"),
-                    reached: NodeId::new("model.b"),
+                    reached: NodeId::new("model.zhao_dbt_test.dim_customers"),
                     reached_column: zhao_core::model::ColumnName::new("a_id"),
                 },
             },
             Finding {
                 severity: Severity::Warn,
                 detail: FindingDetail::ColumnTypeNarrowed {
-                    node: NodeId::new("model.a"),
+                    node: NodeId::new("model.zhao_dbt_test.stg_customers"),
                     column: zhao_core::model::ColumnName::new("amount"),
                     from_type: "bigint".to_string(),
                     to_type: "int".to_string(),
@@ -858,19 +835,45 @@ mod tests {
             Finding {
                 severity: Severity::Pass,
                 detail: FindingDetail::ColumnAdded {
-                    node: NodeId::new("model.c"),
+                    node: NodeId::new("model.zhao_dbt_test.stg_orders"),
                     column: zhao_core::model::ColumnName::new("new_col"),
                 },
             },
         ];
-        let report = Report::new(&[], &findings).with_recommended_command(&current, &DbtVocabulary);
+        let report = Report::new(&[], &findings).with_recommended_command(&DbtVocabulary);
 
         assert_eq!(
             report.recommended_command.as_deref(),
             Some("dbt build --select dim_customers stg_customers"),
-            "should include model.b (via the reached Finding) and model.a (via the \
-             type-narrowed Finding on itself) exactly once each, and never model.c \
-             (only a pass-severity Finding, not Downstream impact)"
+            "should include dim_customers (via the reached Finding) and stg_customers \
+             (via the type-narrowed Finding on itself) exactly once each, and never \
+             stg_orders (only a pass-severity Finding, not Downstream impact)"
+        );
+    }
+
+    /// Regression test for the bug an earlier version of this method had:
+    /// a Node reached only via the Baseline (e.g. one that no longer
+    /// exists in the current state at all, for
+    /// `ColumnRemovedWithActiveReferences`) must still be named in the
+    /// recommended command -- this method no longer looks Nodes up
+    /// against a `ParsedProject` at all, precisely so there's nothing to
+    /// fail to resolve.
+    #[test]
+    fn with_recommended_command_includes_a_node_that_no_longer_exists_anywhere_but_its_id() {
+        let findings = vec![Finding {
+            severity: Severity::Error,
+            detail: FindingDetail::ColumnRemovedWithActiveReferences {
+                node: NodeId::new("model.zhao_dbt_test.stg_customers"),
+                column: zhao_core::model::ColumnName::new("id"),
+                reached: NodeId::new("model.zhao_dbt_test.deleted_downstream_model"),
+                reached_column: zhao_core::model::ColumnName::new("a_id"),
+            },
+        }];
+        let report = Report::new(&[], &findings).with_recommended_command(&DbtVocabulary);
+
+        assert_eq!(
+            report.recommended_command.as_deref(),
+            Some("dbt build --select deleted_downstream_model"),
         );
     }
 
@@ -878,10 +881,8 @@ mod tests {
     /// recommended command.
     #[test]
     fn with_recommended_command_is_none_when_nothing_is_impactful() {
-        let current = project_with_nodes(&[("model.a", "stg_customers")]);
-
         // No Findings at all.
-        let report = Report::new(&[], &[]).with_recommended_command(&current, &DbtVocabulary);
+        let report = Report::new(&[], &[]).with_recommended_command(&DbtVocabulary);
         assert_eq!(report.recommended_command, None);
 
         // A Finding exists, but it's pass-severity -- not Downstream
@@ -889,11 +890,11 @@ mod tests {
         let findings = vec![Finding {
             severity: Severity::Pass,
             detail: FindingDetail::ColumnAdded {
-                node: NodeId::new("model.a"),
+                node: NodeId::new("model.zhao_dbt_test.stg_customers"),
                 column: zhao_core::model::ColumnName::new("new_col"),
             },
         }];
-        let report = Report::new(&[], &findings).with_recommended_command(&current, &DbtVocabulary);
+        let report = Report::new(&[], &findings).with_recommended_command(&DbtVocabulary);
         assert_eq!(report.recommended_command, None);
     }
 
@@ -901,18 +902,17 @@ mod tests {
     /// present, and omits it entirely when absent.
     #[test]
     fn render_text_appends_the_recommended_command_when_present() {
-        let current = project_with_nodes(&[("model.a", "stg_customers")]);
         let findings = vec![Finding {
             severity: Severity::Error,
             detail: FindingDetail::ColumnRemovedWithActiveReferences {
-                node: NodeId::new("model.a"),
+                node: NodeId::new("model.zhao_dbt_test.stg_customers"),
                 column: zhao_core::model::ColumnName::new("id"),
-                reached: NodeId::new("model.a"),
+                reached: NodeId::new("model.zhao_dbt_test.stg_customers"),
                 reached_column: zhao_core::model::ColumnName::new("id"),
             },
         }];
         let report = Report::new(&[], &findings)
-            .with_recommended_command(&current, &DbtVocabulary)
+            .with_recommended_command(&DbtVocabulary)
             .with_staleness_warning(false);
 
         let text = render_text(&report, &DbtVocabulary, false);

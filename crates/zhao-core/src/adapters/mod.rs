@@ -52,9 +52,14 @@ pub trait AdapterVocabulary {
     fn origin_term(&self) -> &'static str;
 
     /// A ready-to-run command, in this tool's own selector syntax,
-    /// recommending exactly which Nodes to validate -- `node_names` are
-    /// this tool's own names for those Nodes (e.g. a dbt model's bare
-    /// name, not zhao's qualified `NodeId`). `None` if `node_names` is
-    /// empty: there's nothing to recommend validating.
-    fn recommended_validation_command(&self, node_names: &[String]) -> Option<String>;
+    /// recommending exactly which Nodes to validate -- `node_ids` are
+    /// zhao's own qualified `NodeId` strings (e.g. a dbt model's
+    /// `unique_id`, `model.<package>.<name>`); this tool derives its own
+    /// selectable name for each from that string itself, rather than
+    /// requiring a caller to look up a full `Node` first -- a Node
+    /// reached only via the Baseline (e.g. one deleted entirely in the
+    /// current state) may have no corresponding `Node` to look up at all,
+    /// but its ID string is still enough to name it. `None` if `node_ids`
+    /// is empty: there's nothing to recommend validating.
+    fn recommended_validation_command(&self, node_ids: &[String]) -> Option<String>;
 }
