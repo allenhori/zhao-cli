@@ -203,7 +203,9 @@ fn no_color_flag_produces_byte_for_byte_plain_text() {
              \x20   [BREAKING] last_name removed from model model.zhao_dbt_test.stg_customers \
              breaks reference via last_name (column-removed-with-active-references)\n\
              \n\
-             Summary: 2 model(s) changed, 4 column(s) changed, 1 breaking, 1 warning\n",
+             Summary: 2 model(s) changed, 4 column(s) changed, 1 breaking, 1 warning\n\
+             \n\
+             Recommended: dbt build --select stg_customers dim_customers\n",
         );
 }
 
@@ -357,6 +359,58 @@ fn exits_zero_when_nothing_breaking_is_found() {
         .assert()
         .code(0)
         .stdout(predicate::str::contains("\"findings\": []"));
+}
+
+/// Acceptance criterion 1: the generated selector's set of Nodes exactly
+/// matches the Nodes named in the Downstream impact section.
+#[test]
+fn recommended_command_matches_the_downstream_impact_nodes() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "\"recommended_command\": \"dbt build --select stg_customers dim_customers\"",
+        ));
+}
+
+/// Acceptance criterion 2: a run with zero impacted Nodes produces no
+/// recommended command -- covers both "zero Changes at all" and "a Change
+/// exists but its only Finding is pass-severity" (not Downstream impact).
+#[test]
+fn no_recommended_command_when_nothing_is_impactful() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest_clean.json"))
+        .arg("--project-dir")
+        .arg(fixture("clean_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("recommended_command").not());
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest_clean.json"))
+        .arg("--project-dir")
+        .arg(fixture("non_matching_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("recommended_command").not());
 }
 
 /// Distinct from `exits_zero_when_nothing_breaking_is_found`: that test

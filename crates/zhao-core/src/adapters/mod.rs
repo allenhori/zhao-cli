@@ -50,4 +50,11 @@ pub trait AdapterVocabulary {
 
     /// This tool's word for an [`crate::model::Origin`] (e.g. "source" for dbt).
     fn origin_term(&self) -> &'static str;
+
+    /// A ready-to-run command, in this tool's own selector syntax,
+    /// recommending exactly which Nodes to validate -- `node_names` are
+    /// this tool's own names for those Nodes (e.g. a dbt model's bare
+    /// name, not zhao's qualified `NodeId`). `None` if `node_names` is
+    /// empty: there's nothing to recommend validating.
+    fn recommended_validation_command(&self, node_names: &[String]) -> Option<String>;
 }

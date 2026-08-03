@@ -55,6 +55,13 @@ impl AdapterVocabulary for DbtVocabulary {
     fn origin_term(&self) -> &'static str {
         "source"
     }
+
+    fn recommended_validation_command(&self, node_names: &[String]) -> Option<String> {
+        if node_names.is_empty() {
+            return None;
+        }
+        Some(format!("dbt build --select {}", node_names.join(" ")))
+    }
 }
 
 /// Everything that can go wrong while an adapter reads and parses a dbt
