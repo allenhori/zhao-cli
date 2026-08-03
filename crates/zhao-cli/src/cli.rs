@@ -46,6 +46,12 @@ pub struct CheckArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
+
+    /// Disables ANSI color codes in text output, regardless of what
+    /// auto-detection would otherwise decide. Has no effect on `--format
+    /// json`, which never contains color codes.
+    #[arg(long)]
+    pub no_color: bool,
 }
 
 /// `zhao check`'s output format.
