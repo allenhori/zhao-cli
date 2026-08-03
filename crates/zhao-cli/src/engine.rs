@@ -34,9 +34,14 @@ pub(crate) struct EngineOutput {
 pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     let current_manifest = args.project_dir.join("target").join("manifest.json");
 
-    let baseline =
-        crate::baseline::resolve(args.state.as_deref(), &args.project_dir, &args.against)
-            .map_err(|err| err.to_string())?;
+    let dbt_passthrough_args = args.dbt_passthrough_args()?;
+    let baseline = crate::baseline::resolve(
+        args.state.as_deref(),
+        &args.project_dir,
+        &args.against,
+        &dbt_passthrough_args,
+    )
+    .map_err(|err| err.to_string())?;
     let current = load_manifest(&current_manifest)?;
     let config = Config::load_for_project(&args.project_dir).map_err(|err| err.to_string())?;
 

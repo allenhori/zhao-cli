@@ -59,6 +59,49 @@ pub struct CheckArgs {
     /// json`, which never contains color codes.
     #[arg(long)]
     pub no_color: bool,
+
+    /// An extra argument to append to every `dbt deps`/`dbt compile`
+    /// invocation zhao runs internally (git-native Baseline resolution
+    /// only) -- repeat for multiple arguments, e.g. `--dbt-arg --target
+    /// --dbt-arg ci`. Appended verbatim, in the order given; zhao never
+    /// parses or validates these, dbt does. Mutually exclusive with
+    /// `--dbt-args`.
+    #[arg(
+        long = "dbt-arg",
+        conflicts_with = "dbt_args",
+        allow_hyphen_values = true
+    )]
+    pub dbt_arg: Vec<String>,
+
+    /// A single dbt-invocation-shaped string to split (shell-word-style)
+    /// into individual arguments and append to every `dbt deps`/`dbt
+    /// compile` invocation zhao runs internally -- a convenience
+    /// alternative to repeating `--dbt-arg`, e.g. `--dbt-args "--target ci
+    /// --vars '{\"key\": \"value\"}'"`. Mutually exclusive with
+    /// `--dbt-arg`.
+    #[arg(
+        long = "dbt-args",
+        conflicts_with = "dbt_arg",
+        allow_hyphen_values = true
+    )]
+    pub dbt_args: Option<String>,
+}
+
+impl CheckArgs {
+    /// Resolves the final, ordered list of extra arguments to append to
+    /// every `dbt deps`/`dbt compile` invocation, from whichever of
+    /// `--dbt-arg`/`--dbt-args` was given (clap's `conflicts_with` on both
+    /// fields already guarantees at most one was) -- empty if neither was.
+    pub fn dbt_passthrough_args(&self) -> Result<Vec<String>, String> {
+        if !self.dbt_arg.is_empty() {
+            return Ok(self.dbt_arg.clone());
+        }
+        if let Some(raw) = &self.dbt_args {
+            return shell_words::split(raw)
+                .map_err(|err| format!("could not parse --dbt-args {raw:?}: {err}"));
+        }
+        Ok(Vec::new())
+    }
 }
 
 /// `zhao check`'s output format.

@@ -118,6 +118,14 @@ pub enum DbtAdapterError {
         /// `dbt compile`'s captured stderr.
         stderr: String,
     },
+    /// `dbt deps` ran but exited with a failure.
+    #[error("dbt deps failed in {project_dir}:\n{stderr}")]
+    DepsFailed {
+        /// The project directory `dbt deps` was run in.
+        project_dir: String,
+        /// `dbt deps`'s captured stderr.
+        stderr: String,
+    },
 }
 
 impl TransformationToolAdapter for DbtAdapter {
@@ -150,32 +158,72 @@ impl DbtAdapter {
     /// `"dbt"`, resolved via `PATH` -- exposed as a parameter (rather than
     /// hardcoded) so tests can point it at a stub script instead of
     /// depending on whether a real `dbt` happens to be installed wherever
-    /// the tests run.
+    /// the tests run. `extra_args` are appended verbatim after `compile`
+    /// (e.g. `--target`, `--vars`) -- zhao never interprets or validates
+    /// these, dbt does.
     ///
     /// This is a plain method, not part of [`TransformationToolAdapter`]:
     /// that trait's `parse` deliberately leaves "how the compiled output
     /// got there" to the caller, and shelling out to `dbt compile` is
     /// exactly the kind of dbt-specific concern this adapter's module (not
     /// the trait) should own.
-    pub fn compile(&self, project_dir: &Path, dbt_command: &str) -> Result<(), DbtAdapterError> {
-        let output = std::process::Command::new(dbt_command)
-            .arg("compile")
-            .current_dir(project_dir)
-            .output()
-            .map_err(|source| DbtAdapterError::CommandNotFound {
-                command: dbt_command.to_string(),
-                source,
-            })?;
-
+    pub fn compile(
+        &self,
+        project_dir: &Path,
+        dbt_command: &str,
+        extra_args: &[String],
+    ) -> Result<(), DbtAdapterError> {
+        let output = run_dbt_subcommand(dbt_command, "compile", project_dir, extra_args)?;
         if !output.status.success() {
             return Err(DbtAdapterError::CompileFailed {
                 project_dir: project_dir.display().to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
-
         Ok(())
     }
+
+    /// Runs `dbt deps` in `project_dir`, installing any package
+    /// dependencies declared in `packages.yml` (or `dependencies.yml`)
+    /// before a subsequent [`DbtAdapter::compile`] -- needed the first
+    /// time a project is compiled somewhere its packages have never been
+    /// installed (e.g. a freshly checked-out git worktree), since `dbt
+    /// compile` fails if a `ref()`/macro from an unresolved package is
+    /// used. See [`DbtAdapter::compile`] for `dbt_command`/`extra_args`.
+    pub fn deps(
+        &self,
+        project_dir: &Path,
+        dbt_command: &str,
+        extra_args: &[String],
+    ) -> Result<(), DbtAdapterError> {
+        let output = run_dbt_subcommand(dbt_command, "deps", project_dir, extra_args)?;
+        if !output.status.success() {
+            return Err(DbtAdapterError::DepsFailed {
+                project_dir: project_dir.display().to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Runs `dbt_command <subcommand> <extra_args...>` in `project_dir`,
+/// shared by [`DbtAdapter::compile`] and [`DbtAdapter::deps`].
+fn run_dbt_subcommand(
+    dbt_command: &str,
+    subcommand: &str,
+    project_dir: &Path,
+    extra_args: &[String],
+) -> Result<std::process::Output, DbtAdapterError> {
+    std::process::Command::new(dbt_command)
+        .arg(subcommand)
+        .args(extra_args)
+        .current_dir(project_dir)
+        .output()
+        .map_err(|source| DbtAdapterError::CommandNotFound {
+            command: dbt_command.to_string(),
+            source,
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -995,7 +1043,7 @@ mod tests {
         );
 
         DbtAdapter
-            .compile(project_dir.path(), dbt.to_str().expect("utf8 path"))
+            .compile(project_dir.path(), dbt.to_str().expect("utf8 path"), &[])
             .expect("compile should succeed");
 
         assert!(
@@ -1015,7 +1063,7 @@ mod tests {
         let stub_dir = tempfile::tempdir().expect("should create temp dir");
         let dbt = stub_dbt_command(stub_dir.path(), "echo 'boom' >&2\nexit 1");
 
-        let result = DbtAdapter.compile(project_dir.path(), dbt.to_str().expect("utf8 path"));
+        let result = DbtAdapter.compile(project_dir.path(), dbt.to_str().expect("utf8 path"), &[]);
 
         match result {
             Err(DbtAdapterError::CompileFailed { stderr, .. }) => {
@@ -1032,12 +1080,69 @@ mod tests {
         let result = DbtAdapter.compile(
             project_dir.path(),
             "definitely-not-a-real-command-zhao-test",
+            &[],
         );
 
         assert!(matches!(
             result,
             Err(DbtAdapterError::CommandNotFound { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compile_appends_extra_args_after_the_subcommand() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        // Echoes its own argv (minus argv[0]) to a file the test can read
+        // back, so this proves the exact args dbt actually received --
+        // not just that compile() returned Ok.
+        let dbt = stub_dbt_command(stub_dir.path(), "echo \"$@\" > args.txt");
+
+        DbtAdapter
+            .compile(
+                project_dir.path(),
+                dbt.to_str().expect("utf8 path"),
+                &["--target".to_string(), "ci".to_string()],
+            )
+            .expect("compile should succeed");
+
+        let recorded_args =
+            fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
+        assert_eq!(recorded_args.trim(), "compile --target ci");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deps_runs_the_configured_dbt_command_in_the_project_dir() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(stub_dir.path(), "echo \"$@\" > args.txt");
+
+        DbtAdapter
+            .deps(project_dir.path(), dbt.to_str().expect("utf8 path"), &[])
+            .expect("deps should succeed");
+
+        let recorded_args =
+            fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
+        assert_eq!(recorded_args.trim(), "deps");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deps_reports_a_clear_error_when_dbt_deps_fails() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(stub_dir.path(), "echo 'boom' >&2\nexit 1");
+
+        let result = DbtAdapter.deps(project_dir.path(), dbt.to_str().expect("utf8 path"), &[]);
+
+        match result {
+            Err(DbtAdapterError::DepsFailed { stderr, .. }) => {
+                assert!(stderr.contains("boom"), "stderr should surface: {stderr:?}");
+            }
+            other => panic!("expected DepsFailed, got {other:?}"),
+        }
     }
 
     #[test]
