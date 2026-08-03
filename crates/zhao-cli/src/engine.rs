@@ -17,10 +17,21 @@ use zhao_core::rules::evaluate;
 use crate::cli::{CheckArgs, OutputFormat};
 use crate::report::{Report, render_text};
 
+/// The full result of running the engine pipeline: the [`Report`] itself,
+/// plus the current project state it was built from -- needed separately
+/// since [`crate::metadata::RunMetadata`] includes the current state's
+/// full Lineage Edge breakdown, which the `Report` alone doesn't carry.
+pub(crate) struct EngineOutput {
+    /// The completed report -- what a `--format json`/text run prints.
+    pub report: Report,
+    /// The current project state the report was built from.
+    pub current: zhao_core::model::ParsedProject,
+}
+
 /// Runs the full engine pipeline -- Baseline resolution, diff, Rule
 /// evaluation -- and builds the resulting [`Report`], including its
 /// staleness warning and recommended command.
-pub(crate) fn build_report(args: &CheckArgs) -> Result<Report, String> {
+pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     let current_manifest = args.project_dir.join("target").join("manifest.json");
 
     let baseline =
@@ -31,9 +42,19 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<Report, String> {
 
     let changes = diff(&baseline, &current);
     let findings = evaluate(&baseline, &changes, &config);
-    Ok(Report::new(&changes, &findings)
+    let report = Report::new(&changes, &findings)
         .with_staleness_warning(is_stale(&args.project_dir, &args.against))
-        .with_recommended_command(DbtAdapter.vocabulary()))
+        .with_recommended_command(DbtAdapter.vocabulary());
+
+    Ok(EngineOutput { report, current })
+}
+
+/// Writes `target/zhao/run-metadata.json` for this run -- see
+/// [`crate::metadata`]. Called by both `zhao check` and `zhao diff`, since
+/// every run writes it, not just gated ones.
+pub(crate) fn write_run_metadata(output: &EngineOutput, args: &CheckArgs) -> Result<(), String> {
+    let metadata = crate::metadata::RunMetadata::new(&output.report, &output.current);
+    crate::metadata::write(&metadata, &args.project_dir)
 }
 
 /// Prints `report` in `args.format` -- JSON or the color-aware text
