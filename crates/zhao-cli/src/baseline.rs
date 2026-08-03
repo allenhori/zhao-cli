@@ -32,15 +32,23 @@ pub enum BaselineError {
 
 /// Resolves the Baseline `zhao check` diffs the current project against.
 ///
-/// If `state_path` is given, it's parsed directly. Otherwise, the
-/// merge-base commit between `HEAD` and `against` is resolved in the git
-/// repository containing `project_dir`, checked out into a temporary
-/// worktree, compiled there with `dbt`, and parsed from that worktree --
-/// all without requiring any externally-supplied Baseline artifact.
+/// If `state_path` is given, it's parsed directly (`extra_args` is
+/// ignored in this path -- there's no `dbt` invocation to pass them to).
+/// Otherwise, the merge-base commit between `HEAD` and `against` is
+/// resolved in the git repository containing `project_dir`, checked out
+/// into a temporary worktree, compiled there with `dbt`, and parsed from
+/// that worktree -- all without requiring any externally-supplied
+/// Baseline artifact. `dbt deps` is run first whenever the worktree's
+/// project directory has a `packages.yml` or `dependencies.yml`, since
+/// `dbt compile` fails on any `ref()`/macro from an as-yet-uninstalled
+/// package -- exactly the state a freshly checked-out worktree is in the
+/// first time. `extra_args` (from `--dbt-arg`/`--dbt-args`) are appended
+/// verbatim to both the `dbt deps` and `dbt compile` invocations.
 pub fn resolve(
     state_path: Option<&Path>,
     project_dir: &Path,
     against: &str,
+    extra_args: &[String],
 ) -> Result<ParsedProject, BaselineError> {
     if let Some(path) = state_path {
         return DbtAdapter
@@ -64,7 +72,12 @@ pub fn resolve(
     let worktree = git::create_worktree(&canonical_repo_root, &merge_base)?;
     let worktree_project_dir = worktree.path().join(relative_project_dir);
 
-    DbtAdapter.compile(&worktree_project_dir, "dbt")?;
+    if worktree_project_dir.join("packages.yml").exists()
+        || worktree_project_dir.join("dependencies.yml").exists()
+    {
+        DbtAdapter.deps(&worktree_project_dir, "dbt", extra_args)?;
+    }
+    DbtAdapter.compile(&worktree_project_dir, "dbt", extra_args)?;
 
     let manifest_path = worktree_project_dir.join("target").join("manifest.json");
     Ok(DbtAdapter.parse(&manifest_path)?)
