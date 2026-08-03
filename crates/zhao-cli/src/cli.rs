@@ -19,9 +19,16 @@ pub enum Command {
     /// Runs the breaking-change gate: diffs the current project against a
     /// Baseline and exits non-zero if any Rule fires at `error` Severity.
     Check(CheckArgs),
+    /// Runs the identical engine as `check` -- Baseline resolution, diff,
+    /// Rule evaluation, report rendering -- but always exits zero,
+    /// regardless of what Severity outcomes are present. For local
+    /// inspection during development; use `check` for CI gating.
+    Diff(CheckArgs),
 }
 
-/// Arguments to `zhao check`.
+/// Arguments shared by `zhao check` and `zhao diff` -- both run the
+/// identical engine and accept identical inputs; they differ only in
+/// what they do with the result (a gate's exit code vs. always zero).
 #[derive(Debug, clap::Args)]
 pub struct CheckArgs {
     /// Path to the Baseline's compiled dbt manifest (`manifest.json`). If
