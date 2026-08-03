@@ -165,20 +165,46 @@ fn unrelated_models_in_the_same_project_do_not_appear_in_either_section() {
 
 /// `--no-color`, verified byte-for-byte against a plain-text snapshot (not
 /// just "doesn't contain an escape somewhere") -- the exact stdout must be
-/// exactly the plain-text rendering, nothing more.
+/// exactly the plain-text rendering, nothing more. Deliberately uses
+/// `breaking_project` (a fixture with real `BREAKING`/`WARN` findings,
+/// same as the other text-report tests above) rather than a no-changes
+/// fixture: the no-changes path returns early before ever reaching the
+/// only code that calls `colorize()`, so a snapshot of *that* path would
+/// pass identically even if `--no-color` were silently ignored. This one
+/// actually exercises the colored code path and proves color was
+/// genuinely suppressed on it, not merely absent because it was never
+/// going to be there.
 #[test]
 fn no_color_flag_produces_byte_for_byte_plain_text() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("check")
         .arg("--state")
-        .arg(fixture("diff_baseline_manifest_clean.json"))
+        .arg(fixture("diff_baseline_manifest.json"))
         .arg("--project-dir")
-        .arg(fixture("clean_project"))
+        .arg(fixture("breaking_project"))
         .arg("--no-color")
         .assert()
-        .code(0)
-        .stdout("No changes detected.\n");
+        .code(1)
+        .stdout(
+            "Changed:\n\
+             \x20 model model.zhao_dbt_test.stg_customers:\n\
+             \x20   ~ column type changed: customer_id (bigint -> int)\n\
+             \x20   + column added: marketing_source\n\
+             \x20   - column removed: last_name\n\
+             \x20 model model.zhao_dbt_test.dim_customers:\n\
+             \x20   - column removed: last_name\n\
+             \x20   ~ join changed at position 0: left -> inner\n\
+             \n\
+             Downstream impact:\n\
+             \x20 model model.zhao_dbt_test.stg_customers:\n\
+             \x20   [WARN] customer_id type narrowed from bigint to int (column-type-narrowed)\n\
+             \x20 model model.zhao_dbt_test.dim_customers:\n\
+             \x20   [BREAKING] last_name removed from model model.zhao_dbt_test.stg_customers \
+             breaks reference via last_name (column-removed-with-active-references)\n\
+             \n\
+             Summary: 2 model(s) changed, 4 column(s) changed, 1 breaking, 1 warning\n",
+        );
 }
 
 /// Auto-detection: with no `--no-color` flag and no CI environment
