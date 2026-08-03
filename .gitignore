@@ -1,1 +1,8 @@
 /target
+
+# zhao's own run-metadata.json output. Written under any project dir's
+# target/zhao/, including inside test fixtures' checked-in target/
+# directories (those hold real, tracked manifest.json fixtures, so this
+# can't just be a blanket */target/ ignore) -- every zhao check/zhao diff
+# run writes one, including test runs against fixture projects.
+**/target/zhao/

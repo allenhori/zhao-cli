@@ -10,6 +10,7 @@ mod check;
 mod cli;
 mod diff;
 mod engine;
+mod metadata;
 mod report;
 
 use std::process::ExitCode;

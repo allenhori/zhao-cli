@@ -5,7 +5,7 @@
 use std::process::ExitCode;
 
 use crate::cli::CheckArgs;
-use crate::engine::{build_report, fail, print_report};
+use crate::engine::{build_report, fail, print_report, write_run_metadata};
 
 /// Exit code for "no breaking Change found."
 const EXIT_PASS: u8 = 0;
@@ -14,15 +14,16 @@ const EXIT_BREAKING: u8 = 1;
 
 /// Runs `zhao check` and returns the process exit code.
 pub fn run(args: &CheckArgs) -> ExitCode {
-    let report = match build_report(args) {
-        Ok(report) => report,
+    let output = match build_report(args) {
+        Ok(output) => output,
         Err(message) => return fail(&message),
     };
-    if let Err(message) = print_report(&report, args) {
+    if let Err(message) = print_report(&output.report, args) {
         return fail(&message);
     }
+    write_run_metadata(&output, args);
 
-    ExitCode::from(if report.is_breaking() {
+    ExitCode::from(if output.report.is_breaking() {
         EXIT_BREAKING
     } else {
         EXIT_PASS

@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use crate::cli::CheckArgs;
-use crate::engine::{build_report, fail, print_report};
+use crate::engine::{build_report, fail, print_report, write_run_metadata};
 
 /// Exit code for "ran successfully" -- used unconditionally, regardless of
 /// Severity outcomes present. `zhao diff` is an inspection tool, not a
@@ -16,13 +16,14 @@ const EXIT_OK: u8 = 0;
 
 /// Runs `zhao diff` and returns the process exit code.
 pub fn run(args: &CheckArgs) -> ExitCode {
-    let report = match build_report(args) {
-        Ok(report) => report,
+    let output = match build_report(args) {
+        Ok(output) => output,
         Err(message) => return fail(&message),
     };
-    if let Err(message) = print_report(&report, args) {
+    if let Err(message) = print_report(&output.report, args) {
         return fail(&message);
     }
+    write_run_metadata(&output, args);
 
     ExitCode::from(EXIT_OK)
 }
