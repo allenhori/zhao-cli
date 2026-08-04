@@ -189,10 +189,42 @@ impl Report {
                              evolution: {}",
                             change.describe()
                         ),
+                        change_description: change.describe(),
                     }
                 })
             })
             .collect();
+        self
+    }
+
+    /// Upgrades or drops each schema-evolution warning based on a live
+    /// existence check, for `--check-relations` (opt-in, since it
+    /// requires a real connection the offline default gate never needs):
+    /// `check(node)` returning `Some(true)` rewords that warning from
+    /// conditional ("if this model already exists...") to definitive
+    /// (the model is confirmed to exist); `Some(false)` removes the
+    /// warning entirely (confirmed not to exist, so there's nothing to
+    /// flag); `None` (the check couldn't be performed at all -- an
+    /// unsupported warehouse, or the check itself failed) leaves that
+    /// warning's conditional wording untouched, the same as if
+    /// `--check-relations` had never been passed.
+    pub fn with_live_relation_checks(
+        mut self,
+        mut check: impl FnMut(&str) -> Option<bool>,
+    ) -> Self {
+        self.schema_evolution_warnings
+            .retain_mut(|warning| match check(&warning.node) {
+                Some(true) => {
+                    warning.message = format!(
+                        "this incrementally-materialized model exists in your target \
+                         environment; this change requires manual schema evolution: {}",
+                        warning.change_description
+                    );
+                    true
+                }
+                Some(false) => false,
+                None => true,
+            });
         self
     }
 
@@ -283,6 +315,14 @@ pub struct SchemaEvolutionWarningJson {
     /// ("if this model already exists..."), never asserts the model
     /// exists as fact.
     pub message: String,
+    /// The underlying Change's own one-line description (e.g. `"+
+    /// column added: new_col"`), kept alongside `message` so
+    /// [`Report::with_live_relation_checks`] can rebuild a definitive
+    /// message without re-deriving or text-parsing the conditional one.
+    /// Never serialized -- an internal detail, not part of the JSON
+    /// contract.
+    #[serde(skip)]
+    change_description: String,
 }
 
 /// A [`Change`], reshaped for JSON output.
@@ -1393,6 +1433,77 @@ mod tests {
         let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
 
         assert!(report.schema_evolution_warnings.is_empty());
+    }
+
+    /// `--check-relations` acceptance criterion: confirmed existing
+    /// upgrades the warning from conditional to definitive wording,
+    /// without dropping it.
+    #[test]
+    fn with_live_relation_checks_upgrades_a_confirmed_warning_to_definitive_wording() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Incremental,
+        )]);
+        let changes = vec![Change::ColumnAdded {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("new_col"),
+        }];
+        let report = Report::new(&changes, &[])
+            .with_schema_evolution_warnings(&current)
+            .with_live_relation_checks(|_node| Some(true));
+
+        assert_eq!(report.schema_evolution_warnings.len(), 1);
+        let message = &report.schema_evolution_warnings[0].message;
+        assert!(
+            !message.starts_with("if "),
+            "a confirmed-existing warning should no longer be phrased conditionally: {message}"
+        );
+        assert!(
+            message.contains("exists in your target environment"),
+            "{message}"
+        );
+    }
+
+    /// `--check-relations` acceptance criterion: confirmed not to exist
+    /// drops the warning entirely.
+    #[test]
+    fn with_live_relation_checks_drops_a_confirmed_absent_warning() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Incremental,
+        )]);
+        let changes = vec![Change::ColumnAdded {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("new_col"),
+        }];
+        let report = Report::new(&changes, &[])
+            .with_schema_evolution_warnings(&current)
+            .with_live_relation_checks(|_node| Some(false));
+
+        assert!(report.schema_evolution_warnings.is_empty());
+    }
+
+    /// `--check-relations` acceptance criterion (implied): when the check
+    /// couldn't be performed at all (unsupported warehouse, failed
+    /// check), the warning's original conditional wording is left
+    /// untouched -- same as `--check-relations` never having been passed.
+    #[test]
+    fn with_live_relation_checks_leaves_an_undetermined_warning_unchanged() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Incremental,
+        )]);
+        let changes = vec![Change::ColumnAdded {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("new_col"),
+        }];
+        let before = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+        let original_message = before.schema_evolution_warnings[0].message.clone();
+
+        let after = before.with_live_relation_checks(|_node| None);
+
+        assert_eq!(after.schema_evolution_warnings.len(), 1);
+        assert_eq!(after.schema_evolution_warnings[0].message, original_message);
     }
 
     /// Acceptance criterion 3: the message is phrased as a conditional

@@ -9,7 +9,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use zhao_core::adapters::TransformationToolAdapter;
-use zhao_core::adapters::dbt::DbtAdapter;
+use zhao_core::adapters::dbt::{DbtAdapter, DbtQueryExecutor};
+use zhao_core::adapters::warehouse;
 use zhao_core::config::Config;
 use zhao_core::diff::diff;
 use zhao_core::rules::evaluate;
@@ -47,13 +48,80 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
 
     let changes = diff(&baseline, &current);
     let findings = evaluate(&baseline, &changes, &config);
-    let report = Report::new(&changes, &findings)
+    let mut report = Report::new(&changes, &findings)
         .with_staleness_warning(is_stale(&args.project_dir, &args.against))
         .with_recommended_command(DbtAdapter.vocabulary())
         .with_defer_plan(&current, DbtAdapter.vocabulary())
         .with_schema_evolution_warnings(&current);
 
+    if args.check_relations {
+        report = apply_check_relations(report, args, &current_manifest, &dbt_passthrough_args);
+    }
+
     Ok(EngineOutput { report, current })
+}
+
+/// `--check-relations`: upgrades or drops each conditional schema-
+/// evolution warning by actually checking whether its Node exists in
+/// the configured target. Best-effort: any warehouse zhao doesn't
+/// support, or any failure of the check itself, is reported to stderr
+/// as a warning and leaves that warning's conditional wording
+/// untouched -- never turns an otherwise-successful run into "zhao
+/// itself failed" over a live-check problem.
+fn apply_check_relations(
+    report: Report,
+    args: &CheckArgs,
+    current_manifest: &Path,
+    dbt_passthrough_args: &[String],
+) -> Report {
+    let adapter_type = match DbtAdapter.adapter_type(current_manifest) {
+        Ok(Some(adapter_type)) => adapter_type,
+        Ok(None) => {
+            eprintln!(
+                "warning: --check-relations: the compiled manifest doesn't record which \
+                 warehouse it targets, so live existence checks aren't available"
+            );
+            return report;
+        }
+        Err(err) => {
+            eprintln!("warning: --check-relations: could not read the compiled manifest: {err}");
+            return report;
+        }
+    };
+    let Some(warehouse_adapter) = warehouse::resolve(&adapter_type) else {
+        eprintln!(
+            "warning: --check-relations: {adapter_type:?} isn't a supported warehouse yet, \
+             so live existence checks aren't available"
+        );
+        return report;
+    };
+    let relation_identities = match DbtAdapter.relation_identities(current_manifest) {
+        Ok(identities) => identities,
+        Err(err) => {
+            eprintln!(
+                "warning: --check-relations: could not read relation identities from the \
+                 compiled manifest: {err}"
+            );
+            return report;
+        }
+    };
+
+    let executor = DbtQueryExecutor {
+        project_dir: &args.project_dir,
+        dbt_command: "dbt",
+        extra_args: dbt_passthrough_args,
+    };
+
+    report.with_live_relation_checks(|node_id| {
+        let relation = relation_identities.get(node_id)?;
+        match warehouse_adapter.relation_exists(relation, &executor) {
+            Ok(exists) => Some(exists),
+            Err(err) => {
+                eprintln!("warning: --check-relations: could not check {node_id}: {err}");
+                None
+            }
+        }
+    })
 }
 
 /// Writes `target/zhao/run-metadata.json` for this run -- see

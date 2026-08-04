@@ -85,6 +85,18 @@ pub struct CheckArgs {
         allow_hyphen_values = true
     )]
     pub dbt_args: Option<String>,
+
+    /// Upgrades the conditional schema-evolution flag (see the "Schema
+    /// evolution" report section) into a definitive one, or drops it
+    /// entirely, by actually checking whether each flagged model exists
+    /// in the configured target -- via the same connection `dbt run`
+    /// already needs, never a connection zhao holds itself. Opt-in,
+    /// since (unlike every other check zhao runs) this requires a real
+    /// connection; without it, the flag stays conditionally worded.
+    /// Silently unavailable (not an error) for any warehouse zhao
+    /// doesn't yet support checking against.
+    #[arg(long = "check-relations")]
+    pub check_relations: bool,
 }
 
 impl CheckArgs {
