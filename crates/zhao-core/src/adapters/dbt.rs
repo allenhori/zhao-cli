@@ -1076,7 +1076,14 @@ impl QueryExecutor for DbtQueryExecutor<'_> {
         let macros_dir = self.project_dir.join("macros");
         fs::create_dir_all(&macros_dir)
             .map_err(|err| format!("could not create {}: {err}", macros_dir.display()))?;
-        let macro_path = macros_dir.join("__zhao_relation_exists.sql");
+        // Suffixed with this process's PID -- the macro file's *name*
+        // never matters to dbt (it discovers macros by their declared
+        // `{% macro %}` name, not by filename), only its content -- so a
+        // unique-per-process name is free insurance against two
+        // concurrent `--check-relations` invocations against the same
+        // project directory racing each other's write/cleanup.
+        let macro_path =
+            macros_dir.join(format!("__zhao_relation_exists_{}.sql", std::process::id()));
         fs::write(&macro_path, RELATION_EXISTS_MACRO_BODY).map_err(|err| {
             format!(
                 "could not write temporary macro at {}: {err}",
@@ -1523,11 +1530,10 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
             .expect("should succeed");
 
         assert!(
-            !project_dir
-                .path()
-                .join("macros")
-                .join("__zhao_relation_exists.sql")
-                .exists(),
+            fs::read_dir(project_dir.path().join("macros"))
+                .expect("macros dir should exist")
+                .next()
+                .is_none(),
             "the temporary macro file must not be left behind in the project directory"
         );
     }
@@ -1548,11 +1554,10 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
 
         assert!(result.is_err());
         assert!(
-            !project_dir
-                .path()
-                .join("macros")
-                .join("__zhao_relation_exists.sql")
-                .exists(),
+            fs::read_dir(project_dir.path().join("macros"))
+                .expect("macros dir should exist")
+                .next()
+                .is_none(),
             "the temporary macro file must not be left behind even on failure"
         );
     }
