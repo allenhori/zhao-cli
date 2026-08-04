@@ -14,7 +14,7 @@
 //!
 //! `adapter.get_relation(database, schema, identifier)` is dbt-core's own
 //! cross-adapter API: every dbt adapter plugin (Snowflake, Databricks,
-//! BigQuery, ...) implements it with an identical signature, and dbt
+//! BigQuery, DuckDB, ...) implements it with an identical signature, and dbt
 //! itself already resolves whatever dialect differences exist underneath
 //! (BigQuery calling the first part a "project" rather than a "database,"
 //! for instance). So the existence check itself is genuinely
@@ -51,7 +51,7 @@ pub struct RelationIdentity {
 /// run-operation`; a different transformation tool would implement this
 /// its own way. Kept warehouse-agnostic (like [`WarehouseAdapter`]
 /// itself) and dyn-safe so a single registry (see [`resolve`]) can hand
-/// back any of the three v1 adapters uniformly.
+/// back any of the v1 adapters uniformly.
 pub trait QueryExecutor {
     /// Runs `macro_name` with `args`, returning its captured output for
     /// the caller to interpret (e.g. a dbt macro's `log(..., info=True)`
@@ -203,6 +203,26 @@ impl WarehouseAdapter for BigQueryAdapter {
     }
 }
 
+/// The DuckDB [`WarehouseAdapter`] -- zhao-dbt-test's own credential-free
+/// CI target, and likely the most common local-development target for
+/// anyone trying zhao out.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DuckDbAdapter;
+
+impl WarehouseAdapter for DuckDbAdapter {
+    fn adapter_type(&self) -> &'static str {
+        "duckdb"
+    }
+
+    fn relation_exists(
+        &self,
+        relation: &RelationIdentity,
+        executor: &dyn QueryExecutor,
+    ) -> Result<bool, WarehouseAdapterError> {
+        check_relation_exists(relation, executor)
+    }
+}
+
 /// Resolves the [`WarehouseAdapter`] for a dbt-style `adapter_type` string
 /// (e.g. as recorded in a compiled manifest's `metadata.adapter_type`).
 /// `None` for any warehouse zhao doesn't support checking against yet --
@@ -213,6 +233,7 @@ pub fn resolve(adapter_type: &str) -> Option<Box<dyn WarehouseAdapter>> {
         "snowflake" => Some(Box::new(SnowflakeAdapter)),
         "databricks" => Some(Box::new(DatabricksAdapter)),
         "bigquery" => Some(Box::new(BigQueryAdapter)),
+        "duckdb" => Some(Box::new(DuckDbAdapter)),
         _ => None,
     }
 }
@@ -253,12 +274,13 @@ mod tests {
         assert_eq!(resolve("snowflake").unwrap().adapter_type(), "snowflake");
         assert_eq!(resolve("databricks").unwrap().adapter_type(), "databricks");
         assert_eq!(resolve("bigquery").unwrap().adapter_type(), "bigquery");
+        assert_eq!(resolve("duckdb").unwrap().adapter_type(), "duckdb");
     }
 
     #[test]
     fn resolve_is_none_for_an_unsupported_adapter_type() {
         assert!(resolve("postgres").is_none());
-        assert!(resolve("duckdb").is_none());
+        assert!(resolve("redshift").is_none());
         assert!(resolve("").is_none());
     }
 
@@ -267,7 +289,7 @@ mod tests {
         let executor = StubExecutor {
             response: Ok("true".to_string()),
         };
-        for adapter_type in ["snowflake", "databricks", "bigquery"] {
+        for adapter_type in ["snowflake", "databricks", "bigquery", "duckdb"] {
             let adapter = resolve(adapter_type).unwrap();
             assert_eq!(
                 adapter.relation_exists(&relation("dim_customers"), &executor),
@@ -282,7 +304,7 @@ mod tests {
         let executor = StubExecutor {
             response: Ok("false".to_string()),
         };
-        for adapter_type in ["snowflake", "databricks", "bigquery"] {
+        for adapter_type in ["snowflake", "databricks", "bigquery", "duckdb"] {
             let adapter = resolve(adapter_type).unwrap();
             assert_eq!(
                 adapter.relation_exists(&relation("dim_customers"), &executor),
