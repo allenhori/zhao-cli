@@ -199,10 +199,14 @@ fn run_metadata_json_field_set_is_exactly_this_and_nothing_else() {
         "staleness_warning",
         "recommended_command",
         "defer_plan",
+        "schema_evolution_warnings",
         "lineage_edges",
         // DeferPlanJson fields.
         "build",
         "defer",
+        // SchemaEvolutionWarningJson's own field ("node" is shared with
+        // ChangeJson/FindingJson below).
+        "message",
         // ChangeJson / FindingJson variants' fields.
         "type",
         "rule",

@@ -49,11 +49,13 @@ pub struct Report {
     /// Node materialized `incremental`. Phrased as a conditional
     /// possibility, never a fact: zhao has no live connection and cannot
     /// know whether the Node actually exists yet in any given target
-    /// environment. Empty (not `None`) when there's nothing to flag, so
-    /// JSON consumers don't need to distinguish "not computed" from
-    /// "computed, found nothing" the way `recommended_command`/`defer_plan`
-    /// do -- this is always computed once a `ParsedProject` is available.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// environment. Always serialized, even as `[]` -- unlike
+    /// `recommended_command`/`defer_plan` (which are only ever computed on
+    /// request and use `Option` to distinguish "not computed" from
+    /// "computed, found nothing"), this is unconditionally computed
+    /// whenever a `ParsedProject` is available, so there's no "not
+    /// computed" state for a consumer to need to distinguish in the first
+    /// place.
     pub schema_evolution_warnings: Vec<SchemaEvolutionWarningJson>,
 }
 
@@ -159,11 +161,18 @@ impl Report {
 
     /// Sets this report's schema-evolution warnings: one per
     /// schema-changing Change (column added/removed/type changed) whose
-    /// Node is materialized `incremental` in `current` -- a Node that no
-    /// longer exists in `current` at all (e.g. removed entirely) can't be
-    /// looked up for its materialization, so it's silently excluded
-    /// rather than guessed at. A non-schema Change (a join change) or a
-    /// Change on any other materialization never produces a warning here.
+    /// Node is materialized `incremental` in `current`. A non-schema
+    /// Change (a join change) or a Change on any other materialization
+    /// never produces a warning here.
+    ///
+    /// `current.node(...)` returning `None` (the Change's Node has no
+    /// corresponding `Node` in `current` at all) can't currently happen in
+    /// practice -- every `Change` originates from `zhao_core::diff::diff`,
+    /// which only ever emits one for a Node it found in `current` in the
+    /// first place, and `current` here is always that same
+    /// `ParsedProject`. Handled as a no-op skip via `?` anyway, purely as
+    /// a defensive guard against that invariant changing later, not
+    /// because it's a reachable case today.
     pub fn with_schema_evolution_warnings(mut self, current: &ParsedProject) -> Self {
         self.schema_evolution_warnings = self
             .changes
@@ -176,7 +185,8 @@ impl Report {
                         node: change.node().to_string(),
                         message: format!(
                             "if this incrementally-materialized model already exists in your \
-                             target environment, {} requires manual schema evolution",
+                             target environment, this change requires manual schema \
+                             evolution: {}",
                             change.describe()
                         ),
                     }
@@ -1336,6 +1346,34 @@ mod tests {
         let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
 
         assert!(report.schema_evolution_warnings.is_empty());
+    }
+
+    /// The remaining two `Materialization` variants -- `view` (also
+    /// exercised via the sibling `does_not_fire_for_a_table_node` test's
+    /// counterpart above) never fires, but `ephemeral` and an unrecognized
+    /// `Other` materialization must not fire either.
+    #[test]
+    fn schema_evolution_warning_never_fires_for_ephemeral_or_other_materializations() {
+        for materialization in [
+            Materialization::View,
+            Materialization::Ephemeral,
+            Materialization::Other("materialized_view".to_string()),
+        ] {
+            let current = project_with_nodes(vec![node_with_materialization(
+                "model.a",
+                materialization.clone(),
+            )]);
+            let changes = vec![Change::ColumnAdded {
+                node: NodeId::new("model.a"),
+                column: zhao_core::model::ColumnName::new("new_col"),
+            }];
+            let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+
+            assert!(
+                report.schema_evolution_warnings.is_empty(),
+                "{materialization:?} should never produce a schema evolution warning"
+            );
+        }
     }
 
     /// A non-schema Change (a join change) on an incremental Node never
