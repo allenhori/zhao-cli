@@ -3,9 +3,12 @@
 //!
 //! See `ARCHITECTURE.md` at the repository root for the reasoning behind
 //! this split. dbt is the first (and, for now, only) implementation of
-//! [`TransformationToolAdapter`]; see [`dbt`].
+//! [`TransformationToolAdapter`]; see [`dbt`]. Snowflake, Databricks,
+//! BigQuery, and DuckDB are the v1 implementations of
+//! [`warehouse::WarehouseAdapter`]; see [`warehouse`].
 
 pub mod dbt;
+pub mod warehouse;
 
 use crate::model::ParsedProject;
 use std::error::Error;
