@@ -24,6 +24,20 @@
 //! even active for a given project (dbt records this as `adapter_type` in
 //! a compiled manifest's metadata) -- that's what
 //! [`WarehouseAdapter::adapter_type`] and [`resolve`] are for.
+//!
+//! ## A caveat for whoever implements the dbt-side `QueryExecutor`
+//!
+//! `adapter.get_relation` reads from dbt's own relation cache, populated
+//! by dbt's schema introspection at the start of a run for schemas it
+//! expects to touch -- community reports exist of it returning "not
+//! found" for a relation that genuinely exists but falls outside a given
+//! invocation's cached scope. The `zhao_relation_exists` macro this
+//! module's `WarehouseAdapter`s expect (see `check_relation_exists`)
+//! should force a fresh lookup rather than trust that cache, or a
+//! `--check-relations` false negative could silently turn a real,
+//! existing incrementally-materialized model's schema-evolution warning
+//! from conditional back into "doesn't exist" -- worse than not checking
+//! at all.
 
 use std::collections::HashMap;
 
@@ -150,7 +164,7 @@ fn check_relation_exists(
 }
 
 /// The Snowflake [`WarehouseAdapter`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct SnowflakeAdapter;
 
 impl WarehouseAdapter for SnowflakeAdapter {
@@ -168,7 +182,7 @@ impl WarehouseAdapter for SnowflakeAdapter {
 }
 
 /// The Databricks [`WarehouseAdapter`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct DatabricksAdapter;
 
 impl WarehouseAdapter for DatabricksAdapter {
@@ -186,7 +200,7 @@ impl WarehouseAdapter for DatabricksAdapter {
 }
 
 /// The BigQuery [`WarehouseAdapter`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct BigQueryAdapter;
 
 impl WarehouseAdapter for BigQueryAdapter {
@@ -206,7 +220,7 @@ impl WarehouseAdapter for BigQueryAdapter {
 /// The DuckDB [`WarehouseAdapter`] -- zhao-dbt-test's own credential-free
 /// CI target, and likely the most common local-development target for
 /// anyone trying zhao out.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct DuckDbAdapter;
 
 impl WarehouseAdapter for DuckDbAdapter {
@@ -431,6 +445,45 @@ mod tests {
         assert_eq!(
             captured.get("relation_schema").map(String::as_str),
             Some("public")
+        );
+    }
+
+    /// The symmetric case: no spurious `relation_schema` arg when `schema`
+    /// is absent, mirroring `relation_exists_omits_database_arg_when_absent`
+    /// above for the other optional part.
+    #[test]
+    fn relation_exists_omits_schema_arg_when_absent() {
+        struct CapturingExecutor {
+            captured: std::cell::RefCell<Option<HashMap<String, String>>>,
+        }
+        impl QueryExecutor for CapturingExecutor {
+            fn run_macro(
+                &self,
+                _macro_name: &str,
+                args: &HashMap<String, String>,
+            ) -> Result<String, String> {
+                *self.captured.borrow_mut() = Some(args.clone());
+                Ok("false".to_string())
+            }
+        }
+
+        let executor = CapturingExecutor {
+            captured: std::cell::RefCell::new(None),
+        };
+        let relation = RelationIdentity {
+            database: Some("analytics".to_string()),
+            schema: None,
+            identifier: "dim_customers".to_string(),
+        };
+        SnowflakeAdapter
+            .relation_exists(&relation, &executor)
+            .expect("should succeed");
+
+        let captured = executor.captured.into_inner().expect("should have run");
+        assert!(!captured.contains_key("relation_schema"));
+        assert_eq!(
+            captured.get("relation_database").map(String::as_str),
+            Some("analytics")
         );
     }
 }
