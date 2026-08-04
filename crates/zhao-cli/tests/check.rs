@@ -832,6 +832,168 @@ fn exits_with_error_code_on_a_missing_baseline_path() {
 }
 
 // ---------------------------------------------------------------------
+// --check-relations: upgrades or drops the conditional schema-evolution
+// flag by actually checking relation existence, via a stub `dbt` on
+// `PATH` standing in for `dbt run-operation` -- exercised via `--state`
+// (no git needed), since the live check runs against the *current*
+// project regardless of how the Baseline was resolved.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+mod check_relations {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn incremental_manifest(select_sql: &str) -> String {
+        format!(
+            r#"{{
+                "metadata": {{"adapter_type": "duckdb"}},
+                "sources": {{}},
+                "nodes": {{
+                    "model.p.m": {{
+                        "unique_id": "model.p.m",
+                        "resource_type": "model",
+                        "name": "m",
+                        "database": "db",
+                        "schema": "public",
+                        "alias": "m",
+                        "compiled_code": "{select_sql}",
+                        "config": {{"materialized": "incremental"}}
+                    }}
+                }}
+            }}"#
+        )
+    }
+
+    /// A throwaway project directory: a baseline manifest file (single
+    /// column) plus a current `target/manifest.json` (baseline's column
+    /// plus one added) -- the schema-changing Change every test in this
+    /// module exercises.
+    fn project_with_a_schema_change() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let baseline_path = dir.path().join("baseline_manifest.json");
+        std::fs::write(&baseline_path, incremental_manifest("select 1 as id"))
+            .expect("should write baseline manifest");
+
+        std::fs::create_dir_all(dir.path().join("target")).expect("should create target dir");
+        std::fs::write(
+            dir.path().join("target").join("manifest.json"),
+            incremental_manifest("select 1 as id, 2 as new_col"),
+        )
+        .expect("should write current manifest");
+
+        (dir, baseline_path)
+    }
+
+    /// A stub `dbt` whose `run-operation` subcommand always echoes the
+    /// given result marker line, standing in for a real
+    /// `zhao_relation_exists` macro run against a live warehouse.
+    fn stub_dbt_run_operation(result: &str) -> tempfile::TempDir {
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let path = stub_dir.path().join("dbt");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho 'ZHAO_RELATION_EXISTS_RESULT:{result}'\n"),
+        )
+        .expect("should write stub dbt script");
+        let mut perms = std::fs::metadata(&path)
+            .expect("should stat stub script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("should chmod stub script");
+        stub_dir
+    }
+
+    /// Acceptance criterion: confirmed existing upgrades the flag to
+    /// definitive wording.
+    #[test]
+    fn upgrades_the_flag_to_definitive_when_the_relation_is_confirmed_to_exist() {
+        let (project, baseline) = project_with_a_schema_change();
+        let stub_dir = stub_dbt_run_operation("true");
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    stub_dir.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .arg("check")
+            .arg("--state")
+            .arg(&baseline)
+            .arg("--project-dir")
+            .arg(project.path())
+            .arg("--check-relations")
+            .arg("--no-color")
+            .output()
+            .expect("command should run");
+
+        let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+        assert!(stdout.contains("Schema evolution:"), "{stdout}");
+        assert!(!stdout.contains("if this"), "{stdout}");
+        assert!(
+            stdout.contains("exists in your target environment"),
+            "{stdout}"
+        );
+    }
+
+    /// Acceptance criterion: confirmed absent drops the flag entirely.
+    #[test]
+    fn drops_the_flag_when_the_relation_is_confirmed_absent() {
+        let (project, baseline) = project_with_a_schema_change();
+        let stub_dir = stub_dbt_run_operation("false");
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    stub_dir.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .arg("check")
+            .arg("--state")
+            .arg(&baseline)
+            .arg("--project-dir")
+            .arg(project.path())
+            .arg("--check-relations")
+            .arg("--no-color")
+            .output()
+            .expect("command should run");
+
+        let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+        assert!(!stdout.contains("Schema evolution:"), "{stdout}");
+    }
+
+    /// Acceptance criterion: without `--check-relations`, behavior is
+    /// unchanged -- the flag stays conditionally worded.
+    #[test]
+    fn without_the_flag_the_wording_stays_conditional() {
+        let (project, baseline) = project_with_a_schema_change();
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .arg("check")
+            .arg("--state")
+            .arg(&baseline)
+            .arg("--project-dir")
+            .arg(project.path())
+            .arg("--no-color")
+            .output()
+            .expect("command should run");
+
+        let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+        assert!(stdout.contains("Schema evolution:"), "{stdout}");
+        assert!(stdout.contains("if this"), "{stdout}");
+    }
+}
+
+// ---------------------------------------------------------------------
 // Git-native Baseline resolution (no `--state`): a throwaway git repo
 // with a real merge-base, and a stub `dbt` on `PATH` standing in for a
 // real dbt install -- these tests exercise zhao's own merge-base

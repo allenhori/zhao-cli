@@ -24,6 +24,7 @@
 //! whatever it's called, passes through unchanged") relationships to an
 //! Origin are tracked.
 
+use super::warehouse::{QueryExecutor, RELATION_EXISTS_MACRO, RelationIdentity};
 use super::{AdapterVocabulary, TransformationToolAdapter};
 use crate::model::{
     Column, ColumnLineage, ColumnName, JoinKind, LineageEdge, Materialization, Node, NodeId,
@@ -132,17 +133,7 @@ impl TransformationToolAdapter for DbtAdapter {
     type Error = DbtAdapterError;
 
     fn parse(&self, path: &Path) -> Result<ParsedProject, Self::Error> {
-        let raw = fs::read_to_string(path).map_err(|source| DbtAdapterError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        let manifest: RawManifest =
-            serde_json::from_str(&raw).map_err(|source| DbtAdapterError::InvalidManifest {
-                path: path.display().to_string(),
-                source,
-            })?;
-
-        Ok(build_parsed_project(&manifest))
+        Ok(build_parsed_project(&read_manifest(path)?))
     }
 
     fn vocabulary(&self) -> &dyn AdapterVocabulary {
@@ -205,6 +196,62 @@ impl DbtAdapter {
         }
         Ok(())
     }
+
+    /// Reads a compiled manifest's `metadata.adapter_type` -- dbt's own
+    /// name for whichever warehouse it was compiled against (e.g.
+    /// `"snowflake"`), the value
+    /// [`crate::adapters::warehouse::resolve`] matches against. `None`
+    /// when the manifest doesn't record one (an unusually old or
+    /// nonstandard manifest) -- callers should treat that the same as an
+    /// unsupported warehouse, not an error.
+    pub fn adapter_type(&self, path: &Path) -> Result<Option<String>, DbtAdapterError> {
+        Ok(read_manifest(path)?.metadata.adapter_type)
+    }
+
+    /// Reads every model's fully-qualified relation identity
+    /// (`database`/`schema`/`identifier`) from a compiled manifest,
+    /// keyed by `NodeId` string -- what
+    /// [`crate::adapters::warehouse::WarehouseAdapter::relation_exists`]
+    /// needs to check a given Node against a live target. A model
+    /// missing a usable qualified name (see `RawNode`'s doc comment) is
+    /// simply absent from the result rather than failing the whole
+    /// lookup.
+    pub fn relation_identities(
+        &self,
+        path: &Path,
+    ) -> Result<HashMap<String, RelationIdentity>, DbtAdapterError> {
+        let manifest = read_manifest(path)?;
+        Ok(manifest
+            .nodes
+            .values()
+            .filter(|node| node.resource_type == "model")
+            .filter_map(|node| {
+                let (database, schema, identifier) = node.qualified_name()?;
+                Some((
+                    node.unique_id.clone(),
+                    RelationIdentity {
+                        database: Some(database),
+                        schema: Some(schema),
+                        identifier,
+                    },
+                ))
+            })
+            .collect())
+    }
+}
+
+/// Reads and parses a manifest at `path` -- the shared first step of
+/// [`TransformationToolAdapter::parse`], [`DbtAdapter::adapter_type`],
+/// and [`DbtAdapter::relation_identities`].
+fn read_manifest(path: &Path) -> Result<RawManifest, DbtAdapterError> {
+    let raw = fs::read_to_string(path).map_err(|source| DbtAdapterError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    serde_json::from_str(&raw).map_err(|source| DbtAdapterError::InvalidManifest {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 /// Runs `dbt_command <subcommand> <extra_args...>` in `project_dir`,
@@ -238,6 +285,18 @@ struct RawManifest {
     nodes: HashMap<String, RawNode>,
     #[serde(default)]
     sources: HashMap<String, RawSource>,
+    #[serde(default)]
+    metadata: RawManifestMetadata,
+}
+
+/// The subset of a manifest's top-level `metadata` block zhao consults --
+/// `adapter_type` is dbt's own name for whichever warehouse this
+/// manifest's target compiled against (e.g. `"snowflake"`), the value
+/// [`crate::adapters::warehouse::resolve`] matches against.
+#[derive(Debug, Default, Deserialize)]
+struct RawManifestMetadata {
+    #[serde(default)]
+    adapter_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -956,6 +1015,123 @@ fn source_of(schema: &LocalSchema, column: &str) -> Option<(Upstream, String)> {
     }
 }
 
+// ---------------------------------------------------------------------
+// QueryExecutor: runs a WarehouseAdapter's relation-existence check via
+// `dbt run-operation`, using whatever connection the project's own dbt
+// profile already has -- never a connection zhao holds itself.
+// ---------------------------------------------------------------------
+
+/// The distinctive marker `DbtQueryExecutor` greps a `dbt run-operation`
+/// invocation's stdout for -- dbt's own framing text around a `log(...,
+/// info=True)` call varies by version (including between dbt v1 "classic
+/// core" and v2 "Fusion," both of which zhao is expected to work
+/// against), so this only ever looks for this one marker rather than
+/// trying to parse dbt's full log format.
+const RESULT_MARKER: &str = "ZHAO_RELATION_EXISTS_RESULT:";
+
+/// The macro body written to a temporary file before `dbt run-operation`
+/// runs, then removed -- zhao owns no macro namespace inside a user's
+/// project, so a transient file is the only way to make an arbitrary
+/// macro available to `run-operation` without requiring the user to
+/// install anything (e.g. a dbt package) first. Uses `adapter.get_relation`
+/// -- see `crate::adapters::warehouse`'s module doc comment for why this
+/// is genuinely cross-warehouse and for the relation-cache caveat this
+/// invocation path (a standalone `run-operation`, not a full `dbt run`)
+/// avoids: the relations cache isn't populated ahead of time for
+/// `run-operation`, so `get_relation` always takes its live,
+/// cache-miss-triggered query path here rather than trusting a
+/// potentially-stale cache.
+const RELATION_EXISTS_MACRO_BODY: &str = r#"{% macro zhao_relation_exists(relation_database=none, relation_schema=none, relation_identifier=none) %}
+  {% set relation = adapter.get_relation(database=relation_database, schema=relation_schema, identifier=relation_identifier) %}
+  {{ log("ZHAO_RELATION_EXISTS_RESULT:" ~ ("true" if relation is not none else "false"), info=True) }}
+{% endmacro %}
+"#;
+
+/// A [`QueryExecutor`] that runs `RELATION_EXISTS_MACRO` via `dbt
+/// run-operation`. See [`DbtAdapter::compile`] for why
+/// `dbt_command`/`extra_args` are parameters rather than hardcoded.
+pub struct DbtQueryExecutor<'a> {
+    /// The dbt project directory to run in.
+    pub project_dir: &'a Path,
+    /// The `dbt` executable to invoke.
+    pub dbt_command: &'a str,
+    /// Extra arguments (`--target`, `--vars`, ...) appended to the
+    /// `run-operation` invocation -- the same passthrough zhao's other
+    /// dbt invocations already support.
+    pub extra_args: &'a [String],
+}
+
+impl QueryExecutor for DbtQueryExecutor<'_> {
+    fn run_macro(
+        &self,
+        macro_name: &str,
+        args: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        if macro_name != RELATION_EXISTS_MACRO {
+            return Err(format!(
+                "DbtQueryExecutor only knows how to run {RELATION_EXISTS_MACRO:?}, not {macro_name:?}"
+            ));
+        }
+
+        let macros_dir = self.project_dir.join("macros");
+        fs::create_dir_all(&macros_dir)
+            .map_err(|err| format!("could not create {}: {err}", macros_dir.display()))?;
+        // Suffixed with this process's PID -- the macro file's *name*
+        // never matters to dbt (it discovers macros by their declared
+        // `{% macro %}` name, not by filename), only its content -- so a
+        // unique-per-process name is free insurance against two
+        // concurrent `--check-relations` invocations against the same
+        // project directory racing each other's write/cleanup.
+        let macro_path =
+            macros_dir.join(format!("__zhao_relation_exists_{}.sql", std::process::id()));
+        fs::write(&macro_path, RELATION_EXISTS_MACRO_BODY).map_err(|err| {
+            format!(
+                "could not write temporary macro at {}: {err}",
+                macro_path.display()
+            )
+        })?;
+
+        // Always remove the temporary macro file afterward, success or
+        // failure -- it must never be left behind in the user's project.
+        let result = self.run_operation(args);
+        let _ = fs::remove_file(&macro_path);
+        result
+    }
+}
+
+impl DbtQueryExecutor<'_> {
+    fn run_operation(&self, args: &HashMap<String, String>) -> Result<String, String> {
+        let args_json = serde_json::to_string(args)
+            .map_err(|err| format!("could not encode macro args as JSON: {err}"))?;
+
+        let output = std::process::Command::new(self.dbt_command)
+            .arg("run-operation")
+            .arg(RELATION_EXISTS_MACRO)
+            .arg("--args")
+            .arg(args_json)
+            .args(self.extra_args)
+            .current_dir(self.project_dir)
+            .output()
+            .map_err(|err| format!("could not run {:?}: {err}", self.dbt_command))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "dbt run-operation {RELATION_EXISTS_MACRO} failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .find_map(|line| line.split(RESULT_MARKER).nth(1))
+            .map(|result| result.trim().to_string())
+            .ok_or_else(|| {
+                format!("dbt run-operation {RELATION_EXISTS_MACRO} produced no parseable result:\n{stdout}")
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,6 +1394,186 @@ mod tests {
             materialization(Some("materialized_view")),
             Materialization::Other("materialized_view".to_string())
         );
+    }
+
+    fn write_manifest(dir: &Path, contents: &str) -> std::path::PathBuf {
+        let path = dir.join("manifest.json");
+        fs::write(&path, contents).expect("should write manifest");
+        path
+    }
+
+    #[test]
+    fn adapter_type_reads_the_manifests_metadata() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = write_manifest(
+            dir.path(),
+            r#"{"nodes": {}, "sources": {}, "metadata": {"adapter_type": "snowflake"}}"#,
+        );
+
+        assert_eq!(
+            DbtAdapter.adapter_type(&path).expect("should parse"),
+            Some("snowflake".to_string())
+        );
+    }
+
+    #[test]
+    fn adapter_type_is_none_when_metadata_is_absent() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = write_manifest(dir.path(), r#"{"nodes": {}, "sources": {}}"#);
+
+        assert_eq!(DbtAdapter.adapter_type(&path).expect("should parse"), None);
+    }
+
+    #[test]
+    fn relation_identities_reads_each_models_qualified_name() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = write_manifest(
+            dir.path(),
+            r#"{
+                "nodes": {
+                    "model.p.a": {
+                        "unique_id": "model.p.a",
+                        "resource_type": "model",
+                        "name": "a",
+                        "database": "analytics",
+                        "schema": "public",
+                        "alias": "a"
+                    },
+                    "model.p.b": {
+                        "unique_id": "model.p.b",
+                        "resource_type": "model",
+                        "name": "b"
+                    },
+                    "seed.p.c": {
+                        "unique_id": "seed.p.c",
+                        "resource_type": "seed",
+                        "name": "c",
+                        "database": "analytics",
+                        "schema": "public",
+                        "alias": "c"
+                    }
+                },
+                "sources": {},
+                "metadata": {}
+            }"#,
+        );
+
+        let identities = DbtAdapter.relation_identities(&path).expect("should parse");
+
+        assert_eq!(
+            identities.get("model.p.a"),
+            Some(&RelationIdentity {
+                database: Some("analytics".to_string()),
+                schema: Some("public".to_string()),
+                identifier: "a".to_string(),
+            })
+        );
+        assert!(
+            !identities.contains_key("model.p.b"),
+            "a model missing database/schema/alias should be skipped, not defaulted"
+        );
+        assert!(
+            !identities.contains_key("seed.p.c"),
+            "a non-model resource type should never appear, even with a full qualified name"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dbt_query_executor_runs_run_operation_and_parses_the_result() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(
+            stub_dir.path(),
+            r#"echo "$@" > invocation.txt
+echo 'ZHAO_RELATION_EXISTS_RESULT:true'
+"#,
+        );
+
+        let executor = DbtQueryExecutor {
+            project_dir: project_dir.path(),
+            dbt_command: dbt.to_str().expect("utf8 path"),
+            extra_args: &[],
+        };
+        let mut args = HashMap::new();
+        args.insert(
+            "relation_identifier".to_string(),
+            "dim_customers".to_string(),
+        );
+
+        let result = executor
+            .run_macro(RELATION_EXISTS_MACRO, &args)
+            .expect("should succeed");
+        assert_eq!(result, "true");
+
+        let invocation = fs::read_to_string(project_dir.path().join("invocation.txt"))
+            .expect("should read invocation.txt");
+        assert!(invocation.contains("run-operation"), "{invocation}");
+        assert!(invocation.contains(RELATION_EXISTS_MACRO), "{invocation}");
+        assert!(invocation.contains("dim_customers"), "{invocation}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dbt_query_executor_always_removes_the_temporary_macro_file() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(stub_dir.path(), "echo 'ZHAO_RELATION_EXISTS_RESULT:false'");
+
+        let executor = DbtQueryExecutor {
+            project_dir: project_dir.path(),
+            dbt_command: dbt.to_str().expect("utf8 path"),
+            extra_args: &[],
+        };
+        executor
+            .run_macro(RELATION_EXISTS_MACRO, &HashMap::new())
+            .expect("should succeed");
+
+        assert!(
+            fs::read_dir(project_dir.path().join("macros"))
+                .expect("macros dir should exist")
+                .next()
+                .is_none(),
+            "the temporary macro file must not be left behind in the project directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dbt_query_executor_removes_the_macro_file_even_when_run_operation_fails() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(stub_dir.path(), "echo 'boom' >&2\nexit 1");
+
+        let executor = DbtQueryExecutor {
+            project_dir: project_dir.path(),
+            dbt_command: dbt.to_str().expect("utf8 path"),
+            extra_args: &[],
+        };
+        let result = executor.run_macro(RELATION_EXISTS_MACRO, &HashMap::new());
+
+        assert!(result.is_err());
+        assert!(
+            fs::read_dir(project_dir.path().join("macros"))
+                .expect("macros dir should exist")
+                .next()
+                .is_none(),
+            "the temporary macro file must not be left behind even on failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dbt_query_executor_rejects_an_unknown_macro_name() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let executor = DbtQueryExecutor {
+            project_dir: project_dir.path(),
+            dbt_command: "dbt",
+            extra_args: &[],
+        };
+
+        let result = executor.run_macro("some_other_macro", &HashMap::new());
+        assert!(result.is_err());
     }
 
     #[test]

@@ -120,12 +120,13 @@ pub trait WarehouseAdapter {
 }
 
 /// The dbt macro every v1 `WarehouseAdapter` invokes -- see the module
-/// doc comment's "why a shared check" section. Not `pub`: an
-/// implementation detail of this module's three adapters, not part of
-/// the trait's own contract (a future, genuinely dialect-specific
-/// capability could use a different macro name without changing the
-/// trait itself).
-const RELATION_EXISTS_MACRO: &str = "zhao_relation_exists";
+/// doc comment's "why a shared check" section. `pub(crate)`, not `pub`:
+/// an implementation detail this crate's dbt-specific `QueryExecutor`
+/// (`crate::adapters::dbt::DbtQueryExecutor`) needs to agree on, not part
+/// of the trait's own public contract (a future, genuinely
+/// dialect-specific capability could use a different macro name without
+/// changing the trait itself).
+pub(crate) const RELATION_EXISTS_MACRO: &str = "zhao_relation_exists";
 
 /// Shared v1 implementation every [`WarehouseAdapter`] in this module
 /// delegates to -- see the module doc comment for why this is safe to
