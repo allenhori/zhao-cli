@@ -240,6 +240,7 @@ fn diff_joins(baseline: &Node, current: &Node) -> Vec<Change> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Materialization;
 
     fn node(id: &str, columns: Vec<Column>, joins: Vec<JoinKind>) -> Node {
         Node {
@@ -247,6 +248,7 @@ mod tests {
             name: id.to_string(),
             columns,
             joins,
+            materialization: Materialization::Table,
         }
     }
 

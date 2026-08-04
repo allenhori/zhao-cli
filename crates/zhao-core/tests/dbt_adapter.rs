@@ -6,7 +6,7 @@
 use std::path::Path;
 use zhao_core::adapters::TransformationToolAdapter;
 use zhao_core::adapters::dbt::DbtAdapter;
-use zhao_core::model::{JoinKind, NodeId, OriginId, Upstream};
+use zhao_core::model::{JoinKind, Materialization, NodeId, OriginId, Upstream};
 
 fn fixture_path() -> &'static Path {
     Path::new(concat!(
@@ -337,4 +337,28 @@ fn extracts_the_join_kind_from_a_models_final_select() {
 
     // No joins anywhere in stg_customers' definition.
     assert_eq!(stg_customers.joins, Vec::<JoinKind>::new());
+}
+
+#[test]
+fn resolves_each_models_materialization_from_its_config() {
+    let project = DbtAdapter
+        .parse(fixture_path())
+        .expect("fixture should parse");
+
+    let materialization_of = |name: &str| {
+        project
+            .nodes
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("{name} should exist"))
+            .materialization
+            .clone()
+    };
+
+    assert_eq!(materialization_of("stg_customers"), Materialization::View);
+    assert_eq!(materialization_of("dim_customers"), Materialization::Table);
+    assert_eq!(
+        materialization_of("fct_orders_incremental"),
+        Materialization::Incremental
+    );
 }

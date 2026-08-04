@@ -335,7 +335,7 @@ fn join_cardinality_loosened(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ColumnLineage, LineageEdge, Node};
+    use crate::model::{ColumnLineage, LineageEdge, Materialization, Node};
 
     fn node_id(s: &str) -> NodeId {
         NodeId::new(s)
@@ -362,12 +362,14 @@ mod tests {
                     name: "a".to_string(),
                     columns: vec![],
                     joins: vec![],
+                    materialization: Materialization::Table,
                 },
                 Node {
                     id: node_id("model.b"),
                     name: "b".to_string(),
                     columns: vec![],
                     joins: vec![],
+                    materialization: Materialization::Table,
                 },
             ],
             origins: vec![],
@@ -407,6 +409,7 @@ mod tests {
                 name: "a".to_string(),
                 columns: vec![],
                 joins: vec![],
+                materialization: Materialization::Table,
             }],
             origins: vec![],
             edges: vec![LineageEdge {
@@ -434,6 +437,7 @@ mod tests {
                 name: "a".to_string(),
                 columns: vec![],
                 joins: vec![],
+                materialization: Materialization::Table,
             }],
             origins: vec![],
             edges: vec![],
@@ -609,6 +613,7 @@ mod tests {
                 name: "a".to_string(),
                 columns: vec![],
                 joins: vec![],
+                materialization: Materialization::Table,
             }],
             origins: vec![],
             edges: vec![LineageEdge {

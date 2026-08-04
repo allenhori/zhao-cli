@@ -26,8 +26,8 @@
 
 use super::{AdapterVocabulary, TransformationToolAdapter};
 use crate::model::{
-    Column, ColumnLineage, ColumnName, JoinKind, LineageEdge, Node, NodeId, Origin, OriginId,
-    ParsedProject, Upstream,
+    Column, ColumnLineage, ColumnName, JoinKind, LineageEdge, Materialization, Node, NodeId,
+    Origin, OriginId, ParsedProject, Upstream,
 };
 use serde::Deserialize;
 use sqlparser::ast::{
@@ -268,6 +268,19 @@ struct RawNode {
     /// module-level doc comment). Only consulted for `data_type`.
     #[serde(default)]
     columns: HashMap<String, RawColumnDoc>,
+    #[serde(default)]
+    config: RawNodeConfig,
+}
+
+/// The subset of a model's resolved `config` block zhao consults --
+/// dbt's manifest embeds all of a model's applied config here (Presets,
+/// `dbt_project.yml` defaults, and the model's own `{{ config(...) }}`
+/// call all already merged), so this is always the actual materialization
+/// in effect, not just what the model itself declared.
+#[derive(Debug, Default, Deserialize)]
+struct RawNodeConfig {
+    #[serde(default)]
+    materialized: Option<String>,
 }
 
 /// A single documented-column entry from a model's `schema.yml`, as
@@ -470,6 +483,7 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
             name: model.name.clone(),
             columns: documented_columns,
             joins,
+            materialization: materialization(model.config.materialized.as_deref()),
         });
     }
 
@@ -499,6 +513,20 @@ fn resolve_dependency_id(unique_id: &str, manifest: &RawManifest) -> Option<Upst
         .sources
         .get(unique_id)
         .map(|source| Upstream::Origin(OriginId::new(source.unique_id.clone())))
+}
+
+/// Maps a manifest's `config.materialized` string to zhao's neutral
+/// [`Materialization`] -- `None` (the field was entirely absent) is
+/// treated the same as `"view"`, dbt's own default when a model declares
+/// no materialization at all.
+fn materialization(materialized: Option<&str>) -> Materialization {
+    match materialized.unwrap_or("view") {
+        "table" => Materialization::Table,
+        "view" => Materialization::View,
+        "incremental" => Materialization::Incremental,
+        "ephemeral" => Materialization::Ephemeral,
+        other => Materialization::Other(other.to_string()),
+    }
 }
 
 /// Orders models so that every model appears after all the other models it
@@ -1163,6 +1191,33 @@ mod tests {
             }
             other => panic!("expected DepsFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn materialization_maps_recognized_dbt_materialized_strings() {
+        assert_eq!(materialization(Some("table")), Materialization::Table);
+        assert_eq!(materialization(Some("view")), Materialization::View);
+        assert_eq!(
+            materialization(Some("incremental")),
+            Materialization::Incremental
+        );
+        assert_eq!(
+            materialization(Some("ephemeral")),
+            Materialization::Ephemeral
+        );
+    }
+
+    #[test]
+    fn materialization_defaults_to_view_when_absent() {
+        assert_eq!(materialization(None), Materialization::View);
+    }
+
+    #[test]
+    fn materialization_preserves_an_unrecognized_string_verbatim() {
+        assert_eq!(
+            materialization(Some("materialized_view")),
+            Materialization::Other("materialized_view".to_string())
+        );
     }
 
     #[test]
