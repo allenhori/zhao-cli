@@ -111,6 +111,31 @@ pub enum JoinKind {
     Cross,
 }
 
+/// How a [`Node`] is physically persisted when built -- e.g. a dbt model's
+/// `config.materialized`. Format-agnostic: any transformation tool with a
+/// similar concept maps into these same variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Materialization {
+    /// Rebuilt from scratch on every run.
+    Table,
+    /// Not persisted at all -- always computed live from its definition.
+    View,
+    /// Persisted and updated in place across runs (e.g. dbt's
+    /// `incremental`, including a microbatch strategy -- microbatch is a
+    /// strategy *of* incremental materialization, not a distinct kind).
+    /// This is the only Materialization a Node's already-existing state in
+    /// a target environment can matter for: a schema change here can't
+    /// simply be rebuilt away, since the whole point is not rebuilding
+    /// from scratch.
+    Incremental,
+    /// Never actually persisted -- inlined into whatever references it
+    /// (e.g. dbt's `ephemeral`).
+    Ephemeral,
+    /// A materialization kind zhao doesn't specifically recognize, kept
+    /// verbatim rather than discarded.
+    Other(String),
+}
+
 /// The atomic buildable thing zhao's core reasons about.
 ///
 /// A dbt `model` is translated into a Node by the dbt Transformation Tool
@@ -130,6 +155,8 @@ pub struct Node {
     /// are included -- a non-standard or unrecognized join is omitted
     /// rather than misrepresented as some other kind.
     pub joins: Vec<JoinKind>,
+    /// How this Node is physically persisted when built.
+    pub materialization: Materialization,
 }
 
 /// An external input a [`Node`] reads from but that zhao does not build.

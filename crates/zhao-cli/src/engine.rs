@@ -50,7 +50,8 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     let report = Report::new(&changes, &findings)
         .with_staleness_warning(is_stale(&args.project_dir, &args.against))
         .with_recommended_command(DbtAdapter.vocabulary())
-        .with_defer_plan(&current, DbtAdapter.vocabulary());
+        .with_defer_plan(&current, DbtAdapter.vocabulary())
+        .with_schema_evolution_warnings(&current);
 
     Ok(EngineOutput { report, current })
 }

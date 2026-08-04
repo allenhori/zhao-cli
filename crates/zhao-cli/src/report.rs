@@ -10,7 +10,7 @@
 use serde::Serialize;
 use zhao_core::adapters::AdapterVocabulary;
 use zhao_core::diff::Change;
-use zhao_core::model::{JoinKind, NodeId, ParsedProject, Upstream};
+use zhao_core::model::{JoinKind, Materialization, NodeId, ParsedProject, Upstream};
 use zhao_core::rules::{Finding, FindingDetail, Severity};
 
 /// The message included in a [`Report`] when the Baseline's merge-base has
@@ -44,6 +44,17 @@ pub struct Report {
     /// instead. `None` under the same conditions as `recommended_command`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defer_plan: Option<DeferPlanJson>,
+    /// One entry per schema-changing Change (column added/removed/type
+    /// changed -- never a join change, which isn't a schema change) on a
+    /// Node materialized `incremental`. Phrased as a conditional
+    /// possibility, never a fact: zhao has no live connection and cannot
+    /// know whether the Node actually exists yet in any given target
+    /// environment. Empty (not `None`) when there's nothing to flag, so
+    /// JSON consumers don't need to distinguish "not computed" from
+    /// "computed, found nothing" the way `recommended_command`/`defer_plan`
+    /// do -- this is always computed once a `ParsedProject` is available.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub schema_evolution_warnings: Vec<SchemaEvolutionWarningJson>,
 }
 
 impl Report {
@@ -59,6 +70,7 @@ impl Report {
             staleness_warning: None,
             recommended_command: None,
             defer_plan: None,
+            schema_evolution_warnings: Vec::new(),
         }
     }
 
@@ -145,6 +157,35 @@ impl Report {
         self
     }
 
+    /// Sets this report's schema-evolution warnings: one per
+    /// schema-changing Change (column added/removed/type changed) whose
+    /// Node is materialized `incremental` in `current` -- a Node that no
+    /// longer exists in `current` at all (e.g. removed entirely) can't be
+    /// looked up for its materialization, so it's silently excluded
+    /// rather than guessed at. A non-schema Change (a join change) or a
+    /// Change on any other materialization never produces a warning here.
+    pub fn with_schema_evolution_warnings(mut self, current: &ParsedProject) -> Self {
+        self.schema_evolution_warnings = self
+            .changes
+            .iter()
+            .filter(|change| change.is_column_change())
+            .filter_map(|change| {
+                let node = current.node(&NodeId::new(change.node()))?;
+                (node.materialization == Materialization::Incremental).then(|| {
+                    SchemaEvolutionWarningJson {
+                        node: change.node().to_string(),
+                        message: format!(
+                            "if this incrementally-materialized model already exists in your \
+                             target environment, {} requires manual schema evolution",
+                            change.describe()
+                        ),
+                    }
+                })
+            })
+            .collect();
+        self
+    }
+
     /// Whether this run's Findings should fail the CI gate: any Finding
     /// at [`Severity::Error`]. A staleness warning never contributes here,
     /// under any Preset.
@@ -219,6 +260,19 @@ impl DeferPlanJson {
                 .collect(),
         }
     }
+}
+
+/// A single conditional schema-evolution notice -- see
+/// [`Report::with_schema_evolution_warnings`].
+#[derive(Debug, Serialize)]
+pub struct SchemaEvolutionWarningJson {
+    /// The incrementally-materialized Node the schema-changing Change
+    /// belongs to.
+    pub node: String,
+    /// The conditional warning text -- always phrased as a possibility
+    /// ("if this model already exists..."), never asserts the model
+    /// exists as fact.
+    pub message: String,
 }
 
 /// A [`Change`], reshaped for JSON output.
@@ -629,6 +683,16 @@ pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary, use_colo
                 plan.defer.join(", ")
             }
         ));
+    }
+
+    if !report.schema_evolution_warnings.is_empty() {
+        out.push_str("\nSchema evolution:\n");
+        for warning in &report.schema_evolution_warnings {
+            out.push_str(&format!(
+                "  {node_term} {}: {}\n",
+                warning.node, warning.message
+            ));
+        }
     }
 
     out
@@ -1078,6 +1142,27 @@ mod tests {
         }
     }
 
+    fn node_with_materialization(
+        id: &str,
+        materialization: Materialization,
+    ) -> zhao_core::model::Node {
+        zhao_core::model::Node {
+            id: NodeId::new(id),
+            name: id.to_string(),
+            columns: Vec::new(),
+            joins: Vec::new(),
+            materialization,
+        }
+    }
+
+    fn project_with_nodes(nodes: Vec<zhao_core::model::Node>) -> ParsedProject {
+        ParsedProject {
+            nodes,
+            origins: Vec::new(),
+            edges: Vec::new(),
+        }
+    }
+
     /// Acceptance criterion 1: given a Change reaching a subset of Nodes,
     /// the plan correctly separates build (the impacted set) from defer
     /// (their upstream dependencies) -- including a Node reached only
@@ -1216,5 +1301,141 @@ mod tests {
         let text = render_text(&report, &DbtVocabulary, false);
 
         assert!(!text.contains("Defer plan:"), "{text}");
+    }
+
+    /// Acceptance criterion 1: a schema-changing Change on an incremental
+    /// Node produces the flag.
+    #[test]
+    fn schema_evolution_warning_fires_for_a_schema_change_on_an_incremental_node() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Incremental,
+        )]);
+        let changes = vec![Change::ColumnAdded {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("new_col"),
+        }];
+        let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+
+        assert_eq!(report.schema_evolution_warnings.len(), 1);
+        assert_eq!(report.schema_evolution_warnings[0].node, "model.a");
+    }
+
+    /// Acceptance criterion 2: the identical kind of Change on a
+    /// table-materialized Node never produces the flag.
+    #[test]
+    fn schema_evolution_warning_never_fires_for_a_table_node() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Table,
+        )]);
+        let changes = vec![Change::ColumnAdded {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("new_col"),
+        }];
+        let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+
+        assert!(report.schema_evolution_warnings.is_empty());
+    }
+
+    /// A non-schema Change (a join change) on an incremental Node never
+    /// produces the flag either -- it's not a schema change at all.
+    #[test]
+    fn schema_evolution_warning_never_fires_for_a_join_change() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Incremental,
+        )]);
+        let changes = vec![Change::JoinChanged {
+            node: NodeId::new("model.a"),
+            position: 0,
+            from_kind: Some(CoreJoinKind::Inner),
+            to_kind: Some(CoreJoinKind::Left),
+        }];
+        let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+
+        assert!(report.schema_evolution_warnings.is_empty());
+    }
+
+    /// Acceptance criterion 3: the message is phrased as a conditional
+    /// possibility, never asserts the model exists as fact.
+    #[test]
+    fn schema_evolution_warning_message_is_phrased_conditionally() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Incremental,
+        )]);
+        let changes = vec![Change::ColumnRemoved {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("old_col"),
+        }];
+        let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+
+        let message = &report.schema_evolution_warnings[0].message;
+        assert!(
+            message.starts_with("if "),
+            "message should be phrased as a conditional, not asserted as fact: {message}"
+        );
+    }
+
+    /// Acceptance criterion 4: no DDL of any kind appears anywhere in the
+    /// output.
+    #[test]
+    fn schema_evolution_warning_never_contains_ddl() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Incremental,
+        )]);
+        let changes = vec![Change::ColumnAdded {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("new_col"),
+        }];
+        let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+        for ddl_keyword in ["ALTER TABLE", "ADD COLUMN", "DROP COLUMN", "CREATE TABLE"] {
+            assert!(
+                !text.to_uppercase().contains(ddl_keyword),
+                "found DDL-shaped text {ddl_keyword:?} in: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_text_appends_the_schema_evolution_section_when_present() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Incremental,
+        )]);
+        let changes = vec![Change::ColumnAdded {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("new_col"),
+        }];
+        let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(text.contains("Schema evolution:"), "{text}");
+        assert!(text.contains("model model.a:"), "{text}");
+    }
+
+    #[test]
+    fn render_text_omits_the_schema_evolution_section_when_absent() {
+        // A real Change on a real (table-materialized) Node, so this
+        // exercises the full render path rather than the early-return
+        // "No changes detected." case -- the section must still be absent.
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Table,
+        )]);
+        let changes = vec![Change::ColumnAdded {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("new_col"),
+        }];
+        let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(!text.contains("Schema evolution:"), "{text}");
     }
 }
