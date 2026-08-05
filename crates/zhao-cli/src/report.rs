@@ -343,10 +343,16 @@ impl DeferPlanJson {
             .map(|id| vocabulary.node_display_name(id))
             .collect();
 
+        // `state` is an arbitrary filesystem path (not one of dbt's own
+        // node-name tokens, which can't contain shell-special characters),
+        // so it's quoted -- a path containing spaces is common enough
+        // that an unquoted command here would be silently wrong if a user
+        // copy-pastes it into a shell.
         let command = settings.state.as_deref().map(|state| {
             format!(
-                "dbt build --select {} --defer --state {state}",
-                build_names.join(" ")
+                "dbt build --select {} --defer --state {}",
+                build_names.join(" "),
+                shell_words::quote(state)
             )
         });
 
@@ -1500,6 +1506,72 @@ mod tests {
         let plan = report.defer_plan.expect("plan should be present");
         assert_eq!(plan.target.as_deref(), Some("prod"));
         assert!(plan.command.is_none());
+    }
+
+    /// The symmetric case: `state` configured with no `target` still
+    /// produces a full command (dbt's `--defer` only needs the state
+    /// path to function), just with no human-readable label alongside
+    /// it.
+    #[test]
+    fn defer_settings_with_only_a_state_produce_a_command_but_no_target() {
+        let current = project_with_edges(Vec::new());
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::ColumnTypeNarrowed {
+                node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                column: zhao_core::model::ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        }];
+        let settings = DeferSettings {
+            target: None,
+            state: Some("artifacts/prod/manifest.json".to_string()),
+        };
+        let report =
+            Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary, &settings);
+
+        let plan = report.defer_plan.as_ref().expect("plan should be present");
+        assert!(plan.target.is_none());
+        assert_eq!(
+            plan.command.as_deref(),
+            Some("dbt build --select dim_customers --defer --state artifacts/prod/manifest.json")
+        );
+
+        let text = render_text(&report, &DbtVocabulary, false);
+        assert!(!text.contains("Target:"), "{text}");
+        assert!(text.contains("Command:"), "{text}");
+    }
+
+    /// A state path containing a space is quoted in the generated
+    /// command -- an unquoted path would silently misbehave if a user
+    /// copy-pastes the command into a shell.
+    #[test]
+    fn a_state_path_containing_a_space_is_quoted_in_the_generated_command() {
+        let current = project_with_edges(Vec::new());
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::ColumnTypeNarrowed {
+                node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                column: zhao_core::model::ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        }];
+        let settings = DeferSettings {
+            target: None,
+            state: Some("artifacts/My Manifests/prod/manifest.json".to_string()),
+        };
+        let report =
+            Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary, &settings);
+
+        let plan = report.defer_plan.expect("plan should be present");
+        assert_eq!(
+            plan.command.as_deref(),
+            Some(
+                "dbt build --select dim_customers --defer --state 'artifacts/My Manifests/prod/manifest.json'"
+            )
+        );
     }
 
     /// Default (unconfigured) `DeferSettings` produce neither a target

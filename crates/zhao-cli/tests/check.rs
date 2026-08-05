@@ -557,6 +557,58 @@ fn no_defer_flags_produce_no_target_or_command() {
         );
 }
 
+/// `zhao.yml`'s own `defer:` section (with no CLI flag given) surfaces
+/// its configured target/state, proving the config path itself -- not
+/// just the CLI-flag path -- reaches the generated command.
+#[test]
+fn zhao_yml_defer_config_surfaces_without_any_cli_flag() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("defer_config_project"))
+        .arg("--no-color")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("Target: staging").and(predicate::str::contains(
+                "Command: dbt build --select stg_customers dim_customers --defer --state artifacts/staging/manifest.json",
+            )),
+        );
+}
+
+/// A `--defer-target`/`--defer-state` CLI flag overrides a *conflicting*
+/// `zhao.yml` `defer:` value -- not just producing a command when
+/// `zhao.yml` has none at all (`defer_target_and_state_flags_produce_a_ready_to_run_command`
+/// already covers that weaker case).
+#[test]
+fn defer_flags_override_a_conflicting_zhao_yml_defer_config() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("defer_config_project"))
+        .arg("--defer-target")
+        .arg("prod")
+        .arg("--defer-state")
+        .arg("artifacts/prod/manifest.json")
+        .arg("--no-color")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("Target: prod")
+                .and(predicate::str::contains(
+                    "Command: dbt build --select stg_customers dim_customers --defer --state artifacts/prod/manifest.json",
+                ))
+                .and(predicate::str::contains("staging").not())
+                .and(predicate::str::contains("artifacts/staging").not()),
+        );
+}
+
 /// A run with zero impacted Nodes produces no defer plan (nothing to
 /// build, so no plan makes sense) -- mirrors
 /// `no_recommended_command_when_nothing_is_impactful`.
