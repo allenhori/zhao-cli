@@ -34,9 +34,9 @@ pub enum Command {
 #[derive(Debug, clap::Args)]
 pub struct LineageArgs {
     /// The lineage target, in dbt's own selector syntax: a bare model
-    /// name shows both upstream and downstream; `+model` shows only
-    /// upstream (ancestors); `model+` shows only downstream
-    /// (descendants).
+    /// name (or `model.column` for column-level lineage) shows both
+    /// upstream and downstream; a `+` prefix shows only upstream
+    /// (ancestors); a `+` suffix shows only downstream (descendants).
     pub target: String,
 
     /// The dbt project directory to query. Its current compiled manifest
@@ -47,10 +47,11 @@ pub struct LineageArgs {
 }
 
 impl LineageArgs {
-    /// Splits `target` into the bare model name and the requested
+    /// Splits `target` into the bare model name, an optional column name
+    /// (present for a `model.column` target), and the requested
     /// [`zhao_core::lineage::Direction`], per dbt's own `+`-prefix/suffix
     /// selector convention.
-    pub fn parse_target(&self) -> (&str, zhao_core::lineage::Direction) {
+    pub fn parse_target(&self) -> (&str, Option<&str>, zhao_core::lineage::Direction) {
         let has_prefix = self.target.starts_with('+');
         let after_prefix = self.target.strip_prefix('+').unwrap_or(&self.target);
         let has_suffix = after_prefix.ends_with('+');
@@ -65,7 +66,14 @@ impl LineageArgs {
             (true, false) => zhao_core::lineage::Direction::Upstream,
             (false, true) => zhao_core::lineage::Direction::Downstream,
         };
-        (name, direction)
+
+        // dbt model names never contain `.`, so the first `.` (if any)
+        // unambiguously separates the model from a column-level target.
+        let (model, column) = match name.split_once('.') {
+            Some((model, column)) => (model, Some(column)),
+            None => (name, None),
+        };
+        (model, column, direction)
     }
 }
 
@@ -183,24 +191,27 @@ mod tests {
     #[test]
     fn bare_target_parses_as_both_directions() {
         let a = args("dim_customers");
-        let (name, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target();
         assert_eq!(name, "dim_customers");
+        assert_eq!(column, None);
         assert_eq!(direction, Direction::Both);
     }
 
     #[test]
     fn a_plus_prefix_parses_as_upstream_only() {
         let a = args("+dim_customers");
-        let (name, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target();
         assert_eq!(name, "dim_customers");
+        assert_eq!(column, None);
         assert_eq!(direction, Direction::Upstream);
     }
 
     #[test]
     fn a_plus_suffix_parses_as_downstream_only() {
         let a = args("dim_customers+");
-        let (name, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target();
         assert_eq!(name, "dim_customers");
+        assert_eq!(column, None);
         assert_eq!(direction, Direction::Downstream);
     }
 
@@ -210,8 +221,27 @@ mod tests {
     #[test]
     fn a_plus_prefix_and_suffix_together_parses_as_both_directions() {
         let a = args("+dim_customers+");
-        let (name, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target();
         assert_eq!(name, "dim_customers");
+        assert_eq!(column, None);
+        assert_eq!(direction, Direction::Both);
+    }
+
+    #[test]
+    fn a_dotted_target_splits_into_model_and_column() {
+        let a = args("dim_customers.customer_id");
+        let (name, column, direction) = a.parse_target();
+        assert_eq!(name, "dim_customers");
+        assert_eq!(column, Some("customer_id"));
+        assert_eq!(direction, Direction::Both);
+    }
+
+    #[test]
+    fn a_dotted_target_still_honors_plus_prefix_and_suffix() {
+        let a = args("+dim_customers.customer_id+");
+        let (name, column, direction) = a.parse_target();
+        assert_eq!(name, "dim_customers");
+        assert_eq!(column, Some("customer_id"));
         assert_eq!(direction, Direction::Both);
     }
 }
