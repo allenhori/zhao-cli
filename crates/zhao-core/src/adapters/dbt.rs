@@ -1038,7 +1038,13 @@ fn collect_expr_sources_into(
                 found,
             );
         }
-        Expr::Function(f) => {
+        // A window function (`OVER (...)`) is deliberately not attempted
+        // (see the module-level "Known limitations" doc comment): its
+        // `PARTITION BY`/`ORDER BY` columns aren't walked at all, so
+        // tracing only the call's own arguments would silently report a
+        // partial, misleadingly-confident source set. Skip the whole
+        // expression instead.
+        Expr::Function(f) if f.over.is_none() => {
             if let FunctionArguments::List(list) = &f.args {
                 for arg in &list.args {
                     if let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))
@@ -1456,6 +1462,104 @@ mod tests {
                 );
             }
             other => panic!("expected Known([result sourced from a, b, c]), got {other:?}"),
+        }
+    }
+
+    /// A window function is not attempted at all -- its `PARTITION
+    /// BY`/`ORDER BY` clause isn't walked, so tracing only its own
+    /// argument would silently report a partial, misleadingly-confident
+    /// source set (see the module-level "Known limitations" doc
+    /// comment).
+    #[test]
+    fn a_window_function_stays_entirely_unresolved() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"select sum(x.a) over (partition by x.b) as running_total from "db"."s"."t" as x"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert!(
+                    cols[0].sources.is_empty(),
+                    "a window function should stay fully unresolved, not partially traced: {:?}",
+                    cols[0].sources
+                );
+            }
+            other => panic!("expected Known([running_total, unresolved]), got {other:?}"),
+        }
+    }
+
+    /// A column referenced more than once in the same expression (e.g.
+    /// `coalesce(x.a, x.a)`) is only reported once -- `collect_expr_sources`
+    /// dedupes rather than double-counting.
+    #[test]
+    fn a_repeated_column_reference_is_deduplicated() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(r#"select x.a + x.a as doubled from "db"."s"."t" as x"#)
+            .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "a".to_string())]
+                );
+            }
+            other => panic!("expected Known([doubled sourced from a once]), got {other:?}"),
+        }
+    }
+
+    /// An unqualified column ambiguous among several relations in scope
+    /// contributes nothing to a larger expression, rather than a wrong
+    /// guess at which relation it meant.
+    #[test]
+    fn an_ambiguous_sub_reference_inside_a_larger_expression_contributes_nothing() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s1".to_string(), "t".to_string()),
+            origin("origin.s1.t"),
+        );
+        known_relations.insert(
+            ("db".to_string(), "s2".to_string(), "u".to_string()),
+            origin("origin.s2.u"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        // "shared" is ambiguous between t and u (neither is `Known`, so
+        // both are `Passthrough` candidates); "x.a" is unambiguous.
+        let query = parse_query(
+            r#"select x.a + shared as result from "db"."s1"."t" as x, "db"."s2"."u" as y"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s1.t"), "a".to_string())],
+                    "the ambiguous half of the expression should contribute nothing, not a guess"
+                );
+            }
+            other => panic!("expected Known([result sourced from a only]), got {other:?}"),
         }
     }
 

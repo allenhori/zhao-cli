@@ -805,7 +805,12 @@ const JS: &str = r#"
     }
   }
 
-  function renderSummarySide(label, side) {
+  // Builds a summary section's DOM directly (rather than an HTML string)
+  // and appends it to `container` -- model/column names come from the
+  // parsed project (manifest/SQL), not from a trusted template, so they
+  // go through `textContent`/element creation, never string-interpolated
+  // into `innerHTML`.
+  function renderSummarySide(container, label, side) {
     const nameOf = (id) => (byId.get(id) ? byId.get(id).name : id);
     const resolved = side.resolved.slice().sort((a, b) => {
       const cmp = (nameOf(a.id) + "." + a.column).localeCompare(nameOf(b.id) + "." + b.column);
@@ -815,13 +820,38 @@ const JS: &str = r#"
       const cmp = nameOf(a).localeCompare(nameOf(b));
       return summaryDescending ? -cmp : cmp;
     });
-    const parts = [];
-    const arrow = summaryDescending ? "Z–A" : "A–Z";
-    parts.push(`<div class="summary-head"><strong>${label}</strong><button class="mini-btn summary-sort" type="button" title="Toggle sort order">${arrow}</button></div>`);
-    if (!resolved.length && !unresolved.length) parts.push("(none)");
-    for (const r of resolved) parts.push(`<span class="col-entry">${nameOf(r.id)}.${r.column}</span>`);
-    for (const u of unresolved) parts.push(`<span class="unresolved">${nameOf(u)} (unresolved)</span>`);
-    return parts.join("<br>");
+
+    const head = document.createElement("div");
+    head.className = "summary-head";
+    const strong = document.createElement("strong");
+    strong.textContent = label;
+    head.appendChild(strong);
+    const sortBtn = document.createElement("button");
+    sortBtn.className = "mini-btn summary-sort";
+    sortBtn.type = "button";
+    sortBtn.title = "Toggle sort order";
+    sortBtn.textContent = summaryDescending ? "Z–A" : "A–Z";
+    head.appendChild(sortBtn);
+    container.appendChild(head);
+
+    if (!resolved.length && !unresolved.length) {
+      container.appendChild(document.createTextNode("(none)"));
+      return;
+    }
+    for (const r of resolved) {
+      const span = document.createElement("span");
+      span.className = "col-entry";
+      span.textContent = `${nameOf(r.id)}.${r.column}`;
+      container.appendChild(span);
+      container.appendChild(document.createElement("br"));
+    }
+    for (const u of unresolved) {
+      const span = document.createElement("span");
+      span.className = "unresolved";
+      span.textContent = `${nameOf(u)} (unresolved)`;
+      container.appendChild(span);
+      container.appendChild(document.createElement("br"));
+    }
   }
 
   function renderPanel(id, columnResult) {
@@ -834,9 +864,12 @@ const JS: &str = r#"
     renderPanelColumns(n, columnResult);
 
     const summary = document.getElementById("panel-summary");
-    if (!columnResult) { summary.innerHTML = ""; return; }
+    summary.innerHTML = "";
+    if (!columnResult) return;
     const { up, down } = columnResult;
-    summary.innerHTML = renderSummarySide("Upstream", up) + "<br>" + renderSummarySide("Downstream", down);
+    renderSummarySide(summary, "Upstream", up);
+    summary.appendChild(document.createElement("br"));
+    renderSummarySide(summary, "Downstream", down);
   }
 
   document.getElementById("search").addEventListener("input", applyHighlight);
