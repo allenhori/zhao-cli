@@ -105,6 +105,141 @@ fn unknown_target_produces_a_clear_error() {
         .stderr(predicate::str::contains("error:").and(predicate::str::contains("does_not_exist")));
 }
 
+/// Acceptance criterion: a target ambiguous by bare name alone (two
+/// same-named models across different dbt packages) is reported clearly,
+/// and the error names every candidate's package -- exactly what
+/// `--package` expects.
+#[test]
+fn an_ambiguous_target_without_a_package_produces_a_clear_error() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("customers")
+        .arg("--project-dir")
+        .arg(fixture("ambiguous_package_project"))
+        .assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("error:")
+                .and(predicate::str::contains("more than one model"))
+                .and(predicate::str::contains("model.pkg_a.customers"))
+                .and(predicate::str::contains("model.pkg_b.customers")),
+        );
+}
+
+/// Acceptance criterion: `--package` disambiguates an otherwise-ambiguous
+/// target and resolves successfully.
+#[test]
+fn a_package_flag_disambiguates_an_ambiguous_target() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("customers")
+        .arg("--package")
+        .arg("pkg_b")
+        .arg("--project-dir")
+        .arg(fixture("ambiguous_package_project"))
+        .assert()
+        .code(0)
+        .stdout(
+            predicate::str::contains("Upstream:\n  (none)")
+                .and(predicate::str::contains("Downstream:\n  (none)")),
+        );
+}
+
+/// A `--package` that matches no candidate for the given name is reported
+/// the same as an unknown target, not silently ignored.
+#[test]
+fn a_package_flag_matching_no_candidate_produces_a_clear_error() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("customers")
+        .arg("--package")
+        .arg("does_not_exist")
+        .arg("--project-dir")
+        .arg(fixture("ambiguous_package_project"))
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("error:").and(predicate::str::contains("no model named")));
+}
+
+/// `--package` on an already-unambiguous target has no effect -- it's
+/// purely a disambiguator, never a requirement.
+#[test]
+fn a_package_flag_on_an_unambiguous_target_still_resolves() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("stg_customers")
+        .arg("--package")
+        .arg("zhao_dbt_test")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(0);
+}
+
+/// `--package` disambiguates a `model.column` target too, not just a
+/// bare model target -- both `run_text` and `run_html` thread it into
+/// `trace_column`, not just `trace`.
+#[test]
+fn a_package_flag_disambiguates_a_column_level_target() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("customers.id")
+        .arg("--package")
+        .arg("pkg_b")
+        .arg("--project-dir")
+        .arg(fixture("ambiguous_package_project"))
+        .assert()
+        .code(0);
+}
+
+/// `--package` disambiguates `--html`'s initial target too, scoping the
+/// export to the correct package's model -- not just text output.
+#[test]
+fn a_package_flag_disambiguates_the_html_export_initial_target() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let out = dir.path().join("out.html");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--html")
+        .arg(&out)
+        .arg("customers")
+        .arg("--package")
+        .arg("pkg_a")
+        .arg("--project-dir")
+        .arg(fixture("ambiguous_package_project"))
+        .assert()
+        .code(0);
+
+    let html = std::fs::read_to_string(&out).expect("should read generated file");
+    assert!(html.contains("\"initial_target\":\"model.pkg_a.customers\""));
+}
+
+/// An empty `--package ""` never matches a real package segment (dbt
+/// never produces one), so it behaves the same as a package that
+/// doesn't apply at all -- `UnknownTarget`, not a silent fallback to
+/// unfiltered (still-ambiguous) matching.
+#[test]
+fn an_empty_package_flag_produces_unknown_target_not_a_silent_fallback() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("customers")
+        .arg("--package")
+        .arg("")
+        .arg("--project-dir")
+        .arg(fixture("ambiguous_package_project"))
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("error:").and(predicate::str::contains("no model named")));
+}
+
 /// Acceptance criterion: a model with no upstream/downstream connections
 /// produces a clear "nothing found" result, not an error -- exercised
 /// against a throwaway single-model project built for this test (no

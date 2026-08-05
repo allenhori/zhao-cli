@@ -57,24 +57,27 @@ fn run_html(
     // unknown/ambiguous/unknown-column target fails the same way it
     // would for text output, rather than silently producing an export
     // with nothing pre-selected.
+    let package = args.package.as_deref();
     let (initial_target, initial_column) = match parsed_target {
         None => (None, None),
         Some((target_name, Some(column_name), direction)) => {
-            match trace_column(project, target_name, column_name, direction) {
-                Ok(_) => match zhao_core::lineage::resolve_target(project, target_name) {
+            match trace_column(project, target_name, package, column_name, direction) {
+                Ok(_) => match zhao_core::lineage::resolve_target(project, target_name, package) {
                     Ok(id) => (Some(id), Some(column_name.to_string())),
                     Err(err) => return fail(&err.to_string()),
                 },
                 Err(err) => return fail(&err.to_string()),
             }
         }
-        Some((target_name, None, direction)) => match trace(project, target_name, direction) {
-            Ok(_) => match zhao_core::lineage::resolve_target(project, target_name) {
-                Ok(id) => (Some(id), None),
+        Some((target_name, None, direction)) => {
+            match trace(project, target_name, package, direction) {
+                Ok(_) => match zhao_core::lineage::resolve_target(project, target_name, package) {
+                    Ok(id) => (Some(id), None),
+                    Err(err) => return fail(&err.to_string()),
+                },
                 Err(err) => return fail(&err.to_string()),
-            },
-            Err(err) => return fail(&err.to_string()),
-        },
+            }
+        }
     };
 
     let html = crate::lineage_html::generate(
@@ -106,16 +109,18 @@ fn run_text(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> Ex
         );
     };
 
+    let package = args.package.as_deref();
+
     // `LineageError`'s own `Display` (via thiserror) already gives a
     // clear, actionable message for every variant -- `UnknownTarget`,
     // `AmbiguousTarget`, `UnknownColumn` alike -- so there's no need to
     // re-derive it per variant here.
     let text = match target_column {
-        Some(column) => match trace_column(project, target_name, column, direction) {
+        Some(column) => match trace_column(project, target_name, package, column, direction) {
             Ok(result) => render_column_text(&result, direction, DbtAdapter.vocabulary()),
             Err(err) => return fail(&err.to_string()),
         },
-        None => match trace(project, target_name, direction) {
+        None => match trace(project, target_name, package, direction) {
             Ok(result) => render_text(&result, target_name, direction, DbtAdapter.vocabulary()),
             Err(err) => return fail(&err.to_string()),
         },

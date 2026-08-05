@@ -35,7 +35,9 @@ pub enum LineageError {
     /// picking whichever one happened to appear first in the project's
     /// Node list (an arbitrary, undocumented tiebreak a user could never
     /// predict), this is treated the same as an unresolvable target:
-    /// the caller must disambiguate, e.g. by package-qualifying the name.
+    /// the caller must disambiguate by package -- each candidate in
+    /// `ids` is a full `<resource_type>.<package>.<name>` ID, so the
+    /// package to pass is right there in the message.
     #[error(
         "{name:?} matches more than one model in the project ({ids:?}) -- disambiguate by \
          package"
@@ -58,17 +60,41 @@ pub enum LineageError {
     },
 }
 
+/// The package segment of a dbt-shaped Node ID
+/// (`<resource_type>.<package>.<name>`), if it parses as that shape --
+/// `None` for anything else (an adapter that doesn't use dot-separated,
+/// package-qualified IDs at all).
+fn node_package(id: &NodeId) -> Option<&str> {
+    id.as_str().split('.').nth(1)
+}
+
 /// Resolves `target_name` to exactly one Node in `project`, or a
 /// [`LineageError`] -- shared by [`trace`] and [`trace_column`], which
 /// both start by resolving a bare model name the same way.
+///
+/// `package`, when given, narrows the match to Nodes whose ID's package
+/// segment equals it (see [`node_package`]) *before* checking for
+/// ambiguity -- the mechanism [`LineageError::AmbiguousTarget`]'s own
+/// message points a caller at when a bare name matches more than one
+/// Node (e.g. two same-named models in different dbt packages). A
+/// `package` that matches nothing still narrows to zero candidates
+/// (reported as [`LineageError::UnknownTarget`], same as a name that
+/// never existed at all) rather than silently falling back to
+/// unfiltered matching -- a package that doesn't apply is exactly as
+/// wrong as a name that doesn't exist.
 fn resolve_target_node<'a>(
     project: &'a ParsedProject,
     target_name: &str,
+    package: Option<&str>,
 ) -> Result<&'a Node, LineageError> {
     let matches: Vec<&Node> = project
         .nodes
         .iter()
         .filter(|node| node.name == target_name)
+        .filter(|node| match package {
+            Some(pkg) => node_package(&node.id) == Some(pkg),
+            None => true,
+        })
         .collect();
     match matches.as_slice() {
         [] => Err(LineageError::UnknownTarget {
@@ -85,9 +111,14 @@ fn resolve_target_node<'a>(
 /// Public wrapper around `resolve_target_node` for callers that just
 /// need the resolved `NodeId` itself (e.g. `zhao lineage --html`'s
 /// initial-target validation), without needing their own copy of the
-/// bare-name-to-Node resolution/ambiguity-checking logic.
-pub fn resolve_target(project: &ParsedProject, target_name: &str) -> Result<NodeId, LineageError> {
-    resolve_target_node(project, target_name).map(|node| node.id.clone())
+/// bare-name-to-Node resolution/ambiguity-checking logic. `package` is
+/// the same optional disambiguator `trace`/`trace_column` accept.
+pub fn resolve_target(
+    project: &ParsedProject,
+    target_name: &str,
+    package: Option<&str>,
+) -> Result<NodeId, LineageError> {
+    resolve_target_node(project, target_name, package).map(|node| node.id.clone())
 }
 
 /// The full transitive closure of upstream/downstream Nodes (and
@@ -110,14 +141,16 @@ pub struct LineageResult {
 }
 
 /// Resolves a lineage query: finds the Node named `target_name` in
-/// `project`, then walks `direction`'s side(s) of its Lineage Edges to
-/// their full transitive closure.
+/// `project` (narrowed to `package` when given -- see
+/// `resolve_target_node`), then walks `direction`'s side(s) of its
+/// Lineage Edges to their full transitive closure.
 pub fn trace(
     project: &ParsedProject,
     target_name: &str,
+    package: Option<&str>,
     direction: Direction,
 ) -> Result<LineageResult, LineageError> {
-    let target = resolve_target_node(project, target_name)?;
+    let target = resolve_target_node(project, target_name, package)?;
 
     let mut result = LineageResult::default();
     if matches!(direction, Direction::Upstream | Direction::Both) {
@@ -253,16 +286,18 @@ pub struct ColumnLineageResult {
 }
 
 /// Resolves a column-level lineage query: finds the Node named
-/// `target_node_name`, confirms `target_column_name` is really one of
-/// its resolved output columns, then walks `direction`'s side(s) of its
-/// column-level Lineage Edges to their full transitive closure.
+/// `target_node_name` (narrowed to `package` when given -- see
+/// `resolve_target_node`), confirms `target_column_name` is really
+/// one of its resolved output columns, then walks `direction`'s side(s)
+/// of its column-level Lineage Edges to their full transitive closure.
 pub fn trace_column(
     project: &ParsedProject,
     target_node_name: &str,
+    package: Option<&str>,
     target_column_name: &str,
     direction: Direction,
 ) -> Result<ColumnLineageResult, LineageError> {
-    let target = resolve_target_node(project, target_node_name)?;
+    let target = resolve_target_node(project, target_node_name, package)?;
     let column = ColumnName::new(target_column_name);
     if !target.columns.iter().any(|c| c.name == column) {
         return Err(LineageError::UnknownColumn {
@@ -472,7 +507,7 @@ mod tests {
     #[test]
     fn bare_target_returns_both_directions() {
         let project = diamond_project();
-        let result = trace(&project, "b", Direction::Both).expect("b should exist");
+        let result = trace(&project, "b", None, Direction::Both).expect("b should exist");
 
         assert_eq!(result.upstream_nodes, vec![NodeId::new("model.p.a")]);
         assert_eq!(result.upstream_origins, vec![OriginId::new("source.p.raw")]);
@@ -482,7 +517,7 @@ mod tests {
     #[test]
     fn upstream_direction_excludes_downstream() {
         let project = diamond_project();
-        let result = trace(&project, "b", Direction::Upstream).expect("b should exist");
+        let result = trace(&project, "b", None, Direction::Upstream).expect("b should exist");
 
         assert_eq!(result.upstream_nodes, vec![NodeId::new("model.p.a")]);
         assert!(result.downstream_nodes.is_empty());
@@ -491,7 +526,7 @@ mod tests {
     #[test]
     fn downstream_direction_excludes_upstream() {
         let project = diamond_project();
-        let result = trace(&project, "b", Direction::Downstream).expect("b should exist");
+        let result = trace(&project, "b", None, Direction::Downstream).expect("b should exist");
 
         assert!(result.upstream_nodes.is_empty());
         assert!(result.upstream_origins.is_empty());
@@ -505,7 +540,7 @@ mod tests {
     #[test]
     fn diamond_paths_are_deduplicated() {
         let project = diamond_project();
-        let result = trace(&project, "a", Direction::Downstream).expect("a should exist");
+        let result = trace(&project, "a", None, Direction::Downstream).expect("a should exist");
 
         let mut downstream: Vec<String> = result
             .downstream_nodes
@@ -526,7 +561,7 @@ mod tests {
     #[test]
     fn unknown_target_produces_a_clear_error() {
         let project = diamond_project();
-        let result = trace(&project, "does_not_exist", Direction::Both);
+        let result = trace(&project, "does_not_exist", None, Direction::Both);
 
         assert_eq!(
             result,
@@ -540,7 +575,8 @@ mod tests {
     fn a_node_with_no_connections_returns_an_empty_but_ok_result() {
         let mut project = diamond_project();
         project.nodes.push(node("model.p.isolated"));
-        let result = trace(&project, "isolated", Direction::Both).expect("isolated should exist");
+        let result =
+            trace(&project, "isolated", None, Direction::Both).expect("isolated should exist");
 
         assert_eq!(result, LineageResult::default());
     }
@@ -555,7 +591,7 @@ mod tests {
         // A same-named model in a different package.
         project.nodes.push(node("model.other_package.a"));
 
-        let result = trace(&project, "a", Direction::Both);
+        let result = trace(&project, "a", None, Direction::Both);
 
         assert_eq!(
             result,
@@ -564,6 +600,78 @@ mod tests {
                 ids: vec!["model.p.a".to_string(), "model.other_package.a".to_string()],
             })
         );
+    }
+
+    /// The acceptance criterion this ticket exists for: an otherwise
+    /// ambiguous bare name resolves cleanly once `package` narrows it to
+    /// the one Node that actually lives in that package.
+    #[test]
+    fn a_package_disambiguates_an_otherwise_ambiguous_target() {
+        let mut project = diamond_project();
+        project.nodes.push(node("model.other_package.a"));
+
+        let result =
+            trace(&project, "a", Some("other_package"), Direction::Both).expect("should resolve");
+
+        // Resolves to `model.other_package.a`, which has none of
+        // `diamond_project`'s edges -- distinct from `model.p.a`'s
+        // result (asserted in `bare_target_returns_both_directions`),
+        // proving the *right* Node was picked, not just *a* Node.
+        assert_eq!(result, LineageResult::default());
+
+        let other_way = trace(&project, "a", Some("p"), Direction::Both).expect("should resolve");
+        assert_eq!(
+            other_way.upstream_origins,
+            vec![OriginId::new("source.p.raw")]
+        );
+    }
+
+    /// A `package` that doesn't match any candidate for the given name
+    /// narrows to zero, reported the same as a name that never existed
+    /// at all -- not silently falling back to unfiltered (still
+    /// ambiguous) matching.
+    #[test]
+    fn a_package_matching_no_candidate_produces_unknown_target_not_ambiguous() {
+        let mut project = diamond_project();
+        project.nodes.push(node("model.other_package.a"));
+
+        let result = trace(&project, "a", Some("does_not_exist"), Direction::Both);
+
+        assert_eq!(
+            result,
+            Err(LineageError::UnknownTarget {
+                name: "a".to_string(),
+            })
+        );
+    }
+
+    /// `package` has no effect on an already-unambiguous name -- it's
+    /// purely a disambiguator, not a requirement to specify one.
+    #[test]
+    fn a_package_on_an_already_unambiguous_target_still_resolves() {
+        let project = diamond_project();
+        let result =
+            trace(&project, "b", Some("p"), Direction::Both).expect("b should still resolve");
+
+        assert_eq!(result.upstream_nodes, vec![NodeId::new("model.p.a")]);
+    }
+
+    /// `resolve_target` (the public wrapper `zhao lineage --html` uses)
+    /// accepts the same disambiguator.
+    #[test]
+    fn resolve_target_accepts_a_package_disambiguator() {
+        let mut project = diamond_project();
+        project.nodes.push(node("model.other_package.a"));
+
+        let resolved = resolve_target(&project, "a", Some("other_package"))
+            .expect("should resolve with the package given");
+        assert_eq!(resolved, NodeId::new("model.other_package.a"));
+
+        let still_ambiguous = resolve_target(&project, "a", None);
+        assert!(matches!(
+            still_ambiguous,
+            Err(LineageError::AmbiguousTarget { .. })
+        ));
     }
 
     /// Direct evidence of true breadth-first order (not just "some
@@ -593,7 +701,7 @@ mod tests {
             ],
         };
 
-        let result = trace(&project, "a", Direction::Downstream).expect("a should exist");
+        let result = trace(&project, "a", None, Direction::Downstream).expect("a should exist");
 
         assert_eq!(
             result.downstream_nodes,
@@ -690,7 +798,8 @@ mod tests {
     #[test]
     fn resolved_column_chain_traces_in_both_directions() {
         let project = column_chain_project();
-        let result = trace_column(&project, "b", "x", Direction::Both).expect("b.x should exist");
+        let result =
+            trace_column(&project, "b", None, "x", Direction::Both).expect("b.x should exist");
 
         assert_eq!(
             result.upstream_columns,
@@ -726,7 +835,8 @@ mod tests {
     #[test]
     fn a_resolved_column_is_never_flagged_unresolved_by_the_companion_node_level_edge() {
         let project = column_chain_project();
-        let result = trace_column(&project, "b", "x", Direction::Upstream).expect("b.x exists");
+        let result =
+            trace_column(&project, "b", None, "x", Direction::Upstream).expect("b.x exists");
 
         assert!(result.unresolved_upstream_at.is_empty(), "{result:?}");
     }
@@ -738,7 +848,7 @@ mod tests {
     fn an_unresolved_column_is_reported_not_omitted() {
         let project = column_chain_project();
         let result =
-            trace_column(&project, "b", "y", Direction::Upstream).expect("b.y should exist");
+            trace_column(&project, "b", None, "y", Direction::Upstream).expect("b.y should exist");
 
         assert!(
             result.upstream_columns.is_empty(),
@@ -756,7 +866,7 @@ mod tests {
     fn plus_prefix_restricts_to_upstream_only() {
         let project = column_chain_project();
         let result =
-            trace_column(&project, "b", "x", Direction::Upstream).expect("b.x should exist");
+            trace_column(&project, "b", None, "x", Direction::Upstream).expect("b.x should exist");
 
         assert!(!result.upstream_columns.is_empty());
         assert!(result.downstream_columns.is_empty());
@@ -767,8 +877,8 @@ mod tests {
     #[test]
     fn plus_suffix_restricts_to_downstream_only() {
         let project = column_chain_project();
-        let result =
-            trace_column(&project, "b", "x", Direction::Downstream).expect("b.x should exist");
+        let result = trace_column(&project, "b", None, "x", Direction::Downstream)
+            .expect("b.x should exist");
 
         assert!(result.upstream_columns.is_empty());
         assert!(!result.downstream_columns.is_empty());
@@ -779,7 +889,7 @@ mod tests {
     #[test]
     fn an_unknown_column_produces_a_clear_error() {
         let project = column_chain_project();
-        let result = trace_column(&project, "b", "does_not_exist", Direction::Both);
+        let result = trace_column(&project, "b", None, "does_not_exist", Direction::Both);
 
         assert_eq!(
             result,
@@ -795,7 +905,7 @@ mod tests {
     #[test]
     fn model_level_trace_is_unaffected_by_column_level_additions() {
         let project = column_chain_project();
-        let result = trace(&project, "b", Direction::Both).expect("b should exist");
+        let result = trace(&project, "b", None, Direction::Both).expect("b should exist");
 
         assert_eq!(result.upstream_nodes, vec![NodeId::new("model.p.a")]);
     }
@@ -827,8 +937,8 @@ mod tests {
             ],
         };
 
-        let result =
-            trace_column(&project, "a", "x", Direction::Downstream).expect("a.x should exist");
+        let result = trace_column(&project, "a", None, "x", Direction::Downstream)
+            .expect("a.x should exist");
 
         assert_eq!(
             result.downstream_columns,
