@@ -141,6 +141,14 @@ impl Report {
     /// rebuild from scratch. Pure computation: this method never connects
     /// to a warehouse or provisions anything.
     ///
+    /// `settings` (from `zhao.yml`'s `defer.target`/`defer.state`, with
+    /// any `--defer-target`/`--defer-state` CLI override already applied
+    /// by the caller) additionally produces a ready-to-run command on the
+    /// plan when a state path is configured -- see
+    /// [`DeferSettings`]/[`DeferPlanJson::command`]. Pass
+    /// [`DeferSettings::default`] when neither is configured; the plan's
+    /// `build`/`defer` lists are computed the same either way.
+    ///
     /// `None` when nothing is impacted at all (nothing to build, so no
     /// plan makes sense); `Some` with an empty `defer` list is meaningful
     /// otherwise -- it means every dependency of the build set is an
@@ -149,12 +157,13 @@ impl Report {
         mut self,
         current: &ParsedProject,
         vocabulary: &dyn AdapterVocabulary,
+        settings: &DeferSettings,
     ) -> Self {
         let build = self.impacted_node_ids();
         self.defer_plan = if build.is_empty() {
             None
         } else {
-            Some(DeferPlanJson::compute(current, build, vocabulary))
+            Some(DeferPlanJson::compute(current, build, vocabulary, settings))
         };
         self
     }
@@ -238,6 +247,25 @@ impl Report {
     }
 }
 
+/// The `--defer` target/state settings a [`Report::with_defer_plan`] call
+/// needs to generate a ready-to-run command -- from `zhao.yml`'s
+/// `defer.target`/`defer.state` (see `zhao_core::config::Config`), with
+/// `--defer-target`/`--defer-state` CLI flags already resolved as
+/// overrides by the caller. Both are optional and independent: `target`
+/// alone (no `state`) produces a plan with no command, since dbt's
+/// `--defer` mechanism has nothing to function without a state path;
+/// `state` alone (no `target`) still produces a full command, just
+/// without a human-readable label for what the state represents.
+#[derive(Debug, Clone, Default)]
+pub struct DeferSettings {
+    /// A human-readable label for the dbt target the state was compiled
+    /// from (e.g. `"prod"`) -- surfaced alongside the generated command,
+    /// never passed to dbt as a `--target` flag.
+    pub target: Option<String>,
+    /// The path passed to `dbt ... --defer --state <path>`.
+    pub state: Option<String>,
+}
+
 /// The computed dbt `--defer` plan for a run -- see
 /// [`Report::with_defer_plan`].
 #[derive(Debug, Serialize)]
@@ -250,6 +278,20 @@ pub struct DeferPlanJson {
     /// existing state (`dbt ... --defer --state <path>`) rather than
     /// rebuilt.
     pub defer: Vec<String>,
+    /// The human-readable label for the target the plan defers to (from
+    /// [`DeferSettings::target`]), if configured -- present independently
+    /// of `command` (a target name alone, with no state path, still
+    /// documents intent even though no command can be generated for it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// A ready-to-run `dbt ... --defer --state <path>` command building
+    /// exactly `build`, deferring everything else to the configured
+    /// state. `None` when no state path is configured (via
+    /// `zhao.yml`'s `defer.state` or `--defer-state`) -- the plan's
+    /// `build`/`defer` lists are still always present regardless, since
+    /// they're useful on their own even without a command to run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 impl DeferPlanJson {
@@ -267,6 +309,7 @@ impl DeferPlanJson {
         current: &ParsedProject,
         build: Vec<String>,
         vocabulary: &dyn AdapterVocabulary,
+        settings: &DeferSettings,
     ) -> Self {
         let build_set: std::collections::HashSet<&str> = build.iter().map(String::as_str).collect();
         let mut visited: std::collections::HashSet<String> = build.iter().cloned().collect();
@@ -291,15 +334,27 @@ impl DeferPlanJson {
             }
         }
 
+        let build_names: Vec<String> = build
+            .iter()
+            .map(|id| vocabulary.node_display_name(id))
+            .collect();
+        let defer_names: Vec<String> = deferred
+            .iter()
+            .map(|id| vocabulary.node_display_name(id))
+            .collect();
+
+        let command = settings.state.as_deref().map(|state| {
+            format!(
+                "dbt build --select {} --defer --state {state}",
+                build_names.join(" ")
+            )
+        });
+
         Self {
-            build: build
-                .iter()
-                .map(|id| vocabulary.node_display_name(id))
-                .collect(),
-            defer: deferred
-                .iter()
-                .map(|id| vocabulary.node_display_name(id))
-                .collect(),
+            build: build_names,
+            defer: defer_names,
+            target: settings.target.clone(),
+            command,
         }
     }
 }
@@ -733,6 +788,12 @@ pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary, use_colo
                 plan.defer.join(", ")
             }
         ));
+        if let Some(target) = &plan.target {
+            out.push_str(&format!("  Target: {target}\n"));
+        }
+        if let Some(command) = &plan.command {
+            out.push_str(&format!("  Command: {command}\n"));
+        }
     }
 
     if !report.schema_evolution_warnings.is_empty() {
@@ -1240,7 +1301,11 @@ mod tests {
                 to_type: "int".to_string(),
             },
         }];
-        let report = Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary);
+        let report = Report::new(&[], &findings).with_defer_plan(
+            &current,
+            &DbtVocabulary,
+            &DeferSettings::default(),
+        );
 
         let plan = report.defer_plan.expect("plan should be present");
         assert_eq!(plan.build, vec!["dim_customers"]);
@@ -1267,7 +1332,11 @@ mod tests {
                 to_type: "int".to_string(),
             },
         }];
-        let report = Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary);
+        let report = Report::new(&[], &findings).with_defer_plan(
+            &current,
+            &DbtVocabulary,
+            &DeferSettings::default(),
+        );
 
         let plan = report.defer_plan.expect("plan should be present");
         assert_eq!(plan.build, vec!["stg_customers"]);
@@ -1302,7 +1371,11 @@ mod tests {
                 },
             },
         ];
-        let report = Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary);
+        let report = Report::new(&[], &findings).with_defer_plan(
+            &current,
+            &DbtVocabulary,
+            &DeferSettings::default(),
+        );
 
         let plan = report.defer_plan.expect("plan should be present");
         assert!(!plan.defer.contains(&"stg_customers".to_string()));
@@ -1312,7 +1385,11 @@ mod tests {
     #[test]
     fn with_defer_plan_is_none_when_nothing_is_impactful() {
         let current = project_with_edges(Vec::new());
-        let report = Report::new(&[], &[]).with_defer_plan(&current, &DbtVocabulary);
+        let report = Report::new(&[], &[]).with_defer_plan(
+            &current,
+            &DbtVocabulary,
+            &DeferSettings::default(),
+        );
 
         assert!(report.defer_plan.is_none());
     }
@@ -1332,7 +1409,11 @@ mod tests {
                 to_type: "int".to_string(),
             },
         }];
-        let report = Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary);
+        let report = Report::new(&[], &findings).with_defer_plan(
+            &current,
+            &DbtVocabulary,
+            &DeferSettings::default(),
+        );
 
         let text = render_text(&report, &DbtVocabulary, false);
 
@@ -1351,6 +1432,100 @@ mod tests {
         let text = render_text(&report, &DbtVocabulary, false);
 
         assert!(!text.contains("Defer plan:"), "{text}");
+    }
+
+    /// A configured `defer.state` produces a ready-to-run command naming
+    /// exactly the build set and the configured state path.
+    #[test]
+    fn defer_settings_with_a_state_path_produce_a_ready_to_run_command() {
+        let current = project_with_edges(vec![node_edge(
+            "model.zhao_dbt_test.stg_orders",
+            "model.zhao_dbt_test.dim_customers",
+        )]);
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::ColumnTypeNarrowed {
+                node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                column: zhao_core::model::ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        }];
+        let settings = DeferSettings {
+            target: Some("prod".to_string()),
+            state: Some("artifacts/prod/manifest.json".to_string()),
+        };
+        let report =
+            Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary, &settings);
+
+        let plan = report.defer_plan.as_ref().expect("plan should be present");
+        assert_eq!(plan.target.as_deref(), Some("prod"));
+        assert_eq!(
+            plan.command.as_deref(),
+            Some("dbt build --select dim_customers --defer --state artifacts/prod/manifest.json")
+        );
+
+        let text = render_text(&report, &DbtVocabulary, false);
+        assert!(text.contains("Target: prod"), "{text}");
+        assert!(
+            text.contains(
+                "Command: dbt build --select dim_customers --defer --state artifacts/prod/manifest.json"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A `defer.target` with no `defer.state` still labels the plan (for
+    /// documentation purposes), but produces no command at all -- dbt's
+    /// `--defer` mechanism has nothing to function without a state path.
+    #[test]
+    fn defer_settings_with_only_a_target_produce_no_command() {
+        let current = project_with_edges(Vec::new());
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::ColumnTypeNarrowed {
+                node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                column: zhao_core::model::ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        }];
+        let settings = DeferSettings {
+            target: Some("prod".to_string()),
+            state: None,
+        };
+        let report =
+            Report::new(&[], &findings).with_defer_plan(&current, &DbtVocabulary, &settings);
+
+        let plan = report.defer_plan.expect("plan should be present");
+        assert_eq!(plan.target.as_deref(), Some("prod"));
+        assert!(plan.command.is_none());
+    }
+
+    /// Default (unconfigured) `DeferSettings` produce neither a target
+    /// label nor a command -- the plan's build/defer lists alone, exactly
+    /// as before this feature existed.
+    #[test]
+    fn default_defer_settings_produce_neither_target_nor_command() {
+        let current = project_with_edges(Vec::new());
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::ColumnTypeNarrowed {
+                node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                column: zhao_core::model::ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        }];
+        let report = Report::new(&[], &findings).with_defer_plan(
+            &current,
+            &DbtVocabulary,
+            &DeferSettings::default(),
+        );
+
+        let plan = report.defer_plan.expect("plan should be present");
+        assert!(plan.target.is_none());
+        assert!(plan.command.is_none());
     }
 
     /// Acceptance criterion 1: a schema-changing Change on an incremental

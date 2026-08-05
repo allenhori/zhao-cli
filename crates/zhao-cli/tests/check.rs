@@ -482,6 +482,81 @@ fn defer_plan_appears_in_human_readable_output() {
         );
 }
 
+/// `--defer-target`/`--defer-state` (no `zhao.yml` involved -- the
+/// config-cascading behavior itself is covered at the `zhao_core::config`
+/// unit level) produce a ready-to-run `--defer --state <path>` command on
+/// the plan, in both output formats.
+#[test]
+fn defer_target_and_state_flags_produce_a_ready_to_run_command() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .arg("--defer-target")
+        .arg("prod")
+        .arg("--defer-state")
+        .arg("artifacts/prod/manifest.json")
+        .arg("--no-color")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("Target: prod").and(predicate::str::contains(
+                "Command: dbt build --select stg_customers dim_customers --defer --state artifacts/prod/manifest.json",
+            )),
+        );
+}
+
+/// The same flags in `--format json` land on the `defer_plan.command`/
+/// `defer_plan.target` keys.
+#[test]
+fn defer_target_and_state_flags_appear_in_json_output() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .arg("--defer-target")
+        .arg("prod")
+        .arg("--defer-state")
+        .arg("artifacts/prod/manifest.json")
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("\"target\": \"prod\"").and(predicate::str::contains(
+                "\"command\": \"dbt build --select stg_customers dim_customers --defer --state artifacts/prod/manifest.json\"",
+            )),
+        );
+}
+
+/// Without either flag (and no `zhao.yml` `defer:` section in this
+/// fixture), the plan carries neither a target label nor a command --
+/// exactly the pre-existing behavior.
+#[test]
+fn no_defer_flags_produce_no_target_or_command() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .arg("--no-color")
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("Defer plan:\n")
+                .and(predicate::str::contains("Target:").not())
+                .and(predicate::str::contains("Command:").not()),
+        );
+}
+
 /// A run with zero impacted Nodes produces no defer plan (nothing to
 /// build, so no plan makes sense) -- mirrors
 /// `no_recommended_command_when_nothing_is_impactful`.

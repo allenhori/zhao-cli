@@ -16,7 +16,7 @@ use zhao_core::diff::diff;
 use zhao_core::rules::evaluate;
 
 use crate::cli::{CheckArgs, OutputFormat};
-use crate::report::{Report, render_text};
+use crate::report::{DeferSettings, Report, render_text};
 
 /// The full result of running the engine pipeline: the [`Report`] itself,
 /// plus the current project state it was built from -- needed separately
@@ -48,10 +48,21 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
 
     let changes = diff(&baseline, &current);
     let findings = evaluate(&baseline, &changes, &config);
+    let defer_settings = DeferSettings {
+        target: args
+            .defer_target
+            .clone()
+            .or_else(|| config.defer_target().map(str::to_string)),
+        state: args
+            .defer_state
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| config.defer_state().map(str::to_string)),
+    };
     let mut report = Report::new(&changes, &findings)
         .with_staleness_warning(is_stale(&args.project_dir, &args.against))
         .with_recommended_command(DbtAdapter.vocabulary())
-        .with_defer_plan(&current, DbtAdapter.vocabulary())
+        .with_defer_plan(&current, DbtAdapter.vocabulary(), &defer_settings)
         .with_schema_evolution_warnings(&current);
 
     if args.check_relations {
