@@ -1,14 +1,12 @@
-//! Model-level lineage queries over a [`ParsedProject`]'s existing
-//! `LineageEdge`s: what's upstream/downstream of a given Node, by full
-//! transitive closure -- matching the semantics dbt's own `+`/`+` selector
-//! syntax has, since that's the syntax [`Direction`] borrows.
-//!
-//! Column-level lineage (a later capability) is out of scope here; this
-//! module only ever answers at the whole-Node level.
+//! Model-level and column-level lineage queries over a [`ParsedProject`]'s
+//! existing `LineageEdge`s: what's upstream/downstream of a given Node (or
+//! a specific column on it), by full transitive closure -- matching the
+//! semantics dbt's own `+`/`+` selector syntax has, since that's the
+//! syntax [`Direction`] borrows.
 
 use std::collections::{HashSet, VecDeque};
 
-use crate::model::{NodeId, OriginId, ParsedProject, Upstream};
+use crate::model::{ColumnName, Node, NodeId, OriginId, ParsedProject, Upstream};
 
 /// Which direction(s) of a lineage traversal to include -- a bare target
 /// is [`Direction::Both`]; `+target`/`target+` narrow to one side, same
@@ -49,6 +47,39 @@ pub enum LineageError {
         /// from.
         ids: Vec<String>,
     },
+    /// `model_name` resolved to a real Node, but `column_name` isn't one
+    /// of its actual (resolved) output columns.
+    #[error("model {model:?} has no column named {column:?}")]
+    UnknownColumn {
+        /// The model whose column list didn't contain `column`.
+        model: String,
+        /// The column name that couldn't be resolved.
+        column: String,
+    },
+}
+
+/// Resolves `target_name` to exactly one Node in `project`, or a
+/// [`LineageError`] -- shared by [`trace`] and [`trace_column`], which
+/// both start by resolving a bare model name the same way.
+fn resolve_target_node<'a>(
+    project: &'a ParsedProject,
+    target_name: &str,
+) -> Result<&'a Node, LineageError> {
+    let matches: Vec<&Node> = project
+        .nodes
+        .iter()
+        .filter(|node| node.name == target_name)
+        .collect();
+    match matches.as_slice() {
+        [] => Err(LineageError::UnknownTarget {
+            name: target_name.to_string(),
+        }),
+        [only] => Ok(*only),
+        multiple => Err(LineageError::AmbiguousTarget {
+            name: target_name.to_string(),
+            ids: multiple.iter().map(|node| node.id.to_string()).collect(),
+        }),
+    }
 }
 
 /// The full transitive closure of upstream/downstream Nodes (and
@@ -78,25 +109,7 @@ pub fn trace(
     target_name: &str,
     direction: Direction,
 ) -> Result<LineageResult, LineageError> {
-    let matches: Vec<&crate::model::Node> = project
-        .nodes
-        .iter()
-        .filter(|node| node.name == target_name)
-        .collect();
-    let target = match matches.as_slice() {
-        [] => {
-            return Err(LineageError::UnknownTarget {
-                name: target_name.to_string(),
-            });
-        }
-        [only] => *only,
-        multiple => {
-            return Err(LineageError::AmbiguousTarget {
-                name: target_name.to_string(),
-                ids: multiple.iter().map(|node| node.id.to_string()).collect(),
-            });
-        }
-    };
+    let target = resolve_target_node(project, target_name)?;
 
     let mut result = LineageResult::default();
     if matches!(direction, Direction::Upstream | Direction::Both) {
@@ -172,6 +185,220 @@ fn walk_downstream(project: &ParsedProject, start: &NodeId) -> Vec<NodeId> {
     }
 
     nodes
+}
+
+// ---------------------------------------------------------------------
+// Column-level lineage.
+// ---------------------------------------------------------------------
+
+/// A single column reached during a column-level lineage query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRef {
+    /// The Node this column belongs to.
+    pub node: NodeId,
+    /// The column's name on that Node.
+    pub column: ColumnName,
+}
+
+/// A single Origin column reached during a column-level lineage query --
+/// kept distinct from [`ColumnRef`] since an Origin isn't a Node (zhao
+/// doesn't build it, and it carries no resolved output schema of its
+/// own the way a Node's `columns` does).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginColumnRef {
+    /// The Origin this column belongs to.
+    pub origin: OriginId,
+    /// The column's name on that Origin.
+    pub column: ColumnName,
+}
+
+/// The result of a column-level lineage query -- the column-grain mirror
+/// of [`LineageResult`]. Every `*_columns`/`*_origins` entry represents a
+/// *resolved* column-to-column edge (real `ColumnLineage` data, the same
+/// kind `zhao check`'s Rule catalog already consumes) -- never a guess.
+///
+/// `unresolved_upstream_at`/`unresolved_downstream_at` name every Node
+/// reached along the way that has a real node-level dependency in that
+/// direction whose specific column mapping couldn't be resolved (e.g. a
+/// computed expression, or one of the SQL shapes documented as
+/// unsupported in the dbt adapter's "Known limitations") -- kept
+/// separate from the resolved lists specifically so "genuinely nothing
+/// here" and "something's here, we just don't know which column" are
+/// never conflated into the same (mis)reading of an empty list.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ColumnLineageResult {
+    /// Every column upstream of the target, resolved via `ColumnLineage`,
+    /// in first-reached (breadth-first) order.
+    pub upstream_columns: Vec<ColumnRef>,
+    /// Every Origin column upstream of the target, resolved the same way.
+    pub upstream_origins: Vec<OriginColumnRef>,
+    /// Every Node with an unresolved upstream dependency reached while
+    /// tracing upstream -- the specific column that traces into it
+    /// couldn't be determined, but the dependency itself is real.
+    pub unresolved_upstream_at: Vec<NodeId>,
+    /// Every column downstream of the target, resolved via
+    /// `ColumnLineage`, in first-reached (breadth-first) order.
+    pub downstream_columns: Vec<ColumnRef>,
+    /// Every Node with an unresolved downstream dependency reached while
+    /// tracing downstream.
+    pub unresolved_downstream_at: Vec<NodeId>,
+}
+
+/// Resolves a column-level lineage query: finds the Node named
+/// `target_node_name`, confirms `target_column_name` is really one of
+/// its resolved output columns, then walks `direction`'s side(s) of its
+/// column-level Lineage Edges to their full transitive closure.
+pub fn trace_column(
+    project: &ParsedProject,
+    target_node_name: &str,
+    target_column_name: &str,
+    direction: Direction,
+) -> Result<ColumnLineageResult, LineageError> {
+    let target = resolve_target_node(project, target_node_name)?;
+    let column = ColumnName::new(target_column_name);
+    if !target.columns.iter().any(|c| c.name == column) {
+        return Err(LineageError::UnknownColumn {
+            model: target_node_name.to_string(),
+            column: target_column_name.to_string(),
+        });
+    }
+
+    let mut result = ColumnLineageResult::default();
+    if matches!(direction, Direction::Upstream | Direction::Both) {
+        walk_upstream_column(project, &target.id, &column, &mut result);
+    }
+    if matches!(direction, Direction::Downstream | Direction::Both) {
+        walk_downstream_column(project, &target.id, &column, &mut result);
+    }
+    Ok(result)
+}
+
+/// Walks every *resolved* column-level edge transitively upstream of
+/// `(start_node, start_column)`, breadth-first.
+///
+/// The dbt adapter always adds a node-level `column: None` edge for
+/// every real dependency *in addition to* any column-level edges it
+/// managed to resolve for that same upstream/downstream pair (see that
+/// adapter's own comment: "Column-level edges above are additive detail,
+/// not a replacement for these") -- so a `None` edge existing at a Node
+/// is not, on its own, evidence that *this* column's mapping is
+/// unresolved; plenty of fully-resolved columns still have one
+/// alongside their real `Some` edge. What actually means "this column's
+/// own upstream is unresolved" is the combination of: this Node has
+/// *some* real upstream connectivity at all (`Some` for another column,
+/// or `None`), and *none* of it names this specific column as a match.
+/// That combination is recorded once in `result.unresolved_upstream_at`,
+/// and the walk doesn't continue past it on that path (there's nothing
+/// concrete to continue into).
+fn walk_upstream_column(
+    project: &ParsedProject,
+    start_node: &NodeId,
+    start_column: &ColumnName,
+    result: &mut ColumnLineageResult,
+) {
+    let mut visited_columns: HashSet<(NodeId, ColumnName)> =
+        HashSet::from([(start_node.clone(), start_column.clone())]);
+    let mut visited_unresolved: HashSet<NodeId> = HashSet::new();
+    let mut frontier: VecDeque<(NodeId, ColumnName)> =
+        VecDeque::from([(start_node.clone(), start_column.clone())]);
+
+    while let Some((node, column)) = frontier.pop_front() {
+        let mut found_resolved_match = false;
+        let mut has_upstream_connectivity = false;
+        for edge in &project.edges {
+            if edge.downstream != node {
+                continue;
+            }
+            has_upstream_connectivity = true;
+            let Some(lineage) = &edge.column else {
+                continue;
+            };
+            if lineage.downstream_column != column {
+                continue;
+            }
+            found_resolved_match = true;
+            match &edge.upstream {
+                Upstream::Node(id) => {
+                    let key = (id.clone(), lineage.upstream_column.clone());
+                    if visited_columns.insert(key.clone()) {
+                        result.upstream_columns.push(ColumnRef {
+                            node: id.clone(),
+                            column: lineage.upstream_column.clone(),
+                        });
+                        frontier.push_back(key);
+                    }
+                }
+                Upstream::Origin(id) => {
+                    let origin_ref = OriginColumnRef {
+                        origin: id.clone(),
+                        column: lineage.upstream_column.clone(),
+                    };
+                    if !result.upstream_origins.contains(&origin_ref) {
+                        result.upstream_origins.push(origin_ref);
+                    }
+                }
+            }
+        }
+        if !found_resolved_match
+            && has_upstream_connectivity
+            && visited_unresolved.insert(node.clone())
+        {
+            result.unresolved_upstream_at.push(node.clone());
+        }
+    }
+}
+
+/// The downstream mirror of [`walk_upstream_column`] -- Origins never
+/// appear here, for the same reason [`walk_downstream`] never reaches
+/// one: nothing is ever downstream of something zhao doesn't build. See
+/// [`walk_upstream_column`]'s doc comment for why "unresolved" means
+/// more than just "some edge here has `column: None`."
+fn walk_downstream_column(
+    project: &ParsedProject,
+    start_node: &NodeId,
+    start_column: &ColumnName,
+    result: &mut ColumnLineageResult,
+) {
+    let mut visited_columns: HashSet<(NodeId, ColumnName)> =
+        HashSet::from([(start_node.clone(), start_column.clone())]);
+    let mut visited_unresolved: HashSet<NodeId> = HashSet::new();
+    let mut frontier: VecDeque<(NodeId, ColumnName)> =
+        VecDeque::from([(start_node.clone(), start_column.clone())]);
+
+    while let Some((node, column)) = frontier.pop_front() {
+        let mut found_resolved_match = false;
+        let mut has_downstream_connectivity = false;
+        for edge in &project.edges {
+            let Upstream::Node(upstream_id) = &edge.upstream else {
+                continue;
+            };
+            if upstream_id != &node {
+                continue;
+            }
+            has_downstream_connectivity = true;
+            let Some(lineage) = &edge.column else {
+                continue;
+            };
+            if lineage.upstream_column != column {
+                continue;
+            }
+            found_resolved_match = true;
+            let key = (edge.downstream.clone(), lineage.downstream_column.clone());
+            if visited_columns.insert(key.clone()) {
+                result.downstream_columns.push(ColumnRef {
+                    node: edge.downstream.clone(),
+                    column: lineage.downstream_column.clone(),
+                });
+                frontier.push_back(key);
+            }
+        }
+        if !found_resolved_match
+            && has_downstream_connectivity
+            && visited_unresolved.insert(node.clone())
+        {
+            result.unresolved_downstream_at.push(node.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +595,255 @@ mod tests {
                 NodeId::new("model.p.d"),
                 NodeId::new("model.p.e"),
                 NodeId::new("model.p.f"),
+            ]
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Column-level lineage.
+    // -------------------------------------------------------------
+
+    fn node_with_columns(id: &str, columns: &[&str]) -> Node {
+        Node {
+            columns: columns
+                .iter()
+                .map(|c| crate::model::Column {
+                    name: ColumnName::new(*c),
+                    data_type: None,
+                })
+                .collect(),
+            ..node(id)
+        }
+    }
+
+    fn column(name: &str) -> ColumnName {
+        ColumnName::new(name)
+    }
+
+    fn column_edge(
+        upstream: &str,
+        upstream_column: &str,
+        downstream: &str,
+        downstream_column: &str,
+    ) -> LineageEdge {
+        LineageEdge {
+            upstream: Upstream::Node(NodeId::new(upstream)),
+            downstream: NodeId::new(downstream),
+            column: Some(crate::model::ColumnLineage {
+                upstream_column: column(upstream_column),
+                downstream_column: column(downstream_column),
+            }),
+        }
+    }
+
+    fn origin_column_edge(
+        upstream_origin: &str,
+        upstream_column: &str,
+        downstream: &str,
+        downstream_column: &str,
+    ) -> LineageEdge {
+        LineageEdge {
+            upstream: Upstream::Origin(OriginId::new(upstream_origin)),
+            downstream: NodeId::new(downstream),
+            column: Some(crate::model::ColumnLineage {
+                upstream_column: column(upstream_column),
+                downstream_column: column(downstream_column),
+            }),
+        }
+    }
+
+    /// `origin.raw.x` -> `a.x` -> `b.x` -> `c.x`, a clean passthrough
+    /// chain, plus `b.y`: a computed column with no resolved source --
+    /// `b`'s node-level dependency on `a` is real (the accompanying
+    /// `column: None` edge dbt's adapter always adds alongside resolved
+    /// ones), but `y` specifically has no `Some` edge naming it.
+    fn column_chain_project() -> ParsedProject {
+        ParsedProject {
+            nodes: vec![
+                node_with_columns("model.p.a", &["x"]),
+                node_with_columns("model.p.b", &["x", "y"]),
+                node_with_columns("model.p.c", &["x"]),
+            ],
+            origins: vec![origin("source.p.raw")],
+            edges: vec![
+                origin_column_edge("source.p.raw", "x", "model.p.a", "x"),
+                column_edge("model.p.a", "x", "model.p.b", "x"),
+                // The always-present node-level fallback edge dbt's
+                // adapter adds alongside the resolved one above --
+                // proves this alone must NOT trigger "unresolved" for
+                // b.x, which fully resolved via the edge above.
+                node_edge("model.p.a", "model.p.b"),
+                column_edge("model.p.b", "x", "model.p.c", "x"),
+            ],
+        }
+    }
+
+    #[test]
+    fn resolved_column_chain_traces_in_both_directions() {
+        let project = column_chain_project();
+        let result = trace_column(&project, "b", "x", Direction::Both).expect("b.x should exist");
+
+        assert_eq!(
+            result.upstream_columns,
+            vec![ColumnRef {
+                node: NodeId::new("model.p.a"),
+                column: column("x"),
+            }]
+        );
+        assert_eq!(
+            result.upstream_origins,
+            vec![OriginColumnRef {
+                origin: OriginId::new("source.p.raw"),
+                column: column("x"),
+            }]
+        );
+        assert_eq!(
+            result.downstream_columns,
+            vec![ColumnRef {
+                node: NodeId::new("model.p.c"),
+                column: column("x"),
+            }]
+        );
+        assert!(
+            result.unresolved_upstream_at.is_empty(),
+            "a fully-resolved column chain must not be flagged unresolved: {result:?}"
+        );
+    }
+
+    /// The key regression this module's design had to get right: a
+    /// node-level `column: None` edge existing alongside a fully-resolved
+    /// `Some` edge for the SAME pair (exactly what dbt's adapter always
+    /// produces) must never, on its own, mark a column unresolved.
+    #[test]
+    fn a_resolved_column_is_never_flagged_unresolved_by_the_companion_node_level_edge() {
+        let project = column_chain_project();
+        let result = trace_column(&project, "b", "x", Direction::Upstream).expect("b.x exists");
+
+        assert!(result.unresolved_upstream_at.is_empty(), "{result:?}");
+    }
+
+    /// Acceptance criterion: a column whose lineage couldn't be resolved
+    /// (here, `b.y`, a computed column) is reported as unresolved, not
+    /// silently omitted or shown as if fully traced.
+    #[test]
+    fn an_unresolved_column_is_reported_not_omitted() {
+        let project = column_chain_project();
+        let result =
+            trace_column(&project, "b", "y", Direction::Upstream).expect("b.y should exist");
+
+        assert!(
+            result.upstream_columns.is_empty(),
+            "y has no resolved upstream column: {result:?}"
+        );
+        assert_eq!(
+            result.unresolved_upstream_at,
+            vec![NodeId::new("model.p.b")]
+        );
+    }
+
+    /// Acceptance criterion: `+<model>.<column>` restricts to upstream
+    /// only.
+    #[test]
+    fn plus_prefix_restricts_to_upstream_only() {
+        let project = column_chain_project();
+        let result =
+            trace_column(&project, "b", "x", Direction::Upstream).expect("b.x should exist");
+
+        assert!(!result.upstream_columns.is_empty());
+        assert!(result.downstream_columns.is_empty());
+    }
+
+    /// Acceptance criterion: `<model>.<column>+` restricts to downstream
+    /// only.
+    #[test]
+    fn plus_suffix_restricts_to_downstream_only() {
+        let project = column_chain_project();
+        let result =
+            trace_column(&project, "b", "x", Direction::Downstream).expect("b.x should exist");
+
+        assert!(result.upstream_columns.is_empty());
+        assert!(!result.downstream_columns.is_empty());
+    }
+
+    /// Acceptance criterion: an unknown `model.column` target produces a
+    /// clear, actionable error.
+    #[test]
+    fn an_unknown_column_produces_a_clear_error() {
+        let project = column_chain_project();
+        let result = trace_column(&project, "b", "does_not_exist", Direction::Both);
+
+        assert_eq!(
+            result,
+            Err(LineageError::UnknownColumn {
+                model: "b".to_string(),
+                column: "does_not_exist".to_string(),
+            })
+        );
+    }
+
+    /// Acceptance criterion: model-level targets continue to work
+    /// unchanged alongside the new column-level capability.
+    #[test]
+    fn model_level_trace_is_unaffected_by_column_level_additions() {
+        let project = column_chain_project();
+        let result = trace(&project, "b", Direction::Both).expect("b should exist");
+
+        assert_eq!(result.upstream_nodes, vec![NodeId::new("model.p.a")]);
+    }
+
+    /// Column-level parity with `downstream_order_is_genuinely_breadth_first`
+    /// (the model-level equivalent): on an asymmetric-depth column chain
+    /// (`a.x -> b.x, a.x -> c.x, b.x -> d.x, c.x -> e.x, d.x -> f.x`), true
+    /// BFS visits `[b, c, d, e, f]` -- `e` (2 hops via the shorter `c`
+    /// branch) before `f` (3 hops via the longer `b -> d` branch) is
+    /// exactly what a depth-first/stack-based walk would get wrong.
+    #[test]
+    fn downstream_column_order_is_genuinely_breadth_first() {
+        let project = ParsedProject {
+            nodes: vec![
+                node_with_columns("model.p.a", &["x"]),
+                node_with_columns("model.p.b", &["x"]),
+                node_with_columns("model.p.c", &["x"]),
+                node_with_columns("model.p.d", &["x"]),
+                node_with_columns("model.p.e", &["x"]),
+                node_with_columns("model.p.f", &["x"]),
+            ],
+            origins: Vec::new(),
+            edges: vec![
+                column_edge("model.p.a", "x", "model.p.b", "x"),
+                column_edge("model.p.a", "x", "model.p.c", "x"),
+                column_edge("model.p.b", "x", "model.p.d", "x"),
+                column_edge("model.p.c", "x", "model.p.e", "x"),
+                column_edge("model.p.d", "x", "model.p.f", "x"),
+            ],
+        };
+
+        let result =
+            trace_column(&project, "a", "x", Direction::Downstream).expect("a.x should exist");
+
+        assert_eq!(
+            result.downstream_columns,
+            vec![
+                ColumnRef {
+                    node: NodeId::new("model.p.b"),
+                    column: column("x")
+                },
+                ColumnRef {
+                    node: NodeId::new("model.p.c"),
+                    column: column("x")
+                },
+                ColumnRef {
+                    node: NodeId::new("model.p.d"),
+                    column: column("x")
+                },
+                ColumnRef {
+                    node: NodeId::new("model.p.e"),
+                    column: column("x")
+                },
+                ColumnRef {
+                    node: NodeId::new("model.p.f"),
+                    column: column("x")
+                },
             ]
         );
     }

@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use zhao_core::adapters::TransformationToolAdapter;
 use zhao_core::adapters::dbt::DbtAdapter;
-use zhao_core::lineage::{Direction, LineageResult, trace};
+use zhao_core::lineage::{ColumnLineageResult, Direction, LineageResult, trace, trace_column};
 
 use crate::cli::LineageArgs;
 
@@ -31,20 +31,24 @@ pub fn run(args: &LineageArgs) -> ExitCode {
         Err(err) => return fail(&format!("{}: {err}", manifest_path.display())),
     };
 
-    let (target_name, direction) = args.parse_target();
-    let result = match trace(&project, target_name, direction) {
-        Ok(result) => result,
-        // `LineageError`'s own `Display` (via thiserror) already gives a
-        // clear, actionable message for every variant -- `UnknownTarget`
-        // and `AmbiguousTarget` alike -- so there's no need to
-        // re-derive it per variant here.
-        Err(err) => return fail(&err.to_string()),
+    let (target_name, target_column, direction) = args.parse_target();
+
+    // `LineageError`'s own `Display` (via thiserror) already gives a
+    // clear, actionable message for every variant -- `UnknownTarget`,
+    // `AmbiguousTarget`, `UnknownColumn` alike -- so there's no need to
+    // re-derive it per variant here.
+    let text = match target_column {
+        Some(column) => match trace_column(&project, target_name, column, direction) {
+            Ok(result) => render_column_text(&result, direction, DbtAdapter.vocabulary()),
+            Err(err) => return fail(&err.to_string()),
+        },
+        None => match trace(&project, target_name, direction) {
+            Ok(result) => render_text(&result, target_name, direction, DbtAdapter.vocabulary()),
+            Err(err) => return fail(&err.to_string()),
+        },
     };
 
-    print!(
-        "{}",
-        render_text(&result, target_name, direction, DbtAdapter.vocabulary())
-    );
+    print!("{text}");
     ExitCode::from(EXIT_OK)
 }
 
@@ -109,6 +113,68 @@ fn render_text(
     out
 }
 
+/// The column-level mirror of [`render_text`]: an "Upstream:"/
+/// "Downstream:" section per included side, each listing resolved
+/// columns (`<term> <node-id>.<column>`, and Origins via
+/// `origin_term()`) plus, separately, any Node reached whose specific
+/// column mapping couldn't be resolved -- rendered as `<term> <node-id>
+/// (unresolved)` so it's visibly present, never silently dropped or
+/// indistinguishable from a fully-traced entry.
+fn render_column_text(
+    result: &ColumnLineageResult,
+    direction: Direction,
+    vocabulary: &dyn zhao_core::adapters::AdapterVocabulary,
+) -> String {
+    let node_term = vocabulary.node_term();
+    let origin_term = vocabulary.origin_term();
+    let mut out = String::new();
+
+    if matches!(direction, Direction::Upstream | Direction::Both) {
+        out.push_str("Upstream:\n");
+        if result.upstream_columns.is_empty()
+            && result.upstream_origins.is_empty()
+            && result.unresolved_upstream_at.is_empty()
+        {
+            out.push_str("  (none)\n");
+        } else {
+            for origin_ref in &result.upstream_origins {
+                out.push_str(&format!(
+                    "  {origin_term} {}.{}\n",
+                    origin_ref.origin, origin_ref.column
+                ));
+            }
+            for column_ref in &result.upstream_columns {
+                out.push_str(&format!(
+                    "  {node_term} {}.{}\n",
+                    column_ref.node, column_ref.column
+                ));
+            }
+            for id in &result.unresolved_upstream_at {
+                out.push_str(&format!("  {node_term} {id} (unresolved)\n"));
+            }
+        }
+    }
+
+    if matches!(direction, Direction::Downstream | Direction::Both) {
+        out.push_str("Downstream:\n");
+        if result.downstream_columns.is_empty() && result.unresolved_downstream_at.is_empty() {
+            out.push_str("  (none)\n");
+        } else {
+            for column_ref in &result.downstream_columns {
+                out.push_str(&format!(
+                    "  {node_term} {}.{}\n",
+                    column_ref.node, column_ref.column
+                ));
+            }
+            for id in &result.unresolved_downstream_at {
+                out.push_str(&format!("  {node_term} {id} (unresolved)\n"));
+            }
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +227,61 @@ mod tests {
     fn render_text_reports_none_for_an_empty_included_side_not_a_blank_output() {
         let result = LineageResult::default();
         let text = render_text(&result, "isolated", Direction::Both, &DbtVocabulary);
+
+        assert!(text.contains("Upstream:\n  (none)\n"), "{text}");
+        assert!(text.contains("Downstream:\n  (none)\n"), "{text}");
+    }
+
+    #[test]
+    fn render_column_text_lists_resolved_columns_and_origins() {
+        let result = ColumnLineageResult {
+            upstream_columns: vec![zhao_core::lineage::ColumnRef {
+                node: NodeId::new("model.p.a"),
+                column: zhao_core::model::ColumnName::new("x"),
+            }],
+            upstream_origins: vec![zhao_core::lineage::OriginColumnRef {
+                origin: OriginId::new("source.p.raw"),
+                column: zhao_core::model::ColumnName::new("x"),
+            }],
+            unresolved_upstream_at: Vec::new(),
+            downstream_columns: vec![zhao_core::lineage::ColumnRef {
+                node: NodeId::new("model.p.c"),
+                column: zhao_core::model::ColumnName::new("x"),
+            }],
+            unresolved_downstream_at: Vec::new(),
+        };
+        let text = render_column_text(&result, Direction::Both, &DbtVocabulary);
+
+        assert!(text.contains("  source source.p.raw.x\n"), "{text}");
+        assert!(text.contains("  model model.p.a.x\n"), "{text}");
+        assert!(text.contains("  model model.p.c.x\n"), "{text}");
+    }
+
+    /// Acceptance criterion: an unresolved column is visibly reported,
+    /// distinguishable from a fully-resolved entry -- never silently
+    /// dropped or indistinguishable from "nothing here."
+    #[test]
+    fn render_column_text_reports_unresolved_nodes_distinctly() {
+        let result = ColumnLineageResult {
+            upstream_columns: Vec::new(),
+            upstream_origins: Vec::new(),
+            unresolved_upstream_at: vec![NodeId::new("model.p.b")],
+            downstream_columns: Vec::new(),
+            unresolved_downstream_at: Vec::new(),
+        };
+        let text = render_column_text(&result, Direction::Upstream, &DbtVocabulary);
+
+        assert!(text.contains("  model model.p.b (unresolved)\n"), "{text}");
+        assert!(
+            !text.contains("(none)"),
+            "an unresolved entry means this side isn't genuinely empty: {text}"
+        );
+    }
+
+    #[test]
+    fn render_column_text_reports_none_when_genuinely_empty() {
+        let result = ColumnLineageResult::default();
+        let text = render_column_text(&result, Direction::Both, &DbtVocabulary);
 
         assert!(text.contains("Upstream:\n  (none)\n"), "{text}");
         assert!(text.contains("Downstream:\n  (none)\n"), "{text}");

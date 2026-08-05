@@ -147,3 +147,139 @@ fn a_model_with_no_connections_produces_a_clear_nothing_found_result_not_an_erro
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     assert!(stdout.contains("(none)"), "{stdout}");
 }
+
+// ---------------------------------------------------------------------
+// Column-level lineage (`model.column` targets).
+// ---------------------------------------------------------------------
+
+/// Acceptance criterion: a bare `model.column` target shows both
+/// upstream and downstream columns actually connected via resolved
+/// column-level lineage -- `stg_customers.customer_id` traces to
+/// `raw_customers.id` upstream (a real rename, not just "some column on
+/// the source") and `dim_customers.customer_id` downstream.
+#[test]
+fn bare_column_target_shows_resolved_upstream_and_downstream_columns() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("stg_customers.customer_id")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .output()
+        .expect("command should run");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+
+    assert!(stdout.contains("Upstream:\n"), "{stdout}");
+    assert!(
+        stdout.contains("source source.zhao_dbt_test.raw.raw_customers.id"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Downstream:\n"), "{stdout}");
+    assert!(
+        stdout.contains("model model.zhao_dbt_test.dim_customers.customer_id"),
+        "{stdout}"
+    );
+}
+
+/// Acceptance criterion: `+<model>.<column>` restricts to upstream only.
+#[test]
+fn plus_prefix_on_a_column_target_shows_only_upstream() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("+stg_customers.customer_id")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(0)
+        .stdout(
+            predicate::str::contains("Upstream:\n")
+                .and(predicate::str::contains(
+                    "source.zhao_dbt_test.raw.raw_customers.id",
+                ))
+                .and(predicate::str::contains("Downstream:\n").not()),
+        );
+}
+
+/// Acceptance criterion: `<model>.<column>+` restricts to downstream
+/// only.
+#[test]
+fn plus_suffix_on_a_column_target_shows_only_downstream() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("stg_customers.customer_id+")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(0)
+        .stdout(
+            predicate::str::contains("Downstream:\n")
+                .and(predicate::str::contains(
+                    "model.zhao_dbt_test.dim_customers.customer_id",
+                ))
+                .and(predicate::str::contains("Upstream:\n").not()),
+        );
+}
+
+/// Acceptance criterion: a column whose lineage couldn't be resolved
+/// (`dim_customers.number_of_orders`, a `coalesce(...)`-computed
+/// aggregate with no single upstream column) is reported as
+/// "unresolved," not silently omitted or shown as if fully traced.
+#[test]
+fn an_unresolved_column_is_reported_as_unresolved_not_omitted() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("dim_customers.number_of_orders")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .output()
+        .expect("command should run");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("(unresolved)"), "{stdout}");
+}
+
+/// Acceptance criterion: an unknown `model.column` target produces a
+/// clear, actionable error.
+#[test]
+fn an_unknown_column_produces_a_clear_error() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("stg_customers.does_not_exist")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("error:")
+                .and(predicate::str::contains("stg_customers"))
+                .and(predicate::str::contains("does_not_exist")),
+        );
+}
+
+/// Acceptance criterion: model-level targets (the tracer bullet)
+/// continue to work unchanged alongside the new column-level capability.
+#[test]
+fn model_level_targets_still_work_unchanged() {
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("stg_customers")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .output()
+        .expect("command should run");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("model model.zhao_dbt_test.dim_customers\n"),
+        "{stdout}"
+    );
+}
