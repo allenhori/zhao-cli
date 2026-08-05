@@ -61,6 +61,17 @@ pub struct LineageArgs {
     /// text output.
     #[arg(long)]
     pub compile: bool,
+
+    /// Disambiguates `target` when its bare model name matches more
+    /// than one model across different dbt packages (a real but
+    /// uncommon project shape -- multiple internal packages, dbt Mesh,
+    /// etc.) -- narrows resolution to the model in this package only.
+    /// The error for an ambiguous target without this flag lists every
+    /// matching model's full ID (`model.<package>.<name>`), which names
+    /// exactly what to pass here. Has no effect (and no error) when the
+    /// bare name is already unambiguous.
+    #[arg(long)]
+    pub package: Option<String>,
 }
 
 impl LineageArgs {
@@ -223,6 +234,7 @@ mod tests {
             project_dir: PathBuf::from("."),
             html: None,
             compile: false,
+            package: None,
         }
     }
 

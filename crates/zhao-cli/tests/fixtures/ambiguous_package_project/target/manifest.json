@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "adapter_type": "duckdb"
+  },
+  "nodes": {
+    "model.pkg_a.customers": {
+      "unique_id": "model.pkg_a.customers",
+      "resource_type": "model",
+      "name": "customers",
+      "database": "dev",
+      "schema": "pkg_a",
+      "alias": "customers",
+      "depends_on": { "nodes": [] },
+      "compiled_code": "select 1 as id",
+      "columns": {}
+    },
+    "model.pkg_b.customers": {
+      "unique_id": "model.pkg_b.customers",
+      "resource_type": "model",
+      "name": "customers",
+      "database": "dev",
+      "schema": "pkg_b",
+      "alias": "customers",
+      "depends_on": { "nodes": [] },
+      "compiled_code": "select 2 as id",
+      "columns": {}
+    }
+  },
+  "sources": {}
+}
