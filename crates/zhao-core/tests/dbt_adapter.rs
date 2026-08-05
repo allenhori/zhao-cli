@@ -139,17 +139,22 @@ fn resolves_column_lineage_through_a_join_across_two_upstream_models() {
     );
 
     // `coalesce(customer_orders.number_of_orders, 0) as number_of_orders`
-    // is computed, not a plain column reference -- it should exist in the
-    // schema but carry no resolved column-level source.
-    let number_of_orders_has_no_column_edge = !project.edges.iter().any(|e| {
-        e.downstream == dim_customers_id
-            && e.column
-                .as_ref()
-                .is_some_and(|c| c.downstream_column.as_str() == "number_of_orders")
+    // is computed, not a plain column reference -- but it wraps exactly
+    // one upstream column (`customer_orders.number_of_orders`, itself
+    // `count(order_id)` inside an earlier CTE), so it should still trace
+    // all the way back to stg_orders.order_id.
+    let stg_orders_id = NodeId::new("model.zhao_dbt_test.stg_orders");
+    let number_of_orders_traced = project.edges.iter().any(|e| {
+        e.upstream == Upstream::Node(stg_orders_id.clone())
+            && e.downstream == dim_customers_id
+            && e.column.as_ref().is_some_and(|c| {
+                c.upstream_column.as_str() == "order_id"
+                    && c.downstream_column.as_str() == "number_of_orders"
+            })
     });
     assert!(
-        number_of_orders_has_no_column_edge,
-        "a computed (coalesce) column should not have a resolved column-level source"
+        number_of_orders_traced,
+        "a coalesce(...) wrapping a single column reference should trace through nested CTEs"
     );
 }
 
@@ -246,17 +251,24 @@ fn resolves_a_join_and_aggregation_across_two_upstream_models() {
         "expected order_id to trace back to stg_orders"
     );
 
-    // `coalesce(order_payments.total_amount, 0) as amount` is computed --
-    // no resolved column-level source.
-    let amount_has_no_column_edge = !project.edges.iter().any(|e| {
-        e.downstream == fct_orders_id
-            && e.column
-                .as_ref()
-                .is_some_and(|c| c.downstream_column.as_str() == "amount")
+    // `coalesce(order_payments.total_amount, 0) as amount` is computed,
+    // but wraps a single column reference through `sum(amount)` inside
+    // the `order_payments` CTE -- it should trace to stg_payments.amount,
+    // the immediate upstream Node (a single model's resolution only
+    // reasons about its own SQL; the further hop from stg_payments.amount
+    // to raw_payments.amount is that Node's own edge, stitched together
+    // by the graph-level lineage walk, not duplicated here).
+    let stg_payments_id = NodeId::new("model.zhao_dbt_test.stg_payments");
+    let amount_traced = project.edges.iter().any(|e| {
+        e.upstream == Upstream::Node(stg_payments_id.clone())
+            && e.downstream == fct_orders_id
+            && e.column.as_ref().is_some_and(|c| {
+                c.upstream_column.as_str() == "amount" && c.downstream_column.as_str() == "amount"
+            })
     });
     assert!(
-        amount_has_no_column_edge,
-        "a computed (coalesce) column should not have a resolved source"
+        amount_traced,
+        "a coalesce(sum(...)) chain wrapping a single column reference should trace through"
     );
 }
 
@@ -302,15 +314,17 @@ fn resolves_an_incremental_model_the_same_as_an_equivalent_non_incremental_one()
         "expected order_id to trace back to stg_orders on the incremental model too"
     );
 
-    let amount_has_no_column_edge = !project.edges.iter().any(|e| {
-        e.downstream == incremental_id
-            && e.column
-                .as_ref()
-                .is_some_and(|c| c.downstream_column.as_str() == "amount")
+    let stg_payments_id = NodeId::new("model.zhao_dbt_test.stg_payments");
+    let amount_traced = project.edges.iter().any(|e| {
+        e.upstream == Upstream::Node(stg_payments_id.clone())
+            && e.downstream == incremental_id
+            && e.column.as_ref().is_some_and(|c| {
+                c.upstream_column.as_str() == "amount" && c.downstream_column.as_str() == "amount"
+            })
     });
     assert!(
-        amount_has_no_column_edge,
-        "the computed amount column should not have a resolved source on the incremental model either"
+        amount_traced,
+        "the computed amount column should trace through on the incremental model too"
     );
 }
 

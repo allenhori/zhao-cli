@@ -11,6 +11,7 @@ mod cli;
 mod diff;
 mod engine;
 mod lineage;
+mod lineage_html;
 mod metadata;
 mod report;
 

@@ -256,6 +256,7 @@ mod tests {
         Column {
             name: ColumnName::new(name),
             data_type: data_type.map(str::to_string),
+            expression: None,
         }
     }
 

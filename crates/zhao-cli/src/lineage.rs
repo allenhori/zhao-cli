@@ -25,24 +25,97 @@ const EXIT_ERROR: u8 = 2;
 
 /// Runs `zhao lineage` and returns the process exit code.
 pub fn run(args: &LineageArgs) -> ExitCode {
+    if args.compile {
+        if let Err(err) = DbtAdapter.compile(&args.project_dir, "dbt", &[]) {
+            return fail(&err.to_string());
+        }
+    }
+
     let manifest_path = args.project_dir.join("target").join("manifest.json");
     let project = match DbtAdapter.parse(&manifest_path) {
         Ok(project) => project,
         Err(err) => return fail(&format!("{}: {err}", manifest_path.display())),
     };
 
-    let (target_name, target_column, direction) = args.parse_target();
+    match &args.html {
+        Some(html_path) => run_html(args, &project, html_path),
+        None => run_text(args, &project),
+    }
+}
+
+/// The `--html` path: generates the self-contained interactive export.
+fn run_html(
+    args: &LineageArgs,
+    project: &zhao_core::model::ParsedProject,
+    html_path: &std::path::Path,
+) -> ExitCode {
+    let parsed_target = args.parse_target();
+
+    // `LineageError`'s own `Display` already gives a clear, actionable
+    // message for every variant, same as the text path -- validated up
+    // front (via the same resolution `trace`/`trace_column` use) so an
+    // unknown/ambiguous/unknown-column target fails the same way it
+    // would for text output, rather than silently producing an export
+    // with nothing pre-selected.
+    let (initial_target, initial_column) = match parsed_target {
+        None => (None, None),
+        Some((target_name, Some(column_name), direction)) => {
+            match trace_column(project, target_name, column_name, direction) {
+                Ok(_) => match zhao_core::lineage::resolve_target(project, target_name) {
+                    Ok(id) => (Some(id), Some(column_name.to_string())),
+                    Err(err) => return fail(&err.to_string()),
+                },
+                Err(err) => return fail(&err.to_string()),
+            }
+        }
+        Some((target_name, None, direction)) => match trace(project, target_name, direction) {
+            Ok(_) => match zhao_core::lineage::resolve_target(project, target_name) {
+                Ok(id) => (Some(id), None),
+                Err(err) => return fail(&err.to_string()),
+            },
+            Err(err) => return fail(&err.to_string()),
+        },
+    };
+
+    let html = crate::lineage_html::generate(
+        project,
+        DbtAdapter.vocabulary(),
+        initial_target,
+        initial_column,
+    );
+    if let Err(err) = std::fs::write(html_path, html) {
+        return fail(&format!("could not write {}: {err}", html_path.display()));
+    }
+
+    let absolute_path = html_path
+        .canonicalize()
+        .unwrap_or_else(|_| html_path.to_path_buf());
+    println!(
+        "Wrote {} -- open it at file://{}",
+        html_path.display(),
+        absolute_path.display()
+    );
+    ExitCode::from(EXIT_OK)
+}
+
+/// The default (no `--html`) path: prints text, same as before.
+fn run_text(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> ExitCode {
+    let Some((target_name, target_column, direction)) = args.parse_target() else {
+        return fail(
+            "a target is required for text output -- pass --html to generate a whole-project graph without one",
+        );
+    };
 
     // `LineageError`'s own `Display` (via thiserror) already gives a
     // clear, actionable message for every variant -- `UnknownTarget`,
     // `AmbiguousTarget`, `UnknownColumn` alike -- so there's no need to
     // re-derive it per variant here.
     let text = match target_column {
-        Some(column) => match trace_column(&project, target_name, column, direction) {
+        Some(column) => match trace_column(project, target_name, column, direction) {
             Ok(result) => render_column_text(&result, direction, DbtAdapter.vocabulary()),
             Err(err) => return fail(&err.to_string()),
         },
-        None => match trace(&project, target_name, direction) {
+        None => match trace(project, target_name, direction) {
             Ok(result) => render_text(&result, target_name, direction, DbtAdapter.vocabulary()),
             Err(err) => return fail(&err.to_string()),
         },

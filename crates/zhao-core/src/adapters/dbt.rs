@@ -23,6 +23,28 @@
 //! Origin's columns can't be expanded -- only identity ("this column,
 //! whatever it's called, passes through unchanged") relationships to an
 //! Origin are tracked.
+//!
+//! A calculated column (a function call, `CAST`, arithmetic, or `CASE`) is
+//! *not* automatically unresolved, though: every plain (optionally
+//! qualified) column identifier that expression structurally references --
+//! `coalesce(x.y, 0)`, `x.a + x.b`, `case when x.a > 0 then x.b else x.c
+//! end`, and arbitrary nesting of these -- is collected and traced, so a
+//! calculated column can resolve to *several* upstream columns, not just
+//! one (see `collect_expr_sources`). This is a structural walk, not a
+//! guess: every identifier found either resolves cleanly through the
+//! surrounding `FROM` scope or it doesn't (e.g. it's ambiguous among
+//! several relations in scope), and only the ones that do are reported --
+//! there's no ranking of "which one is really the source" involved. A
+//! calculated column's rendered SQL (re-generated from the parsed
+//! expression, so not necessarily byte-identical to the original source)
+//! is also recorded on [`crate::model::Column::expression`], `None` for a
+//! plain passthrough/rename of a single identifier. Resolution is
+//! CTE-aware in both directions: a reference to an earlier CTE's own
+//! calculated column (`SELECT cte1.total AS my_column FROM cte1`) carries
+//! forward *that* column's already-resolved sources, however many CTE
+//! hops away it was actually computed -- the final model's column isn't
+//! misattributed to the trivial passthrough reference that happens to sit
+//! in the outermost `SELECT`.
 
 use super::warehouse::{QueryExecutor, RELATION_EXISTS_MACRO, RelationIdentity};
 use super::{AdapterVocabulary, TransformationToolAdapter};
@@ -32,7 +54,8 @@ use crate::model::{
 };
 use serde::Deserialize;
 use sqlparser::ast::{
-    Expr, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, SetExpr,
+    Statement, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -475,11 +498,14 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
             LocalSchema::Passthrough(Upstream::Origin(_)) | LocalSchema::Opaque => Vec::new(),
         };
 
-        // Column-level edges, from whatever was resolved.
+        // Column-level edges, from whatever was resolved. A calculated
+        // column can carry more than one source (see the module-level
+        // "Known limitations" doc comment) -- one edge per referenced
+        // upstream column.
         match &local_schema {
             LocalSchema::Known(cols) => {
                 for col in cols {
-                    if let Some((upstream, upstream_col)) = &col.source {
+                    for (upstream, upstream_col) in &col.sources {
                         edges.push(LineageEdge {
                             upstream: upstream.clone(),
                             downstream: node_id.clone(),
@@ -526,6 +552,14 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
 
         resolved_schemas.insert(node_id.clone(), columns.clone());
 
+        let expressions: HashMap<&str, &str> = match &local_schema {
+            LocalSchema::Known(cols) => cols
+                .iter()
+                .filter_map(|c| c.expression.as_deref().map(|e| (c.name.as_str(), e)))
+                .collect(),
+            _ => HashMap::new(),
+        };
+
         let documented_columns: Vec<Column> = columns
             .iter()
             .map(|name| Column {
@@ -534,6 +568,7 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
                     .columns
                     .get(name.as_str())
                     .and_then(|doc| doc.data_type.clone()),
+                expression: expressions.get(name.as_str()).map(|e| e.to_string()),
             })
             .collect();
 
@@ -629,12 +664,15 @@ fn topological_order<'a>(models: &[&'a RawNode]) -> Vec<&'a RawNode> {
 // SQL resolution
 // ---------------------------------------------------------------------
 
-/// A resolved column: its output name, and, if traceable to a single
-/// upstream Node/Origin column, where it comes from.
+/// A resolved column: its output name, every upstream Node/Origin column
+/// it's traceable to (zero, one, or several -- see the module-level
+/// "Known limitations" doc comment), and, for a calculated/derived column,
+/// its rendered defining SQL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedColumn {
     name: String,
-    source: Option<(Upstream, String)>,
+    sources: Vec<(Upstream, String)>,
+    expression: Option<String>,
 }
 
 /// The resolved shape of a query or CTE, as far as this adapter could
@@ -903,7 +941,8 @@ fn expand_wildcard_of(
                 cols.iter()
                     .map(|c| ResolvedColumn {
                         name: c.as_str().to_string(),
-                        source: Some((upstream.clone(), c.as_str().to_string())),
+                        sources: vec![(upstream.clone(), c.as_str().to_string())],
+                        expression: None,
                     })
                     .collect(),
             )
@@ -925,21 +964,24 @@ fn qualified_wildcard_alias(
     }
 }
 
-/// Resolves a single projection expression to a named, possibly-sourced
-/// column. Only plain (optionally qualified) identifiers are traced to an
-/// upstream column; anything else (function calls, arithmetic, literals,
-/// `CASE`, ...) is recorded by its output name with no resolved source.
+/// Resolves a single projection expression to a named column, tracing
+/// every plain (optionally qualified) column identifier the expression
+/// structurally references -- see [`collect_expr_sources`] and the
+/// module-level "Known limitations" doc comment.
 fn resolve_expr_column(
     expr: &Expr,
     alias: Option<String>,
     from_scope: &HashMap<String, LocalSchema>,
 ) -> ResolvedColumn {
-    let source = match expr {
-        Expr::Identifier(ident) => resolve_unqualified(&ident.value, from_scope),
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            resolve_qualified(&parts[0].value, &parts[1].value, from_scope)
-        }
-        _ => None,
+    let sources = collect_expr_sources(expr, from_scope);
+
+    // A plain (optionally qualified) identifier is a passthrough/rename,
+    // not a calculation -- no expression text is worth showing for it.
+    // Everything else (function calls, arithmetic, `CASE`, literals, ...)
+    // gets its rendered SQL recorded.
+    let expression = match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => None,
+        other => Some(other.to_string()),
     };
 
     let name = alias.unwrap_or_else(|| match expr {
@@ -950,31 +992,123 @@ fn resolve_expr_column(
         other => other.to_string(),
     });
 
-    ResolvedColumn { name, source }
+    ResolvedColumn {
+        name,
+        sources,
+        expression,
+    }
 }
 
+/// Recursively collects every distinct upstream column that `expr`
+/// structurally references, in the order first encountered. A plain
+/// identifier or qualified identifier contributes (at most) one; a
+/// function call, `CAST`, unary/binary operator, `CASE`, or parenthesized
+/// expression contributes the union of its sub-expressions' sources.
+/// Anything else (a literal, a subquery expression, ...) contributes
+/// nothing. Deliberately structural, not a guess: a sub-expression that
+/// can't be resolved (e.g. an unqualified name ambiguous among several
+/// relations in scope) simply contributes nothing, rather than a wrong
+/// guess at what it might be.
+fn collect_expr_sources(
+    expr: &Expr,
+    from_scope: &HashMap<String, LocalSchema>,
+) -> Vec<(Upstream, String)> {
+    let mut found = Vec::new();
+    collect_expr_sources_into(expr, from_scope, &mut found);
+    found
+}
+
+fn collect_expr_sources_into(
+    expr: &Expr,
+    from_scope: &HashMap<String, LocalSchema>,
+    found: &mut Vec<(Upstream, String)>,
+) {
+    let push_dedup = |mut new: Vec<(Upstream, String)>, found: &mut Vec<(Upstream, String)>| {
+        new.retain(|candidate| !found.contains(candidate));
+        found.append(&mut new);
+    };
+
+    match expr {
+        Expr::Identifier(ident) => {
+            push_dedup(resolve_unqualified(&ident.value, from_scope), found);
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            push_dedup(
+                resolve_qualified(&parts[0].value, &parts[1].value, from_scope),
+                found,
+            );
+        }
+        Expr::Function(f) => {
+            if let FunctionArguments::List(list) = &f.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(arg_expr),
+                        ..
+                    } = arg
+                    {
+                        collect_expr_sources_into(arg_expr, from_scope, found);
+                    }
+                }
+            }
+        }
+        Expr::Cast { expr: inner, .. }
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner) => {
+            collect_expr_sources_into(inner, from_scope, found);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_sources_into(left, from_scope, found);
+            collect_expr_sources_into(right, from_scope, found);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_sources_into(operand, from_scope, found);
+            }
+            for when in conditions {
+                collect_expr_sources_into(&when.condition, from_scope, found);
+                collect_expr_sources_into(&when.result, from_scope, found);
+            }
+            if let Some(else_result) = else_result {
+                collect_expr_sources_into(else_result, from_scope, found);
+            }
+        }
+        // Literals, subquery expressions, window functions, and anything
+        // else: not attempted (see module-level "Known limitations").
+        _ => {}
+    }
+}
+
+/// Resolves a plain unqualified column reference. Returns every source it
+/// carries when it resolves through an already-multi-sourced calculated
+/// column (see [`source_of`]); returns nothing when ambiguous among
+/// several relations in scope.
 fn resolve_unqualified(
     column: &str,
     from_scope: &HashMap<String, LocalSchema>,
-) -> Option<(Upstream, String)> {
+) -> Vec<(Upstream, String)> {
     if from_scope.len() == 1 {
-        let only = from_scope.values().next()?;
-        return source_of(only, column);
+        return match from_scope.values().next() {
+            Some(only) => source_of(only, column),
+            None => Vec::new(),
+        };
     }
 
     // A `Known` relation's columns are enumerated -- it either definitely
     // has this column or definitely doesn't, so a `Known` hit is
     // authoritative and wins over merely-possible matches.
-    let known_hits: Vec<(Upstream, String)> = from_scope
+    let known_hits: Vec<&LocalSchema> = from_scope
         .values()
-        .filter_map(|schema| match schema {
-            LocalSchema::Known(_) => source_of(schema, column),
-            _ => None,
-        })
+        .filter(|schema| matches!(schema, LocalSchema::Known(cols) if cols.iter().any(|c| c.name == column)))
         .collect();
     match known_hits.len() {
-        1 => return known_hits.into_iter().next(),
-        n if n > 1 => return None, // genuinely ambiguous among Known relations
+        1 => return source_of(known_hits[0], column),
+        n if n > 1 => return Vec::new(), // genuinely ambiguous among Known relations
         _ => {}
     }
 
@@ -982,16 +1116,16 @@ fn resolve_unqualified(
     // `Passthrough` relations, whose real columns we can't enumerate to
     // either confirm or rule out, so only resolve if exactly one is in
     // scope (more than one is genuinely ambiguous).
-    let passthrough_hits: Vec<(Upstream, String)> = from_scope
+    let passthrough_hits: Vec<&Upstream> = from_scope
         .values()
         .filter_map(|schema| match schema {
-            LocalSchema::Passthrough(upstream) => Some((upstream.clone(), column.to_string())),
+            LocalSchema::Passthrough(upstream) => Some(upstream),
             _ => None,
         })
         .collect();
     match passthrough_hits.len() {
-        1 => passthrough_hits.into_iter().next(),
-        _ => None,
+        1 => vec![(passthrough_hits[0].clone(), column.to_string())],
+        _ => Vec::new(),
     }
 }
 
@@ -999,19 +1133,30 @@ fn resolve_qualified(
     qualifier: &str,
     column: &str,
     from_scope: &HashMap<String, LocalSchema>,
-) -> Option<(Upstream, String)> {
-    let schema = from_scope.get(qualifier)?;
-    source_of(schema, column)
+) -> Vec<(Upstream, String)> {
+    match from_scope.get(qualifier) {
+        Some(schema) => source_of(schema, column),
+        None => Vec::new(),
+    }
 }
 
-fn source_of(schema: &LocalSchema, column: &str) -> Option<(Upstream, String)> {
+/// Every upstream source `column` traces to on `schema`. A `Passthrough`
+/// always contributes exactly one (identity passthrough of a single
+/// upstream relation). A `Known` relation looks up that column's own
+/// already-resolved sources -- carrying forward however many there are,
+/// which is how a reference to an earlier CTE's calculated column (e.g.
+/// `SELECT cte1.total AS my_column FROM cte1`) ends up attributed to
+/// whatever `cte1.total` itself resolved to, not to the trivial
+/// passthrough reference.
+fn source_of(schema: &LocalSchema, column: &str) -> Vec<(Upstream, String)> {
     match schema {
-        LocalSchema::Passthrough(upstream) => Some((upstream.clone(), column.to_string())),
+        LocalSchema::Passthrough(upstream) => vec![(upstream.clone(), column.to_string())],
         LocalSchema::Known(cols) => cols
             .iter()
             .find(|c| c.name == column)
-            .and_then(|c| c.source.clone()),
-        LocalSchema::Opaque => None,
+            .map(|c| c.sources.clone())
+            .unwrap_or_default(),
+        LocalSchema::Opaque => Vec::new(),
     }
 }
 
@@ -1166,7 +1311,7 @@ mod tests {
             LocalSchema::Known(cols) => {
                 assert_eq!(cols.len(), 1);
                 assert!(
-                    cols[0].source.is_none(),
+                    cols[0].sources.is_empty(),
                     "an alias collision between two relations must not silently resolve to either one"
                 );
             }
@@ -1210,11 +1355,145 @@ mod tests {
                 assert_eq!(cols.len(), 1);
                 assert_eq!(cols[0].name, "name");
                 assert_eq!(
-                    cols[0].source,
-                    Some((origin("origin.s.tbl"), "name".to_string()))
+                    cols[0].sources,
+                    vec![(origin("origin.s.tbl"), "name".to_string())]
                 );
             }
             other => panic!("expected Known([name sourced from tbl via CTE a]), got {other:?}"),
+        }
+    }
+
+    /// A calculated column that references two distinct upstream columns
+    /// (`x.a + x.b`) resolves to *both* sources, not zero and not an
+    /// arbitrary pick of one -- and its rendered SQL is recorded as its
+    /// expression.
+    #[test]
+    fn a_calculated_column_over_two_distinct_columns_resolves_to_both_sources() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(r#"select x.a + x.b as total from "db"."s"."t" as x"#)
+            .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "total");
+                assert_eq!(
+                    cols[0].sources,
+                    vec![
+                        (origin("origin.s.t"), "a".to_string()),
+                        (origin("origin.s.t"), "b".to_string()),
+                    ]
+                );
+                assert!(
+                    cols[0].expression.is_some(),
+                    "a calculated column should carry its rendered SQL"
+                );
+            }
+            other => panic!("expected Known([total sourced from a and b]), got {other:?}"),
+        }
+    }
+
+    /// A plain (optionally qualified) identifier reference -- a
+    /// passthrough or rename, not a calculation -- carries no expression
+    /// text: there's nothing more informative to show than "this is that
+    /// column."
+    #[test]
+    fn a_plain_identifier_reference_carries_no_expression() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query =
+            parse_query(r#"select x.a as renamed from "db"."s"."t" as x"#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].expression, None);
+            }
+            other => panic!("expected Known([renamed]), got {other:?}"),
+        }
+    }
+
+    /// A `CASE` expression's every branch (operand, each `WHEN`/`THEN`
+    /// pair, and `ELSE`) is walked for column references.
+    #[test]
+    fn a_case_expression_collects_sources_from_every_branch() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"select case when x.a > 0 then x.b else x.c end as result from "db"."s"."t" as x"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![
+                        (origin("origin.s.t"), "a".to_string()),
+                        (origin("origin.s.t"), "b".to_string()),
+                        (origin("origin.s.t"), "c".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Known([result sourced from a, b, c]), got {other:?}"),
+        }
+    }
+
+    /// A reference to an earlier CTE's own multi-sourced calculated column
+    /// carries forward *all* of that column's sources, however many CTE
+    /// hops away it was actually computed -- not just the trivial
+    /// passthrough reference in the outer query.
+    #[test]
+    fn a_multi_sourced_calculated_column_propagates_through_a_cte_hop() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"with a as (select x.a + x.b as total from "db"."s"."t" as x) select a.total as my_column from a"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "my_column");
+                assert_eq!(
+                    cols[0].sources,
+                    vec![
+                        (origin("origin.s.t"), "a".to_string()),
+                        (origin("origin.s.t"), "b".to_string()),
+                    ],
+                    "my_column should be attributed to what actually computed total, not to the passthrough reference"
+                );
+            }
+            other => {
+                panic!("expected Known([my_column sourced from a and b via CTE]), got {other:?}")
+            }
         }
     }
 
