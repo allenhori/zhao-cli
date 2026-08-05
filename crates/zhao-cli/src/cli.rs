@@ -24,6 +24,41 @@ pub enum Command {
     /// regardless of what Severity outcomes are present. For local
     /// inspection during development; use `check` for CI gating.
     Diff(CheckArgs),
+    /// Answers "what's upstream/downstream of this model?" -- a
+    /// structural query over the current project's compiled state, not a
+    /// Baseline-vs-current diff. No `--state`, no git, no `dbt compile`.
+    Lineage(LineageArgs),
+}
+
+/// Arguments for `zhao lineage`.
+#[derive(Debug, clap::Args)]
+pub struct LineageArgs {
+    /// The lineage target, in dbt's own selector syntax: a bare model
+    /// name shows both upstream and downstream; `+model` shows only
+    /// upstream (ancestors); `model+` shows only downstream
+    /// (descendants).
+    pub target: String,
+
+    /// The dbt project directory to query. Its current compiled manifest
+    /// is read from `<project-dir>/target/manifest.json`, as-is -- run
+    /// `dbt compile` in the project before invoking `zhao lineage`.
+    #[arg(long, default_value = ".")]
+    pub project_dir: PathBuf,
+}
+
+impl LineageArgs {
+    /// Splits `target` into the bare model name and the requested
+    /// [`zhao_core::lineage::Direction`], per dbt's own `+`-prefix/suffix
+    /// selector convention.
+    pub fn parse_target(&self) -> (&str, zhao_core::lineage::Direction) {
+        if let Some(name) = self.target.strip_prefix('+') {
+            (name, zhao_core::lineage::Direction::Upstream)
+        } else if let Some(name) = self.target.strip_suffix('+') {
+            (name, zhao_core::lineage::Direction::Downstream)
+        } else {
+            (self.target.as_str(), zhao_core::lineage::Direction::Both)
+        }
+    }
 }
 
 /// Arguments shared by `zhao check` and `zhao diff` -- both run the
@@ -123,4 +158,41 @@ pub enum OutputFormat {
     Text,
     /// Machine-readable JSON.
     Json,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zhao_core::lineage::Direction;
+
+    fn args(target: &str) -> LineageArgs {
+        LineageArgs {
+            target: target.to_string(),
+            project_dir: PathBuf::from("."),
+        }
+    }
+
+    #[test]
+    fn bare_target_parses_as_both_directions() {
+        let a = args("dim_customers");
+        let (name, direction) = a.parse_target();
+        assert_eq!(name, "dim_customers");
+        assert_eq!(direction, Direction::Both);
+    }
+
+    #[test]
+    fn a_plus_prefix_parses_as_upstream_only() {
+        let a = args("+dim_customers");
+        let (name, direction) = a.parse_target();
+        assert_eq!(name, "dim_customers");
+        assert_eq!(direction, Direction::Upstream);
+    }
+
+    #[test]
+    fn a_plus_suffix_parses_as_downstream_only() {
+        let a = args("dim_customers+");
+        let (name, direction) = a.parse_target();
+        assert_eq!(name, "dim_customers");
+        assert_eq!(direction, Direction::Downstream);
+    }
 }

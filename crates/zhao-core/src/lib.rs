@@ -14,6 +14,7 @@ pub mod adapters;
 pub mod config;
 pub mod diff;
 pub mod git;
+pub mod lineage;
 pub mod model;
 pub mod rules;
 
