@@ -224,12 +224,14 @@ fn plus_suffix_on_a_column_target_shows_only_downstream() {
         );
 }
 
-/// Acceptance criterion: a column whose lineage couldn't be resolved
-/// (`dim_customers.number_of_orders`, a `coalesce(...)`-computed
-/// aggregate with no single upstream column) is reported as
-/// "unresolved," not silently omitted or shown as if fully traced.
+/// Acceptance criterion: a calculated column that wraps a single upstream
+/// column reference through nested function calls and CTE hops
+/// (`dim_customers.number_of_orders` is `coalesce(customer_orders.number_of_orders,
+/// 0)`, where `customer_orders.number_of_orders` is itself `count(order_id)`
+/// inside an earlier CTE) is traced all the way back to the real upstream
+/// column, not reported as unresolved.
 #[test]
-fn an_unresolved_column_is_reported_as_unresolved_not_omitted() {
+fn a_calculated_column_traces_through_nested_functions_and_cte_hops() {
     let output = Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
@@ -241,7 +243,11 @@ fn an_unresolved_column_is_reported_as_unresolved_not_omitted() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
-    assert!(stdout.contains("(unresolved)"), "{stdout}");
+    assert!(
+        stdout.contains("model.zhao_dbt_test.stg_orders.order_id"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("(unresolved)"), "{stdout}");
 }
 
 /// Acceptance criterion: an unknown `model.column` target produces a
@@ -282,4 +288,151 @@ fn model_level_targets_still_work_unchanged() {
         stdout.contains("model model.zhao_dbt_test.dim_customers\n"),
         "{stdout}"
     );
+}
+
+// ---------------------------------------------------------------------
+// `--html`: self-contained interactive lineage export.
+// ---------------------------------------------------------------------
+
+/// Acceptance criterion: `zhao lineage --html out.html` with no target
+/// embeds the whole project's lineage graph.
+#[test]
+fn html_with_no_target_embeds_the_whole_project() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let out = dir.path().join("out.html");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--html")
+        .arg(&out)
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(0);
+
+    let html = std::fs::read_to_string(&out).expect("should read generated file");
+    for model in [
+        "model.zhao_dbt_test.stg_customers",
+        "model.zhao_dbt_test.stg_orders",
+        "model.zhao_dbt_test.stg_payments",
+        "model.zhao_dbt_test.dim_customers",
+        "model.zhao_dbt_test.fct_orders",
+        "model.zhao_dbt_test.fct_orders_incremental",
+    ] {
+        assert!(html.contains(model), "{model} missing from export");
+    }
+}
+
+/// Acceptance criterion: `zhao lineage --html out.html <model>` scopes
+/// the initial view to that target.
+#[test]
+fn html_with_a_model_target_scopes_the_initial_view() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let out = dir.path().join("out.html");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--html")
+        .arg(&out)
+        .arg("stg_customers")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(0);
+
+    let html = std::fs::read_to_string(&out).expect("should read generated file");
+    assert!(html.contains("\"initial_target\":\"model.zhao_dbt_test.stg_customers\""));
+    assert!(!html.contains("\"initial_column\":"));
+}
+
+/// Acceptance criterion: `zhao lineage --html out.html <model>.<column>`
+/// scopes the initial view at the column grain too.
+#[test]
+fn html_with_a_column_target_scopes_the_initial_view_at_column_grain() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let out = dir.path().join("out.html");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--html")
+        .arg(&out)
+        .arg("stg_customers.customer_id")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(0);
+
+    let html = std::fs::read_to_string(&out).expect("should read generated file");
+    assert!(html.contains("\"initial_target\":\"model.zhao_dbt_test.stg_customers\""));
+    assert!(html.contains("\"initial_column\":\"customer_id\""));
+}
+
+/// Acceptance criterion: an unknown/ambiguous/unknown-column target
+/// fails the same way `--html` mode as it does for text output, rather
+/// than silently generating a file with nothing pre-selected.
+#[test]
+fn html_with_an_unknown_target_produces_a_clear_error_and_writes_nothing() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let out = dir.path().join("out.html");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--html")
+        .arg(&out)
+        .arg("does_not_exist")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("does_not_exist"));
+
+    assert!(
+        !out.exists(),
+        "no file should be written on a failed target resolution"
+    );
+}
+
+/// Acceptance criterion: the generated file is fully self-contained --
+/// no `http://`/`https://` reference anywhere in its output (beyond the
+/// SVG namespace URI, which is never fetched over the network).
+#[test]
+fn html_export_is_fully_self_contained() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let out = dir.path().join("out.html");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--html")
+        .arg(&out)
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(0);
+
+    let html = std::fs::read_to_string(&out).expect("should read generated file");
+    let without_svg_namespace = html.replace("http://www.w3.org/2000/svg", "");
+    assert!(
+        !without_svg_namespace.contains("http://") && !without_svg_namespace.contains("https://"),
+        "export must be fully self-contained: {without_svg_namespace}"
+    );
+}
+
+/// Acceptance criterion (implied, shared with text output): a target is
+/// required unless `--html` is given -- bare `zhao lineage` with neither
+/// produces a clear error, not a panic or silent no-op.
+#[test]
+fn no_target_and_no_html_produces_a_clear_error() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("error:"));
 }

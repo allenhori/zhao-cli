@@ -37,23 +37,42 @@ pub struct LineageArgs {
     /// name (or `model.column` for column-level lineage) shows both
     /// upstream and downstream; a `+` prefix shows only upstream
     /// (ancestors); a `+` suffix shows only downstream (descendants).
-    pub target: String,
+    /// Required for text output; optional for `--html`, where omitting
+    /// it embeds the whole project's lineage graph instead of scoping to
+    /// one target.
+    pub target: Option<String>,
 
     /// The dbt project directory to query. Its current compiled manifest
     /// is read from `<project-dir>/target/manifest.json`, as-is -- run
-    /// `dbt compile` in the project before invoking `zhao lineage`.
+    /// `dbt compile` in the project before invoking `zhao lineage` (or
+    /// pass `--compile`).
     #[arg(long, default_value = ".")]
     pub project_dir: PathBuf,
+
+    /// Generates a self-contained, interactive HTML lineage graph at
+    /// this path instead of printing text. A local development
+    /// convenience -- not intended to run in CI.
+    #[arg(long)]
+    pub html: Option<PathBuf>,
+
+    /// Runs `dbt compile` in `--project-dir` before generating the
+    /// export, for a guaranteed-fresh view. Without it, the existing
+    /// `target/manifest.json` is read as-is, same as the default for
+    /// text output.
+    #[arg(long)]
+    pub compile: bool,
 }
 
 impl LineageArgs {
     /// Splits `target` into the bare model name, an optional column name
     /// (present for a `model.column` target), and the requested
     /// [`zhao_core::lineage::Direction`], per dbt's own `+`-prefix/suffix
-    /// selector convention.
-    pub fn parse_target(&self) -> (&str, Option<&str>, zhao_core::lineage::Direction) {
-        let has_prefix = self.target.starts_with('+');
-        let after_prefix = self.target.strip_prefix('+').unwrap_or(&self.target);
+    /// selector convention. `None` when no target was given at all
+    /// (only valid alongside `--html`, for the whole-project graph).
+    pub fn parse_target(&self) -> Option<(&str, Option<&str>, zhao_core::lineage::Direction)> {
+        let target = self.target.as_deref()?;
+        let has_prefix = target.starts_with('+');
+        let after_prefix = target.strip_prefix('+').unwrap_or(target);
         let has_suffix = after_prefix.ends_with('+');
         let name = after_prefix.strip_suffix('+').unwrap_or(after_prefix);
 
@@ -73,7 +92,7 @@ impl LineageArgs {
             Some((model, column)) => (model, Some(column)),
             None => (name, None),
         };
-        (model, column, direction)
+        Some((model, column, direction))
     }
 }
 
@@ -183,15 +202,17 @@ mod tests {
 
     fn args(target: &str) -> LineageArgs {
         LineageArgs {
-            target: target.to_string(),
+            target: Some(target.to_string()),
             project_dir: PathBuf::from("."),
+            html: None,
+            compile: false,
         }
     }
 
     #[test]
     fn bare_target_parses_as_both_directions() {
         let a = args("dim_customers");
-        let (name, column, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target().expect("target should be present");
         assert_eq!(name, "dim_customers");
         assert_eq!(column, None);
         assert_eq!(direction, Direction::Both);
@@ -200,7 +221,7 @@ mod tests {
     #[test]
     fn a_plus_prefix_parses_as_upstream_only() {
         let a = args("+dim_customers");
-        let (name, column, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target().expect("target should be present");
         assert_eq!(name, "dim_customers");
         assert_eq!(column, None);
         assert_eq!(direction, Direction::Upstream);
@@ -209,7 +230,7 @@ mod tests {
     #[test]
     fn a_plus_suffix_parses_as_downstream_only() {
         let a = args("dim_customers+");
-        let (name, column, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target().expect("target should be present");
         assert_eq!(name, "dim_customers");
         assert_eq!(column, None);
         assert_eq!(direction, Direction::Downstream);
@@ -221,7 +242,7 @@ mod tests {
     #[test]
     fn a_plus_prefix_and_suffix_together_parses_as_both_directions() {
         let a = args("+dim_customers+");
-        let (name, column, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target().expect("target should be present");
         assert_eq!(name, "dim_customers");
         assert_eq!(column, None);
         assert_eq!(direction, Direction::Both);
@@ -230,7 +251,7 @@ mod tests {
     #[test]
     fn a_dotted_target_splits_into_model_and_column() {
         let a = args("dim_customers.customer_id");
-        let (name, column, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target().expect("target should be present");
         assert_eq!(name, "dim_customers");
         assert_eq!(column, Some("customer_id"));
         assert_eq!(direction, Direction::Both);
@@ -239,7 +260,7 @@ mod tests {
     #[test]
     fn a_dotted_target_still_honors_plus_prefix_and_suffix() {
         let a = args("+dim_customers.customer_id+");
-        let (name, column, direction) = a.parse_target();
+        let (name, column, direction) = a.parse_target().expect("target should be present");
         assert_eq!(name, "dim_customers");
         assert_eq!(column, Some("customer_id"));
         assert_eq!(direction, Direction::Both);

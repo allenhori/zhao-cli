@@ -94,6 +94,16 @@ pub struct Column {
     pub name: ColumnName,
     /// This column's documented data type, if the source project records one.
     pub data_type: Option<String>,
+    /// The rendered SQL of this column's defining expression, when it's a
+    /// calculated/derived column (a function call, `CAST`, arithmetic,
+    /// `CASE`, ...). `None` for a plain passthrough of an upstream column
+    /// (a bare identifier reference, possibly renamed) -- there's no
+    /// expression more informative than "this is that column" to show.
+    /// Re-rendered from the parsed SQL AST, so it's a faithful
+    /// representation of the computation but not necessarily
+    /// byte-identical to the original source text (whitespace,
+    /// capitalization, and equivalent syntax may differ).
+    pub expression: Option<String>,
 }
 
 /// The kind of join a [`Node`]'s definition uses to combine two relations.

@@ -82,6 +82,14 @@ fn resolve_target_node<'a>(
     }
 }
 
+/// Public wrapper around `resolve_target_node` for callers that just
+/// need the resolved `NodeId` itself (e.g. `zhao lineage --html`'s
+/// initial-target validation), without needing their own copy of the
+/// bare-name-to-Node resolution/ambiguity-checking logic.
+pub fn resolve_target(project: &ParsedProject, target_name: &str) -> Result<NodeId, LineageError> {
+    resolve_target_node(project, target_name).map(|node| node.id.clone())
+}
+
 /// The full transitive closure of upstream/downstream Nodes (and
 /// upstream Origins, since an ancestor chain can terminate at one) of a
 /// query's target -- never includes the target itself. Whichever side
@@ -610,6 +618,7 @@ mod tests {
                 .map(|c| crate::model::Column {
                     name: ColumnName::new(*c),
                     data_type: None,
+                    expression: None,
                 })
                 .collect(),
             ..node(id)
