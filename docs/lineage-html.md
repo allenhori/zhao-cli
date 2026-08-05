@@ -14,6 +14,11 @@ open lineage.html                            # macOS; xdg-open on Linux, or just
 committed in this repo. Open it in your browser to try the real thing rather than take our
 word for what it does.
 
+![Clicking a model, expanding columns, then tracing a calculated column's real upstream source](assets/lineage-demo.gif)
+
+*(A real capture of the live demo above — click a model, turn on "Columns", click a
+calculated column to trace it back to its actual source, then search for `model.column`.)*
+
 ## What you get
 
 - **The whole DAG**, laid out left-to-right by dependency depth — sources on the left,

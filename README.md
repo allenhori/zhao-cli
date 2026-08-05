@@ -77,6 +77,8 @@ Full flag reference: **[docs/commands.md](docs/commands.md)**.
 column to trace exactly what it depends on and what depends on it, search, filter, all
 offline in one HTML file.
 
+![Clicking a model, expanding columns, then tracing a calculated column's real upstream source](docs/assets/lineage-demo.gif)
+
 **[Open the live demo](docs/assets/lineage-demo.html)** to try it yourself. More in
 **[docs/lineage-html.md](docs/lineage-html.md)**.
 
