@@ -180,6 +180,66 @@ fn a_package_flag_on_an_unambiguous_target_still_resolves() {
         .code(0);
 }
 
+/// `--package` disambiguates a `model.column` target too, not just a
+/// bare model target -- both `run_text` and `run_html` thread it into
+/// `trace_column`, not just `trace`.
+#[test]
+fn a_package_flag_disambiguates_a_column_level_target() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("customers.id")
+        .arg("--package")
+        .arg("pkg_b")
+        .arg("--project-dir")
+        .arg(fixture("ambiguous_package_project"))
+        .assert()
+        .code(0);
+}
+
+/// `--package` disambiguates `--html`'s initial target too, scoping the
+/// export to the correct package's model -- not just text output.
+#[test]
+fn a_package_flag_disambiguates_the_html_export_initial_target() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let out = dir.path().join("out.html");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--html")
+        .arg(&out)
+        .arg("customers")
+        .arg("--package")
+        .arg("pkg_a")
+        .arg("--project-dir")
+        .arg(fixture("ambiguous_package_project"))
+        .assert()
+        .code(0);
+
+    let html = std::fs::read_to_string(&out).expect("should read generated file");
+    assert!(html.contains("\"initial_target\":\"model.pkg_a.customers\""));
+}
+
+/// An empty `--package ""` never matches a real package segment (dbt
+/// never produces one), so it behaves the same as a package that
+/// doesn't apply at all -- `UnknownTarget`, not a silent fallback to
+/// unfiltered (still-ambiguous) matching.
+#[test]
+fn an_empty_package_flag_produces_unknown_target_not_a_silent_fallback() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("customers")
+        .arg("--package")
+        .arg("")
+        .arg("--project-dir")
+        .arg(fixture("ambiguous_package_project"))
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("error:").and(predicate::str::contains("no model named")));
+}
+
 /// Acceptance criterion: a model with no upstream/downstream connections
 /// produces a clear "nothing found" result, not an error -- exercised
 /// against a throwaway single-model project built for this test (no
