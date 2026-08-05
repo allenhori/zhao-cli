@@ -790,4 +790,61 @@ mod tests {
 
         assert_eq!(result.upstream_nodes, vec![NodeId::new("model.p.a")]);
     }
+
+    /// Column-level parity with `downstream_order_is_genuinely_breadth_first`
+    /// (the model-level equivalent): on an asymmetric-depth column chain
+    /// (`a.x -> b.x, a.x -> c.x, b.x -> d.x, c.x -> e.x, d.x -> f.x`), true
+    /// BFS visits `[b, c, d, e, f]` -- `e` (2 hops via the shorter `c`
+    /// branch) before `f` (3 hops via the longer `b -> d` branch) is
+    /// exactly what a depth-first/stack-based walk would get wrong.
+    #[test]
+    fn downstream_column_order_is_genuinely_breadth_first() {
+        let project = ParsedProject {
+            nodes: vec![
+                node_with_columns("model.p.a", &["x"]),
+                node_with_columns("model.p.b", &["x"]),
+                node_with_columns("model.p.c", &["x"]),
+                node_with_columns("model.p.d", &["x"]),
+                node_with_columns("model.p.e", &["x"]),
+                node_with_columns("model.p.f", &["x"]),
+            ],
+            origins: Vec::new(),
+            edges: vec![
+                column_edge("model.p.a", "x", "model.p.b", "x"),
+                column_edge("model.p.a", "x", "model.p.c", "x"),
+                column_edge("model.p.b", "x", "model.p.d", "x"),
+                column_edge("model.p.c", "x", "model.p.e", "x"),
+                column_edge("model.p.d", "x", "model.p.f", "x"),
+            ],
+        };
+
+        let result =
+            trace_column(&project, "a", "x", Direction::Downstream).expect("a.x should exist");
+
+        assert_eq!(
+            result.downstream_columns,
+            vec![
+                ColumnRef {
+                    node: NodeId::new("model.p.b"),
+                    column: column("x")
+                },
+                ColumnRef {
+                    node: NodeId::new("model.p.c"),
+                    column: column("x")
+                },
+                ColumnRef {
+                    node: NodeId::new("model.p.d"),
+                    column: column("x")
+                },
+                ColumnRef {
+                    node: NodeId::new("model.p.e"),
+                    column: column("x")
+                },
+                ColumnRef {
+                    node: NodeId::new("model.p.f"),
+                    column: column("x")
+                },
+            ]
+        );
+    }
 }
