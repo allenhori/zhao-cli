@@ -51,13 +51,21 @@ impl LineageArgs {
     /// [`zhao_core::lineage::Direction`], per dbt's own `+`-prefix/suffix
     /// selector convention.
     pub fn parse_target(&self) -> (&str, zhao_core::lineage::Direction) {
-        if let Some(name) = self.target.strip_prefix('+') {
-            (name, zhao_core::lineage::Direction::Upstream)
-        } else if let Some(name) = self.target.strip_suffix('+') {
-            (name, zhao_core::lineage::Direction::Downstream)
-        } else {
-            (self.target.as_str(), zhao_core::lineage::Direction::Both)
-        }
+        let has_prefix = self.target.starts_with('+');
+        let after_prefix = self.target.strip_prefix('+').unwrap_or(&self.target);
+        let has_suffix = after_prefix.ends_with('+');
+        let name = after_prefix.strip_suffix('+').unwrap_or(after_prefix);
+
+        // `+target+` (both sides) means both directions in dbt's own
+        // selector syntax too, same as a bare target -- handled
+        // explicitly here rather than falling out of checking the prefix
+        // alone and leaving a trailing `+` stuck to the name.
+        let direction = match (has_prefix, has_suffix) {
+            (true, true) | (false, false) => zhao_core::lineage::Direction::Both,
+            (true, false) => zhao_core::lineage::Direction::Upstream,
+            (false, true) => zhao_core::lineage::Direction::Downstream,
+        };
+        (name, direction)
     }
 }
 
@@ -194,5 +202,16 @@ mod tests {
         let (name, direction) = a.parse_target();
         assert_eq!(name, "dim_customers");
         assert_eq!(direction, Direction::Downstream);
+    }
+
+    /// `+target+` (both sides), same as dbt's own selector syntax, means
+    /// both directions -- same as a bare target, and critically not a
+    /// garbled name with a stray trailing `+` still attached.
+    #[test]
+    fn a_plus_prefix_and_suffix_together_parses_as_both_directions() {
+        let a = args("+dim_customers+");
+        let (name, direction) = a.parse_target();
+        assert_eq!(name, "dim_customers");
+        assert_eq!(direction, Direction::Both);
     }
 }

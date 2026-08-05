@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use zhao_core::adapters::TransformationToolAdapter;
 use zhao_core::adapters::dbt::DbtAdapter;
-use zhao_core::lineage::{Direction, LineageError, LineageResult, trace};
+use zhao_core::lineage::{Direction, LineageResult, trace};
 
 use crate::cli::LineageArgs;
 
@@ -34,9 +34,11 @@ pub fn run(args: &LineageArgs) -> ExitCode {
     let (target_name, direction) = args.parse_target();
     let result = match trace(&project, target_name, direction) {
         Ok(result) => result,
-        Err(LineageError::UnknownTarget { name }) => {
-            return fail(&format!("no model named {name:?} was found in the project"));
-        }
+        // `LineageError`'s own `Display` (via thiserror) already gives a
+        // clear, actionable message for every variant -- `UnknownTarget`
+        // and `AmbiguousTarget` alike -- so there's no need to
+        // re-derive it per variant here.
+        Err(err) => return fail(&err.to_string()),
     };
 
     print!(

@@ -6,7 +6,7 @@
 //! Column-level lineage (a later capability) is out of scope here; this
 //! module only ever answers at the whole-Node level.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use crate::model::{NodeId, OriginId, ParsedProject, Upstream};
 
@@ -31,6 +31,23 @@ pub enum LineageError {
     UnknownTarget {
         /// The name that couldn't be resolved.
         name: String,
+    },
+    /// `target_name` matches more than one Node's bare name -- e.g. two
+    /// same-named models in different dbt packages. Rather than silently
+    /// picking whichever one happened to appear first in the project's
+    /// Node list (an arbitrary, undocumented tiebreak a user could never
+    /// predict), this is treated the same as an unresolvable target:
+    /// the caller must disambiguate, e.g. by package-qualifying the name.
+    #[error(
+        "{name:?} matches more than one model in the project ({ids:?}) -- disambiguate by \
+         package"
+    )]
+    AmbiguousTarget {
+        /// The name that matched more than one Node.
+        name: String,
+        /// Every Node's full ID the name matched, for the user to choose
+        /// from.
+        ids: Vec<String>,
     },
 }
 
@@ -61,13 +78,25 @@ pub fn trace(
     target_name: &str,
     direction: Direction,
 ) -> Result<LineageResult, LineageError> {
-    let target = project
+    let matches: Vec<&crate::model::Node> = project
         .nodes
         .iter()
-        .find(|node| node.name == target_name)
-        .ok_or_else(|| LineageError::UnknownTarget {
-            name: target_name.to_string(),
-        })?;
+        .filter(|node| node.name == target_name)
+        .collect();
+    let target = match matches.as_slice() {
+        [] => {
+            return Err(LineageError::UnknownTarget {
+                name: target_name.to_string(),
+            });
+        }
+        [only] => *only,
+        multiple => {
+            return Err(LineageError::AmbiguousTarget {
+                name: target_name.to_string(),
+                ids: multiple.iter().map(|node| node.id.to_string()).collect(),
+            });
+        }
+    };
 
     let mut result = LineageResult::default();
     if matches!(direction, Direction::Upstream | Direction::Both) {
@@ -93,9 +122,9 @@ fn walk_upstream(project: &ParsedProject, start: &NodeId) -> (Vec<NodeId>, Vec<O
     let mut visited_origins: HashSet<OriginId> = HashSet::new();
     let mut nodes = Vec::new();
     let mut origins = Vec::new();
-    let mut frontier = vec![start.clone()];
+    let mut frontier: VecDeque<NodeId> = VecDeque::from([start.clone()]);
 
-    while let Some(current) = frontier.pop() {
+    while let Some(current) = frontier.pop_front() {
         for edge in &project.edges {
             if edge.downstream != current {
                 continue;
@@ -104,7 +133,7 @@ fn walk_upstream(project: &ParsedProject, start: &NodeId) -> (Vec<NodeId>, Vec<O
                 Upstream::Node(id) => {
                     if visited_nodes.insert(id.clone()) {
                         nodes.push(id.clone());
-                        frontier.push(id.clone());
+                        frontier.push_back(id.clone());
                     }
                 }
                 Upstream::Origin(id) => {
@@ -125,9 +154,9 @@ fn walk_upstream(project: &ParsedProject, start: &NodeId) -> (Vec<NodeId>, Vec<O
 fn walk_downstream(project: &ParsedProject, start: &NodeId) -> Vec<NodeId> {
     let mut visited: HashSet<NodeId> = HashSet::from([start.clone()]);
     let mut nodes = Vec::new();
-    let mut frontier = vec![start.clone()];
+    let mut frontier: VecDeque<NodeId> = VecDeque::from([start.clone()]);
 
-    while let Some(current) = frontier.pop() {
+    while let Some(current) = frontier.pop_front() {
         for edge in &project.edges {
             let Upstream::Node(upstream_id) = &edge.upstream else {
                 continue;
@@ -137,7 +166,7 @@ fn walk_downstream(project: &ParsedProject, start: &NodeId) -> Vec<NodeId> {
             }
             if visited.insert(edge.downstream.clone()) {
                 nodes.push(edge.downstream.clone());
-                frontier.push(edge.downstream.clone());
+                frontier.push_back(edge.downstream.clone());
             }
         }
     }
@@ -279,5 +308,67 @@ mod tests {
         let result = trace(&project, "isolated", Direction::Both).expect("isolated should exist");
 
         assert_eq!(result, LineageResult::default());
+    }
+
+    /// Two Nodes in different packages sharing the same bare name must
+    /// produce a clear, actionable error -- never a silent, arbitrary
+    /// pick of whichever one happens to appear first in the project's
+    /// Node list.
+    #[test]
+    fn a_name_matching_more_than_one_node_produces_a_clear_error() {
+        let mut project = diamond_project();
+        // A same-named model in a different package.
+        project.nodes.push(node("model.other_package.a"));
+
+        let result = trace(&project, "a", Direction::Both);
+
+        assert_eq!(
+            result,
+            Err(LineageError::AmbiguousTarget {
+                name: "a".to_string(),
+                ids: vec!["model.p.a".to_string(), "model.other_package.a".to_string()],
+            })
+        );
+    }
+
+    /// Direct evidence of true breadth-first order (not just "some
+    /// deterministic order that happens to work"): on an asymmetric-depth
+    /// graph (`a -> b, a -> c, b -> d, c -> e, d -> f`), BFS visits
+    /// `[b, c, d, e, f]` -- `e` (2 hops via the shorter `c` branch) before
+    /// `f` (3 hops via the longer `b -> d` branch) is exactly the
+    /// distinction a depth-first/stack-based walk would get wrong.
+    #[test]
+    fn downstream_order_is_genuinely_breadth_first() {
+        let project = ParsedProject {
+            nodes: vec![
+                node("model.p.a"),
+                node("model.p.b"),
+                node("model.p.c"),
+                node("model.p.d"),
+                node("model.p.e"),
+                node("model.p.f"),
+            ],
+            origins: Vec::new(),
+            edges: vec![
+                node_edge("model.p.a", "model.p.b"),
+                node_edge("model.p.a", "model.p.c"),
+                node_edge("model.p.b", "model.p.d"),
+                node_edge("model.p.c", "model.p.e"),
+                node_edge("model.p.d", "model.p.f"),
+            ],
+        };
+
+        let result = trace(&project, "a", Direction::Downstream).expect("a should exist");
+
+        assert_eq!(
+            result.downstream_nodes,
+            vec![
+                NodeId::new("model.p.b"),
+                NodeId::new("model.p.c"),
+                NodeId::new("model.p.d"),
+                NodeId::new("model.p.e"),
+                NodeId::new("model.p.f"),
+            ]
+        );
     }
 }
