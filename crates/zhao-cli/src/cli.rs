@@ -167,6 +167,23 @@ pub struct CheckArgs {
     /// doesn't yet support checking against.
     #[arg(long = "check-relations")]
     pub check_relations: bool,
+
+    /// The name of the dbt target the `--defer` plan should defer to
+    /// (e.g. `"prod"`) -- purely a human-readable label shown alongside
+    /// the generated command, not passed to dbt as `--target`. Overrides
+    /// `zhao.yml`'s `defer.target` when given. Has no effect unless a
+    /// state path is also available (from `--defer-state` or
+    /// `zhao.yml`'s `defer.state`).
+    #[arg(long = "defer-target")]
+    pub defer_target: Option<String>,
+
+    /// The path to a compiled manifest to defer to -- when set (here or
+    /// via `zhao.yml`'s `defer.state`), the report's `--defer` plan
+    /// includes a ready-to-run `dbt ... --defer --state <path>` command
+    /// alongside the plan's build/defer Node lists, not just the lists
+    /// themselves. Overrides `zhao.yml`'s `defer.state` when given.
+    #[arg(long = "defer-state")]
+    pub defer_state: Option<PathBuf>,
 }
 
 impl CheckArgs {

@@ -67,11 +67,15 @@ impl Preset {
 }
 
 /// zhao's project configuration: a [`Preset`] plus any per-Rule
-/// [`Severity`] overrides layered on top.
+/// [`Severity`] overrides layered on top, plus the `--defer` target/state
+/// zhao's ready-to-run `--defer --state <path>` command generation needs
+/// (see [`Config::defer_target`]/[`Config::defer_state`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     preset: Preset,
     overrides: HashMap<RuleId, Severity>,
+    defer_target: Option<String>,
+    defer_state: Option<String>,
 }
 
 impl Default for Config {
@@ -79,6 +83,8 @@ impl Default for Config {
         Self {
             preset: Preset::Default,
             overrides: HashMap::new(),
+            defer_target: None,
+            defer_state: None,
         }
     }
 }
@@ -91,6 +97,26 @@ impl Config {
             .get(&rule)
             .copied()
             .unwrap_or_else(|| self.preset.severity_for(rule))
+    }
+
+    /// The configured name of the dbt target being deferred to (e.g.
+    /// `"prod"`), if any -- purely a human-readable label surfaced
+    /// alongside the generated `--defer` command, not itself passed as a
+    /// `--target` flag (dbt's `--defer` mechanism only needs
+    /// [`Config::defer_state`]'s path; this just documents what that
+    /// path represents). `None` if `zhao.yml` sets no `defer.target` at
+    /// any level of the cascade.
+    pub fn defer_target(&self) -> Option<&str> {
+        self.defer_target.as_deref()
+    }
+
+    /// The configured path to a compiled manifest to defer to, passed as
+    /// `dbt ... --defer --state <path>` in the generated command. `None`
+    /// if `zhao.yml` sets no `defer.state` at any level of the cascade
+    /// (in which case no ready-to-run `--defer` command is generated at
+    /// all -- that's a `zhao-cli`-side decision, not this crate's).
+    pub fn defer_state(&self) -> Option<&str> {
+        self.defer_state.as_deref()
     }
 
     /// Loads a single `zhao.yml` from the given path. Returns
@@ -156,6 +182,8 @@ fn ancestor_dirs_from_repo_root(start: &Path) -> Vec<PathBuf> {
 struct ConfigLayer {
     preset: Option<Preset>,
     overrides: HashMap<RuleId, Severity>,
+    defer_target: Option<String>,
+    defer_state: Option<String>,
 }
 
 impl ConfigLayer {
@@ -188,6 +216,8 @@ impl ConfigLayer {
         ConfigLayer {
             preset: self.preset.or(base.preset),
             overrides,
+            defer_target: self.defer_target.or(base.defer_target),
+            defer_state: self.defer_state.or(base.defer_state),
         }
     }
 
@@ -195,6 +225,8 @@ impl ConfigLayer {
         Config {
             preset: self.preset.unwrap_or_default(),
             overrides: self.overrides,
+            defer_target: self.defer_target,
+            defer_state: self.defer_state,
         }
     }
 }
@@ -216,6 +248,18 @@ struct RawConfig {
     preset: Option<String>,
     #[serde(default)]
     rules: HashMap<String, String>,
+    #[serde(default)]
+    defer: Option<RawDeferConfig>,
+}
+
+/// The `defer:` section of `zhao.yml` -- see
+/// [`Config::defer_target`]/[`Config::defer_state`].
+#[derive(Debug, Default, Deserialize)]
+struct RawDeferConfig {
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
 }
 
 impl RawConfig {
@@ -249,7 +293,17 @@ impl RawConfig {
             overrides.insert(rule, severity);
         }
 
-        Ok(ConfigLayer { preset, overrides })
+        let (defer_target, defer_state) = match self.defer {
+            None => (None, None),
+            Some(defer) => (defer.target, defer.state),
+        };
+
+        Ok(ConfigLayer {
+            preset,
+            overrides,
+            defer_target,
+            defer_state,
+        })
     }
 }
 
@@ -591,5 +645,57 @@ mod tests {
             config.severity_for(RuleId::ColumnRemovedWithActiveReferences),
             Severity::Warn
         );
+    }
+
+    #[test]
+    fn missing_defer_section_leaves_both_fields_unset() {
+        let config = Config::load(Path::new("/nonexistent/zhao.yml")).expect("should be ok");
+        assert_eq!(config.defer_target(), None);
+        assert_eq!(config.defer_state(), None);
+    }
+
+    #[test]
+    fn defer_target_and_state_are_read_from_zhao_yml() {
+        let file =
+            write_temp_yaml("defer:\n  target: prod\n  state: artifacts/prod/manifest.json\n");
+        let config = Config::load(file.path()).expect("should parse");
+
+        assert_eq!(config.defer_target(), Some("prod"));
+        assert_eq!(config.defer_state(), Some("artifacts/prod/manifest.json"));
+    }
+
+    #[test]
+    fn defer_section_can_set_only_one_of_target_or_state() {
+        let file = write_temp_yaml("defer:\n  state: artifacts/prod/manifest.json\n");
+        let config = Config::load(file.path()).expect("should parse");
+
+        assert_eq!(config.defer_target(), None);
+        assert_eq!(config.defer_state(), Some("artifacts/prod/manifest.json"));
+    }
+
+    #[test]
+    fn project_local_defer_config_wins_over_root_per_key() {
+        let repo = fake_repo();
+        fs::write(
+            repo.root.join("zhao.yml"),
+            "defer:\n  target: prod\n  state: artifacts/root/manifest.json\n",
+        )
+        .expect("should write root config");
+        fs::write(
+            repo.project_dir.join("zhao.yml"),
+            "defer:\n  state: artifacts/project/manifest.json\n",
+        )
+        .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        // Project-local wins for the key it sets.
+        assert_eq!(
+            config.defer_state(),
+            Some("artifacts/project/manifest.json")
+        );
+        // Root's value still applies for the key the project-local file
+        // doesn't touch.
+        assert_eq!(config.defer_target(), Some("prod"));
     }
 }
