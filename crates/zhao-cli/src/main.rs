@@ -10,6 +10,7 @@ mod check;
 mod cli;
 mod diff;
 mod engine;
+mod lineage;
 mod metadata;
 mod report;
 
@@ -25,5 +26,6 @@ fn main() -> ExitCode {
     match &cli.command {
         Command::Check(args) => check::run(args),
         Command::Diff(args) => diff::run(args),
+        Command::Lineage(args) => lineage::run(args),
     }
 }
