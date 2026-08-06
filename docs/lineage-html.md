@@ -32,6 +32,16 @@ Pass `--html <path>` to write to an explicit path instead:
 zhao lineage --html lineage.html            # the whole project, at an explicit path
 ```
 
+## `target/zhao/full_lineage.json`
+
+Every `zhao lineage` invocation -- any target, `--text` or not -- also writes a standalone
+`target/zhao/full_lineage.json`, unconditionally: the whole project's lineage graph (every
+Node, Origin, and model-/column-level edge) as plain JSON, meant to be read directly by other
+tooling rather than scraped out of an HTML export. It's always the *whole* project's graph,
+never a per-target variant -- a target only changes what an HTML export renders/pre-selects by
+default, never what this file contains. One canonical file, overwritten every run, same
+"unconditional machine-readable output" precedent as `target/zhao/run-metadata.json`.
+
 **[Live demo](assets/lineage-demo.html)** — an actual export from a small fixture project,
 committed in this repo. Open it in your browser to try the real thing rather than take our
 word for what it does.

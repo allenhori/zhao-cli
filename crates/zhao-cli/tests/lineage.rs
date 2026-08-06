@@ -866,3 +866,200 @@ fn an_explicit_html_path_overrides_the_computed_default() {
 
     assert!(out.exists(), "expected {} to exist", out.display());
 }
+
+// ---------------------------------------------------------------------
+// `target/zhao/full_lineage.json` -- always written, whole project
+// (issue #39).
+// ---------------------------------------------------------------------
+
+fn copy_manifest_into(project_dir: &std::path::Path, source_fixture: &str) {
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture(source_fixture).join("target").join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy manifest");
+}
+
+/// Acceptance criterion: every invocation writes/overwrites
+/// `target/zhao/full_lineage.json`, regardless of `--text`/default HTML.
+#[test]
+fn full_lineage_json_is_written_in_text_mode() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    copy_manifest_into(project_dir, "rules_project");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--text")
+        .arg("stg_customers")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let expected = project_dir
+        .join("target")
+        .join("zhao")
+        .join("full_lineage.json");
+    assert!(
+        expected.exists(),
+        "expected {} to exist",
+        expected.display()
+    );
+}
+
+/// Acceptance criterion: written regardless of a target being given at
+/// all, and its content is the whole project's graph either way -- not a
+/// per-target variant.
+#[test]
+fn full_lineage_json_content_is_independent_of_target_scoping() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    copy_manifest_into(project_dir, "rules_project");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("+stg_customers")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let path = project_dir
+        .join("target")
+        .join("zhao")
+        .join("full_lineage.json");
+    let scoped_json = std::fs::read_to_string(&path).expect("should read full_lineage.json");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let whole_project_json = std::fs::read_to_string(&path).expect("should read full_lineage.json");
+
+    // Compared as sets, not raw strings: `edges`' iteration order isn't
+    // guaranteed stable across separate process invocations (unrelated,
+    // pre-existing nondeterminism upstream in how the adapter builds the
+    // edge list) -- what #39 actually promises is the same *content*
+    // regardless of target, not the same byte-for-byte serialization.
+    fn as_sorted_json_strings(json: &str) -> (Vec<String>, Vec<String>) {
+        let value: serde_json::Value = serde_json::from_str(json).expect("should parse as JSON");
+        let mut nodes: Vec<String> = value["nodes"]
+            .as_array()
+            .expect("nodes should be an array")
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let mut edges: Vec<String> = value["edges"]
+            .as_array()
+            .expect("edges should be an array")
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        nodes.sort();
+        edges.sort();
+        (nodes, edges)
+    }
+
+    assert_eq!(
+        as_sorted_json_strings(&scoped_json),
+        as_sorted_json_strings(&whole_project_json),
+        "full_lineage.json must contain the same nodes/edges regardless of what target was requested"
+    );
+
+    for model in [
+        "model.zhao_dbt_test.stg_customers",
+        "model.zhao_dbt_test.stg_orders",
+        "model.zhao_dbt_test.stg_payments",
+        "model.zhao_dbt_test.dim_customers",
+        "model.zhao_dbt_test.fct_orders",
+        "model.zhao_dbt_test.fct_orders_incremental",
+    ] {
+        assert!(
+            whole_project_json.contains(model),
+            "{model} missing from full_lineage.json"
+        );
+    }
+}
+
+/// `full_lineage.json` is a genuinely separate file from whatever HTML
+/// export was requested -- not the same blob embedded in the HTML page's
+/// own JS.
+#[test]
+fn full_lineage_json_is_separate_from_the_html_export() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    copy_manifest_into(project_dir, "rules_project");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let json_path = project_dir
+        .join("target")
+        .join("zhao")
+        .join("full_lineage.json");
+    let html_path = project_dir
+        .join("target")
+        .join("zhao")
+        .join("lineage_graphs")
+        .join("full_lineage.html");
+
+    assert!(
+        json_path.exists(),
+        "expected {} to exist",
+        json_path.display()
+    );
+    assert!(
+        html_path.exists(),
+        "expected {} to exist",
+        html_path.display()
+    );
+
+    let json = std::fs::read_to_string(&json_path).expect("should read json");
+    // Genuinely valid, standalone JSON -- not merely a fragment cut out
+    // of the HTML page.
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("should parse as JSON");
+    assert!(parsed.get("nodes").is_some());
+    assert!(parsed.get("edges").is_some());
+}
+
+/// Written even when the requested target fails to resolve -- it's
+/// target-independent, so there's no reason to withhold it just because
+/// what was asked for on top of it failed.
+#[test]
+fn full_lineage_json_is_written_even_when_the_target_fails_to_resolve() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    copy_manifest_into(project_dir, "rules_project");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("does_not_exist")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(2);
+
+    let expected = project_dir
+        .join("target")
+        .join("zhao")
+        .join("full_lineage.json");
+    assert!(
+        expected.exists(),
+        "expected {} to exist even on a failed target resolution",
+        expected.display()
+    );
+}

@@ -38,10 +38,38 @@ pub fn run(args: &LineageArgs) -> ExitCode {
         Err(err) => return fail(&format!("{}: {err}", manifest_path.display())),
     };
 
+    // Unconditional, target-independent -- always the whole project's
+    // graph, written before any target resolution/validation below (it
+    // doesn't depend on the target at all, so there's no reason to gate
+    // it behind a successful resolution). Same "unconditional
+    // machine-readable output" precedent as `run-metadata.json`. See
+    // issue #39.
+    if let Err(err) = write_full_lineage_json(&args.project_dir, &project) {
+        return fail(&err);
+    }
+
     if args.text {
         return run_text(args, &project);
     }
     run_html(args, &project)
+}
+
+/// Writes `<project_dir>/target/zhao/full_lineage.json`: a direct
+/// serialization of the whole project's lineage graph (every Node,
+/// Origin, model-/column-level edge), independent of whatever
+/// `--text`/`--html`/target was requested -- see issue #39. Overwritten
+/// on every run, no flag to turn it off.
+fn write_full_lineage_json(
+    project_dir: &Path,
+    project: &zhao_core::model::ParsedProject,
+) -> Result<(), String> {
+    let dir = project_dir.join("target").join("zhao");
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
+
+    let path = dir.join("full_lineage.json");
+    let json = crate::lineage_html::graph_data_json(project, DbtAdapter.vocabulary());
+    std::fs::write(&path, json).map_err(|err| format!("could not write {}: {err}", path.display()))
 }
 
 /// zhao's default filenaming scheme for `zhao lineage`'s HTML export,
