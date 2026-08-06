@@ -22,6 +22,22 @@ shell-words = "1.1.1"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 zhao-core = { path = "../zhao-core" }
+# `zhao update` (issue #28) is the one deliberate exception to "zhao never
+# makes a network call" -- see README's "What it doesn't do" section.
+# `ureq`'s blocking, no-async-runtime API keeps that exception's footprint
+# small rather than pulling in a full async HTTP stack for one command.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+# `zhao update`'s release archive is `.tar.gz` on macOS/Linux, `.zip` on
+# Windows -- each build only ever needs to extract *its own* platform's
+# archive format, so these are per-target dependencies rather than pulling
+# both extractors into every binary.
+[target.'cfg(not(windows))'.dependencies]
+flate2 = "1.1"
+tar = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

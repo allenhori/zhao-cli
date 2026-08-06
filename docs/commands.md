@@ -134,3 +134,23 @@ stdout; it's a mirror, not a redirect.
 | `--log-level <mirror\|debug>` | `mirror` | Accepted and parsed (see [Configuring `log`](configuration.md#log)) but not yet wired to anything — the run log has no `debug`-level content defined yet for either this or `zhao.yml`'s `log.level` to switch to. Reserved so a later ticket adding real debug-level content doesn't need another config-shape change. |
 
 No purge/retention logic yet — `target/zhao/logs/` accumulates indefinitely by default.
+
+## `zhao update`
+
+Replaces the currently running `zhao` binary in place with a release fetched from
+[GitHub Releases](https://github.com/allenhori/zhao-cli/releases) — the one zhao command that
+makes a network call at all (see [What it doesn't do](../README.md#what-it-doesnt-do)).
+
+```bash
+zhao update              # the latest stable release
+zhao update --nightly    # the current nightly build
+zhao update v0.1.1       # pinned to an exact release tag
+```
+
+Kept deliberately simple: updates by release tag, not a semver-range resolver. `VERSION` and
+`--nightly` are mutually exclusive.
+
+**Exit codes**: `0` the binary was replaced; `2` couldn't run (unsupported platform, the tag/
+release doesn't exist, a download or extraction failure, ...). A failure at any point before the
+final replace leaves the existing binary completely untouched — never a broken or partial
+binary in place. Run `zhao --version` afterward to confirm the update actually took effect.
