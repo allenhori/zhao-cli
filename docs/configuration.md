@@ -81,6 +81,22 @@ Saves passing `--against main` on every invocation just because your default bra
 called `master` (zhao's own built-in default). The CLI `--against` flag still overrides this
 when given; with neither set, zhao falls back to `master`.
 
+## `log`
+
+The verbosity of each run's entry in the daily-rotating run log (`target/zhao/logs/<date>.log`
+-- see [Command reference](commands.md#the-daily-run-log)):
+
+```yaml
+log:
+  level: mirror   # or: debug
+```
+
+`mirror` (the default) is a literal mirror of whatever was already printed to stdout. `debug`
+is accepted and parsed but not yet wired to anything -- there's no debug-level content defined
+yet for it to switch to; reserved so a later ticket adding real debug-level content doesn't need
+another config-shape change. A CLI `--log-level` flag exists on `check`/`diff`/`lineage` for the
+same reason, also not yet connected to anything.
+
 ## Monorepos: multiple dbt projects
 
 A root-level `zhao.yml` (at the nearest ancestor directory containing `.git`) acts as the

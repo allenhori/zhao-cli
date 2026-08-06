@@ -166,19 +166,25 @@ pub(crate) fn write_run_metadata(output: &EngineOutput, args: &CheckArgs) {
 /// Prints `report` in `args.format` -- JSON or the color-aware text
 /// report, per `args.no_color` and environment auto-detection.
 pub(crate) fn print_report(report: &Report, args: &CheckArgs) -> Result<(), String> {
-    match args.format {
+    // Built up first, then both printed and mirrored to the daily run
+    // log (issue #35) -- a literal mirror of what actually went to
+    // stdout, so it matches `println!`'s trailing newline in the JSON
+    // case too, not just the text case's own already-newline-terminated
+    // render.
+    let printed = match args.format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(report)
                 .map_err(|err| format!("could not serialize report as JSON: {err}"))?;
             println!("{json}");
+            format!("{json}\n")
         }
         OutputFormat::Text => {
-            print!(
-                "{}",
-                render_text(report, DbtAdapter.vocabulary(), use_color(args.no_color))
-            );
+            let text = render_text(report, DbtAdapter.vocabulary(), use_color(args.no_color));
+            print!("{text}");
+            text
         }
-    }
+    };
+    crate::log::mirror(&args.project_dir, &printed);
     Ok(())
 }
 

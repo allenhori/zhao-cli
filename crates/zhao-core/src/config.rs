@@ -66,10 +66,36 @@ impl Preset {
     }
 }
 
+/// `zhao.yml`'s `log.level` (and a CLI override) -- see issue #35. Both
+/// variants currently produce identical (mirror-only) run-log content;
+/// this exists so a later ticket can add real `Debug`-level content
+/// without another config-shape change, not because `Debug` does
+/// anything different yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogLevel {
+    /// A literal mirror of whatever was already printed to stdout --
+    /// the only content this ticket actually produces.
+    #[default]
+    Mirror,
+    /// Reserved for a later ticket's richer, internal-only content.
+    Debug,
+}
+
+impl LogLevel {
+    fn from_config_name(name: &str) -> Option<LogLevel> {
+        match name {
+            "mirror" => Some(LogLevel::Mirror),
+            "debug" => Some(LogLevel::Debug),
+            _ => None,
+        }
+    }
+}
+
 /// zhao's project configuration: a [`Preset`] plus any per-Rule
 /// [`Severity`] overrides layered on top, plus the `--defer` target/state
 /// zhao's ready-to-run `--defer --state <path>` command generation needs
-/// (see [`Config::defer_target`]/[`Config::defer_state`]).
+/// (see [`Config::defer_target`]/[`Config::defer_state`]), plus the run
+/// log's configured verbosity (see [`Config::log_level`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     preset: Preset,
@@ -77,6 +103,7 @@ pub struct Config {
     defer_target: Option<String>,
     defer_state: Option<String>,
     against: Option<String>,
+    log_level: LogLevel,
 }
 
 impl Default for Config {
@@ -87,6 +114,7 @@ impl Default for Config {
             defer_target: None,
             defer_state: None,
             against: None,
+            log_level: LogLevel::default(),
         }
     }
 }
@@ -128,6 +156,13 @@ impl Config {
     /// this nor a CLI override is given.
     pub fn against(&self) -> Option<&str> {
         self.against.as_deref()
+    }
+
+    /// The configured run-log verbosity (see [`LogLevel`]) -- defaults to
+    /// [`LogLevel::Mirror`] if `zhao.yml` sets no `log.level` at any level
+    /// of the cascade.
+    pub fn log_level(&self) -> LogLevel {
+        self.log_level
     }
 
     /// Loads a single `zhao.yml` from the given path. Returns
@@ -196,6 +231,7 @@ struct ConfigLayer {
     defer_target: Option<String>,
     defer_state: Option<String>,
     against: Option<String>,
+    log_level: Option<LogLevel>,
 }
 
 impl ConfigLayer {
@@ -231,6 +267,7 @@ impl ConfigLayer {
             defer_target: self.defer_target.or(base.defer_target),
             defer_state: self.defer_state.or(base.defer_state),
             against: self.against.or(base.against),
+            log_level: self.log_level.or(base.log_level),
         }
     }
 
@@ -241,6 +278,7 @@ impl ConfigLayer {
             defer_target: self.defer_target,
             defer_state: self.defer_state,
             against: self.against,
+            log_level: self.log_level.unwrap_or_default(),
         }
     }
 }
@@ -266,6 +304,15 @@ struct RawConfig {
     defer: Option<RawDeferConfig>,
     #[serde(default)]
     against: Option<String>,
+    #[serde(default)]
+    log: Option<RawLogConfig>,
+}
+
+/// The `log:` section of `zhao.yml` -- see [`Config::log_level`].
+#[derive(Debug, Default, Deserialize)]
+struct RawLogConfig {
+    #[serde(default)]
+    level: Option<String>,
 }
 
 /// The `defer:` section of `zhao.yml` -- see
@@ -314,12 +361,23 @@ impl RawConfig {
             Some(defer) => (defer.target, defer.state),
         };
 
+        let log_level = match self.log.and_then(|log| log.level) {
+            None => None,
+            Some(name) => Some(LogLevel::from_config_name(&name).ok_or_else(|| {
+                ConfigError::InvalidLogLevel {
+                    path: path.display().to_string(),
+                    value: name.clone(),
+                }
+            })?),
+        };
+
         Ok(ConfigLayer {
             preset,
             overrides,
             defer_target,
             defer_state,
             against: self.against,
+            log_level,
         })
     }
 }
@@ -373,6 +431,14 @@ pub enum ConfigError {
         /// The rule the invalid severity was assigned to.
         rule: String,
         /// The unrecognized severity value.
+        value: String,
+    },
+    /// `log.level` isn't a value zhao recognizes.
+    #[error("{path}: log.level {value:?} is not valid (expected one of: mirror, debug)")]
+    InvalidLogLevel {
+        /// The file the invalid log level was declared in.
+        path: String,
+        /// The unrecognized log level value.
         value: String,
     },
 }
@@ -461,6 +527,28 @@ mod tests {
         let result = Config::load(file.path());
 
         assert!(matches!(result, Err(ConfigError::UnknownPreset { .. })));
+    }
+
+    /// Issue #35's acceptance criterion: `zhao.yml`'s `log.level` key is
+    /// accepted and parsed. Defaults to `Mirror` when unset.
+    #[test]
+    fn log_level_defaults_to_mirror_when_unset() {
+        let config = Config::load(Path::new("/nonexistent/zhao.yml")).expect("should be ok");
+        assert_eq!(config.log_level(), LogLevel::Mirror);
+    }
+
+    #[test]
+    fn log_level_debug_is_parsed_from_zhao_yml() {
+        let file = write_temp_yaml("log:\n  level: debug\n");
+        let config = Config::load(file.path()).expect("should parse");
+        assert_eq!(config.log_level(), LogLevel::Debug);
+    }
+
+    #[test]
+    fn an_unrecognized_log_level_produces_a_clear_error() {
+        let file = write_temp_yaml("log:\n  level: verbose\n");
+        let result = Config::load(file.path());
+        assert!(matches!(result, Err(ConfigError::InvalidLogLevel { .. })));
     }
 
     #[test]

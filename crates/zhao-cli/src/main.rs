@@ -12,6 +12,7 @@ mod diff;
 mod engine;
 mod lineage;
 mod lineage_html;
+mod log;
 mod metadata;
 mod report;
 
