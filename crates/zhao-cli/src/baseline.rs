@@ -88,15 +88,37 @@ pub fn resolve(
     if worktree_project_dir.join("packages.yml").exists()
         || worktree_project_dir.join("dependencies.yml").exists()
     {
-        DbtAdapter.deps(&worktree_project_dir, "dbt", extra_args)?;
+        crate::log::log_dbt_result(
+            "deps",
+            &worktree_project_dir,
+            project_dir,
+            DbtAdapter.deps(&worktree_project_dir, "dbt", extra_args),
+        )?;
     }
-    DbtAdapter.compile(&worktree_project_dir, "dbt", extra_args)?;
+    crate::log::log_dbt_result(
+        "compile",
+        &worktree_project_dir,
+        project_dir,
+        DbtAdapter.compile(&worktree_project_dir, "dbt", extra_args),
+    )?;
 
     let manifest_path = worktree_project_dir.join("target").join("manifest.json");
     capture_baseline_manifest(&manifest_path, project_dir);
     Ok(DbtAdapter.parse(&manifest_path)?)
 }
 
+/// Routes a `dbt compile`/`dbt deps` subcommand's captured stdout/stderr
+/// into `real_project_dir`'s daily run log -- both a successful run's
+/// output (previously discarded entirely) and a failing one's (already
+/// captured on the error, for #30's terminal error message; this adds
+/// the same content to the log for post-hoc inspection too) -- then
+/// passes the `Result` straight through unchanged. See issue #36.
+///
+/// `worktree_project_dir` is where the subcommand actually ran (the
+/// temporary git worktree, gone by the time anyone reads the log --
+/// recorded in the log entry for context regardless);
+/// `real_project_dir` is where the log itself lives, same as every
+/// other `target/zhao/` artifact `resolve` produces.
 /// Copies `manifest_path` (the just-compiled Baseline's manifest, still
 /// inside the temporary worktree at this point) to
 /// `<project_dir>/target/zhao/baseline_manifest.json`. See [`resolve`]'s

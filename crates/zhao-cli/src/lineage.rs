@@ -27,7 +27,16 @@ const EXIT_ERROR: u8 = 2;
 /// Runs `zhao lineage` and returns the process exit code.
 pub fn run(args: &LineageArgs) -> ExitCode {
     if args.compile {
-        if let Err(err) = DbtAdapter.compile(&args.project_dir, "dbt", &[]) {
+        // `dbt_project_dir` and `real_project_dir` are the same path
+        // here -- unlike `baseline::resolve`'s git-native Baseline
+        // compile (which runs in a throwaway worktree), `--compile`
+        // runs directly in the real project directory. See issue #36.
+        if let Err(err) = crate::log::log_dbt_result(
+            "compile",
+            &args.project_dir,
+            &args.project_dir,
+            DbtAdapter.compile(&args.project_dir, "dbt", &[]),
+        ) {
             return fail(&err.to_string());
         }
     }
