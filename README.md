@@ -47,7 +47,8 @@ Windows: grab `zhao-x86_64-pc-windows-msvc.zip` from the same page. Rust users:
 Two release channels: a tagged **stable** release (`v0.1.0`, ...) for anything you depend
 on, and a rolling **nightly** build off `master`, always available at the
 [`nightly` tag](https://github.com/allenhori/zhao-cli/releases/tag/nightly) — set
-`ZHAO_VERSION=nightly` before running the install script above to track it instead.
+`ZHAO_VERSION=nightly` before running the install script above to track it instead. See
+[RELEASING.md](RELEASING.md) for how the two channels work and how releases are cut.
 
 ## Quickstart
 
@@ -118,6 +119,7 @@ Full example and notes: **[docs/ci-integration.md](docs/ci-integration.md)**.
 - [CI integration](docs/ci-integration.md)
 - [Understanding lineage](docs/lineage-html.md)
 - [Architecture](ARCHITECTURE.md) — how the code is organized, for contributors
+- [Releasing](RELEASING.md) — how the stable/nightly channels work, for maintainers
 
 ## What it doesn't do
 
