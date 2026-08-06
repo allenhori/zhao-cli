@@ -52,10 +52,10 @@ safety.
    [the Actions run](https://github.com/allenhori/zhao-cli/actions/workflows/release.yml) and
    the [resulting release](https://github.com/allenhori/zhao-cli/releases) once it finishes.
 
-There's currently no automated gate stopping a `v*` tag from being pushed on a commit that
-hasn't actually passed CI -- see [Planned: branch protection](#planned-branch-protection-not-yet-configured)
-below. Until that's in place, cutting a release is a manual judgment call: only tag a commit
-you've confirmed is green.
+Since `master` now requires `ci.yml`'s checks and a PR review before anything merges (see
+[Branch protection](#branch-protection) below), every commit that could ever become a tagged
+release was already vetted before it landed -- there's no separate green-check judgment call
+left to make at tag time.
 
 ## Nightly
 
@@ -68,11 +68,19 @@ gh workflow run release.yml --ref master
 No action needed otherwise -- every day's build simply overwrites the previous nightly release
 and moves the `nightly` tag to `master`'s current tip.
 
-## Planned: branch protection (not yet configured)
+## Branch protection
 
-Tracked as a low-priority roadmap item, not yet acted on: GitHub branch protection on `master`
-(required `ci.yml` status checks before merge, required PR review, no direct pushes). Since a
-`v*` tag is normally cut from `master`'s tip, gating entry into `master` this way means every
-commit that could ever become a tagged release was already vetted before it landed -- without
-needing any check inside `release.yml` itself. Deliberately not enabled yet while the repo isn't
-open to outside contributions.
+`master` has GitHub branch protection configured:
+
+- `ci.yml`'s four status checks (Test, Clippy, Format, Docs) must pass, and the branch must be
+  up to date with `master` (`strict` mode), before a PR can merge.
+- At least one approving review is required.
+- No direct pushes, force-pushes, or deletions of `master`.
+
+Since a `v*` tag is normally cut from `master`'s tip, gating entry this way means every commit
+that could ever become a tagged release was already vetted before it landed -- without needing
+any check inside `release.yml` itself.
+
+Admins (currently just the sole maintainer) are exempt from these rules (`enforce_admins:
+false`) rather than bound by them with no override -- appropriate while the repo is
+solo-maintained; revisit once there's more than one collaborator with write access.
