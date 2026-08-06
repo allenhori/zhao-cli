@@ -1,6 +1,8 @@
-//! `zhao lineage --html`: a self-contained, interactive HTML lineage
-//! graph export. A local development convenience -- not intended to run
-//! in CI.
+//! `zhao lineage`'s HTML export (`generate`) and standalone graph JSON
+//! (`graph_data_json`, written unconditionally to
+//! `target/zhao/full_lineage.json` -- see issue #39, meant for other
+//! tooling to consume directly). The HTML export itself is a local
+//! development convenience -- not intended to run in CI.
 //!
 //! The whole graph (Nodes, Origins, model-level *and* column-level
 //! edges) is embedded as a single JSON blob inside the page; all
@@ -15,7 +17,9 @@
 //! Node one layer past its furthest upstream) -- actual pixel layout
 //! (including the taller per-column row layout when column detail is
 //! shown) is computed client-side in JS, since it depends on view-mode
-//! state a static export can't know ahead of time.
+//! state a static export can't know ahead of time. This layering still
+//! applies to `graph_data_json`'s output too, even though it has no
+//! page to lay out -- it's the same `GraphData` shape either way.
 
 use std::collections::HashMap;
 
@@ -89,16 +93,13 @@ struct GraphData {
     initial_column: Option<String>,
 }
 
-/// Generates the full HTML document. `initial_target`/`initial_column`
-/// (already-validated, full `NodeId` and bare column name strings) scope
-/// the page's initial view -- both `None` embeds the whole project with
-/// nothing pre-selected.
-pub fn generate(
-    project: &ParsedProject,
-    vocabulary: &dyn AdapterVocabulary,
-    initial_target: Option<NodeId>,
-    initial_column: Option<String>,
-) -> String {
+/// Builds the whole project's [`GraphData`] -- every Node/Origin/edge,
+/// laid out by [`compute_layers`] -- with no target scoping at all
+/// (`initial_target`/`initial_column` both `None`). Shared by both
+/// [`generate`] (which overlays a target on top, if one was given) and
+/// [`graph_data_json`] (the standalone `full_lineage.json` export, which
+/// is always the whole, unscoped graph -- see issue #39).
+fn build_graph_data(project: &ParsedProject, vocabulary: &dyn AdapterVocabulary) -> GraphData {
     let layers = compute_layers(project);
 
     // Grouped by layer purely to get a stable, deterministic ordering
@@ -165,17 +166,45 @@ pub fn generate(
         })
         .collect();
 
-    let data = GraphData {
+    GraphData {
         nodes,
         edges,
         node_term: vocabulary.node_term().to_string(),
         origin_term: vocabulary.origin_term().to_string(),
-        initial_target: initial_target.map(|id| id.to_string()),
-        initial_column,
-    };
+        initial_target: None,
+        initial_column: None,
+    }
+}
+
+/// Generates the full HTML document. `initial_target`/`initial_column`
+/// (already-validated, full `NodeId` and bare column name strings) scope
+/// the page's initial view -- both `None` embeds the whole project with
+/// nothing pre-selected.
+pub fn generate(
+    project: &ParsedProject,
+    vocabulary: &dyn AdapterVocabulary,
+    initial_target: Option<NodeId>,
+    initial_column: Option<String>,
+) -> String {
+    let mut data = build_graph_data(project, vocabulary);
+    data.initial_target = initial_target.map(|id| id.to_string());
+    data.initial_column = initial_column;
+
     let json = serde_json::to_string(&data).expect("graph data should always serialize");
 
     render_html(&json, vocabulary.node_term(), vocabulary.origin_term())
+}
+
+/// Serializes the whole project's lineage graph -- every Node, Origin,
+/// and model-/column-level edge, with no target scoping -- to a JSON
+/// string, for `zhao lineage`'s standalone `target/zhao/full_lineage.json`
+/// (issue #39). Not the same JSON embedded in an HTML export (that one's
+/// shaped for the page's own JS, and can carry `initial_target`/
+/// `initial_column`); this is a genuinely separate, always-whole-project
+/// artifact meant to be read directly.
+pub fn graph_data_json(project: &ParsedProject, vocabulary: &dyn AdapterVocabulary) -> String {
+    let data = build_graph_data(project, vocabulary);
+    serde_json::to_string(&data).expect("graph data should always serialize")
 }
 
 /// Longest-path layering: an Origin is always layer 0 (has no upstream
