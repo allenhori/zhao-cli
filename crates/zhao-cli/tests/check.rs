@@ -1427,7 +1427,7 @@ mod git_native_baseline {
             &rules_project_current_manifest_json(),
         );
 
-        Command::cargo_bin("zhao")
+        let output = Command::cargo_bin("zhao")
             .expect("binary should build")
             .env("PATH", path_with_stub_dbt_prepended(&stub_dir))
             .arg("check")
@@ -1437,6 +1437,12 @@ mod git_native_baseline {
             .arg("json")
             .output()
             .expect("command should run");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "expected exit 0 or 1, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         let captured_path = repo.path.join("target/zhao/baseline_manifest.json");
         assert!(
@@ -1462,7 +1468,7 @@ mod git_native_baseline {
             &rules_project_current_manifest_json(),
         );
 
-        Command::cargo_bin("zhao")
+        let output = Command::cargo_bin("zhao")
             .expect("binary should build")
             .arg("check")
             .arg("--project-dir")
@@ -1473,6 +1479,12 @@ mod git_native_baseline {
             .arg("json")
             .output()
             .expect("command should run");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "expected exit 0 or 1, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         let captured_path = repo.path.join("target/zhao/baseline_manifest.json");
         assert!(

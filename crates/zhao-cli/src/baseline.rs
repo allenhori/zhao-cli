@@ -110,10 +110,24 @@ fn capture_baseline_manifest(manifest_path: &Path, project_dir: &Path) {
         );
         return;
     }
+
+    // Written via a temp file in the same directory, then renamed into
+    // place -- the same atomic-write precedent `target/zhao/run-
+    // metadata.json` (`crate::metadata::write`) already follows, so a
+    // failure partway through (disk full, the process killed) can never
+    // leave a truncated/corrupt `baseline_manifest.json` overwriting a
+    // previously good one from an earlier run.
     let dest: PathBuf = dest_dir.join("baseline_manifest.json");
-    if let Err(err) = std::fs::copy(manifest_path, &dest) {
+    let write_result = (|| -> std::io::Result<()> {
+        let contents = std::fs::read(manifest_path)?;
+        let mut temp_file = tempfile::NamedTempFile::new_in(&dest_dir)?;
+        std::io::Write::write_all(&mut temp_file, &contents)?;
+        temp_file.persist(&dest).map_err(|err| err.error)?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
         eprintln!(
-            "warning: could not copy the baseline manifest to {}: {err}",
+            "warning: could not capture the baseline manifest to {}: {err}",
             dest.display()
         );
     }
