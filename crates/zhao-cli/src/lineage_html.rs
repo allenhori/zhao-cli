@@ -254,6 +254,7 @@ fn render_html(graph_data_json: &str, node_term: &str, origin_term: &str) -> Str
   </div>
   <div id="main">
     <div id="graph-scroll"><svg id="graph" xmlns="http://www.w3.org/2000/svg"></svg></div>
+    <div id="panel-resize-handle" title="Drag to resize"></div>
     <aside id="panel">
       <div id="panel-empty">Select a {node_term} or {origin_term} to inspect its lineage.</div>
       <div id="panel-content">
@@ -378,9 +379,18 @@ body {
 #graph-scroll { flex: 1; overflow: auto; }
 #graph { display: block; }
 
+/* Issue #33: a drag handle between the graph and the panel. `#panel`'s
+   width is set inline by JS on drag (see `initPanelResize`); this is
+   just the grab target and its hover/active affordance. */
+#panel-resize-handle {
+  width: 6px; flex-shrink: 0; cursor: col-resize; background: var(--border);
+  position: relative;
+}
+#panel-resize-handle:hover, #panel-resize-handle.resizing { background: var(--series-node); }
+
 #panel {
-  width: 300px; flex-shrink: 0; border-left: 1px solid var(--border); background: var(--surface-1);
-  padding: 20px; overflow: auto;
+  width: 300px; min-width: 220px; flex-shrink: 0; border-left: 1px solid var(--border);
+  background: var(--surface-1); padding: 20px; overflow: auto;
 }
 #panel-empty { color: var(--text-muted); font-size: 13px; line-height: 1.5; }
 #panel-content { display: none; }
@@ -439,6 +449,12 @@ body {
 .node-box .col-row:hover { fill: var(--surface-2); }
 .node-box .col-row.col-active { fill: var(--series-node-soft); }
 .node-box .col-row.col-active .col-label { fill: var(--series-node); font-weight: 600; }
+/* A lighter tint than `.col-active` -- the selected column's own row is
+   the strong highlight, connected columns reached by its upstream/
+   downstream trace (in *other* models) get this softer one, so the two
+   read as "selected" vs. "related to it" rather than identical. */
+.node-box .col-row.col-related { fill: var(--series-node-soft); opacity: 0.5; }
+.node-box .col-row.col-related .col-label { fill: var(--series-node); }
 .node-box .col-divider { stroke: var(--gridline); stroke-width: 1; }
 
 .edge { stroke: var(--gridline); stroke-width: 1.5; fill: none; transition: stroke 0.15s ease, stroke-width 0.15s ease, opacity 0.15s ease; }
@@ -587,6 +603,18 @@ const JS: &str = r#"
       edgeEls.push(path);
     }
 
+    // Every "id column" pair reached by the selected column's own
+    // upstream/downstream trace, in any model -- used below to give
+    // connected column rows a lighter highlight than the selected
+    // column's own `.col-active` row. Recomputed here (not cached on
+    // `currentColumnResult`) since `render()` can run before that panel
+    // state is updated -- see `selectColumn`.
+    const relatedColumnKeys = new Set();
+    if (selectedId && selectedColumn) {
+      const { up, down } = bfsColumn(selectedId, selectedColumn);
+      for (const r of [...up.resolved, ...down.resolved]) relatedColumnKeys.add(r.id + " " + r.column);
+    }
+
     nodeEls.clear();
     for (const n of data.nodes) {
       const p = layout.pos.get(n.id);
@@ -615,13 +643,19 @@ const JS: &str = r#"
           const rowY = p.y + HEADER_H + i * COL_ROW_H;
           const row = el("g", { class: "col-row-group" });
           const active = selectedId === n.id && selectedColumn === col.name;
+          // Lighter highlight for a column reached by the *selected*
+          // column's own upstream/downstream trace, in any other model --
+          // `relatedColumnKeys` is computed once per render() below, not
+          // per row. See issue #33's UX addition.
+          const related = !active && relatedColumnKeys.has(n.id + " " + col.name);
+          const rowClass = active ? " col-active" : related ? " col-related" : "";
           const rowRect = el("rect", {
-            class: "col-row" + (active ? " col-active" : ""), x: p.x, y: rowY, width: p.w, height: COL_ROW_H,
+            class: "col-row" + rowClass, x: p.x, y: rowY, width: p.w, height: COL_ROW_H,
           });
           rowRect.addEventListener("click", (ev) => { ev.stopPropagation(); selectNode(n.id); selectColumn(col.name); });
           row.appendChild(rowRect);
           const label = el("text", {
-            class: "col-label" + (active ? " col-active" : ""), x: p.x + 14, y: rowY + COL_ROW_H / 2 + 4,
+            class: "col-label" + rowClass, x: p.x + 14, y: rowY + COL_ROW_H / 2 + 4,
           });
           const suffix = col.expression ? " ƒ" : "";
           const budget = 24 - suffix.length;
@@ -936,6 +970,43 @@ const JS: &str = r#"
     applyHighlight();
   });
   document.getElementById("scope-expand-btn").addEventListener("click", expandToWholeProject);
+
+  // Issue #33: drag `#panel-resize-handle` to resize `#panel`. Clamped to
+  // [220, main width - 300] so neither extreme can crush the graph area
+  // to nothing or shrink the panel out of legibility -- `#panel` already
+  // has a CSS `min-width: 220px` as a second line of defense, but the
+  // clamp here keeps the handle's own drag feel consistent with that
+  // limit rather than fighting it.
+  (function initPanelResize() {
+    const handle = document.getElementById("panel-resize-handle");
+    const panel = document.getElementById("panel");
+    const mainEl = document.getElementById("main");
+    let dragging = false;
+    let startX = 0;
+    let startWidth = 0;
+
+    handle.addEventListener("mousedown", (ev) => {
+      dragging = true;
+      startX = ev.clientX;
+      startWidth = panel.getBoundingClientRect().width;
+      handle.classList.add("resizing");
+      document.body.style.userSelect = "none";
+      ev.preventDefault();
+    });
+    document.addEventListener("mousemove", (ev) => {
+      if (!dragging) return;
+      const delta = startX - ev.clientX; // dragging left (negative clientX delta) widens the panel
+      const maxWidth = Math.max(220, mainEl.getBoundingClientRect().width - 300);
+      const width = Math.min(maxWidth, Math.max(220, startWidth + delta));
+      panel.style.width = width + "px";
+    });
+    document.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove("resizing");
+      document.body.style.userSelect = "";
+    });
+  })();
   document.getElementById("show-columns").addEventListener("change", (ev) => {
     showColumns = ev.target.checked;
     render();
