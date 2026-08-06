@@ -5,7 +5,7 @@
 use std::process::ExitCode;
 
 use crate::cli::CheckArgs;
-use crate::engine::{build_report, fail, print_report, write_run_metadata};
+use crate::engine::{build_report, fail, print_report, purge_run_logs, write_run_metadata};
 
 /// Exit code for "no breaking Change found."
 const EXIT_PASS: u8 = 0;
@@ -22,6 +22,7 @@ pub fn run(args: &CheckArgs) -> ExitCode {
         return fail(&message);
     }
     write_run_metadata(&output, args);
+    purge_run_logs(args, output.log_retention_days);
 
     ExitCode::from(if output.report.is_breaking() {
         EXIT_BREAKING
