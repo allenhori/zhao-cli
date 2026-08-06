@@ -1415,6 +1415,84 @@ mod git_native_baseline {
         );
     }
 
+    /// After a git-native Baseline resolution, the Baseline's compiled
+    /// manifest is captured to `target/zhao/baseline_manifest.json` in
+    /// the *current* project directory (not the temporary worktree,
+    /// which has already been deleted by the time this file is checked).
+    #[test]
+    fn captures_the_baseline_manifest_after_git_native_resolution() {
+        let stub_dir = stub_dbt_dir();
+        let repo = repo_with_baseline_and_current(
+            &rules_baseline_manifest_json(),
+            &rules_project_current_manifest_json(),
+        );
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env("PATH", path_with_stub_dbt_prepended(&stub_dir))
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .arg("--format")
+            .arg("json")
+            .output()
+            .expect("command should run");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "expected exit 0 or 1, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let captured_path = repo.path.join("target/zhao/baseline_manifest.json");
+        assert!(
+            captured_path.exists(),
+            "expected {} to exist after a git-native Baseline run",
+            captured_path.display()
+        );
+        let captured =
+            std::fs::read_to_string(&captured_path).expect("should read captured manifest");
+        assert_eq!(
+            captured,
+            rules_baseline_manifest_json(),
+            "the captured file should match exactly what the Baseline actually compiled to"
+        );
+    }
+
+    /// `--state <path>` never compiles anything, so there's nothing to
+    /// capture -- no `baseline_manifest.json` should be written.
+    #[test]
+    fn state_flag_does_not_write_a_baseline_manifest_capture() {
+        let repo = repo_with_baseline_and_current(
+            &rules_baseline_manifest_json(),
+            &rules_project_current_manifest_json(),
+        );
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .arg("--state")
+            .arg(fixture("diff_baseline_manifest.json"))
+            .arg("--format")
+            .arg("json")
+            .output()
+            .expect("command should run");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "expected exit 0 or 1, got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let captured_path = repo.path.join("target/zhao/baseline_manifest.json");
+        assert!(
+            !captured_path.exists(),
+            "a --state run should never write baseline_manifest.json (nothing was compiled)"
+        );
+    }
+
     /// Acceptance criterion 3: a clear, actionable error (exit 2) when
     /// `dbt` isn't invokable. `PATH` is overridden to a directory holding
     /// only a `git` symlink -- deterministic regardless of whether a real

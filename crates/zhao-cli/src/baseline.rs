@@ -3,7 +3,7 @@
 //! compiles itself from the git-native merge-base commit, with no external
 //! artifact required.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use zhao_core::adapters::TransformationToolAdapter;
 use zhao_core::adapters::dbt::{DbtAdapter, DbtAdapterError};
@@ -44,6 +44,19 @@ pub enum BaselineError {
 /// package -- exactly the state a freshly checked-out worktree is in the
 /// first time. `extra_args` (from `--dbt-arg`/`--dbt-args`) are appended
 /// verbatim to both the `dbt deps` and `dbt compile` invocations.
+///
+/// Before the temporary worktree is torn down (it's removed the moment
+/// this function returns -- see [`git::Worktree`]'s own `Drop`), its
+/// compiled `target/manifest.json` is copied to
+/// `<project_dir>/target/zhao/baseline_manifest.json`, so what the
+/// Baseline actually compiled to is still inspectable afterward instead
+/// of vanishing along with the worktree. Best-effort: a failure to copy
+/// (permissions, a read-only `target/`, ...) is reported to stderr as a
+/// warning and never fails Baseline resolution itself -- the same
+/// "a sidecar artifact failing to write shouldn't fail the actual
+/// command" precedent `target/zhao/run-metadata.json` already follows.
+/// Only meaningful for this git-native path -- `--state <path>` returns
+/// above, before anything is compiled, so there's nothing to capture.
 pub fn resolve(
     state_path: Option<&Path>,
     project_dir: &Path,
@@ -80,5 +93,42 @@ pub fn resolve(
     DbtAdapter.compile(&worktree_project_dir, "dbt", extra_args)?;
 
     let manifest_path = worktree_project_dir.join("target").join("manifest.json");
+    capture_baseline_manifest(&manifest_path, project_dir);
     Ok(DbtAdapter.parse(&manifest_path)?)
+}
+
+/// Copies `manifest_path` (the just-compiled Baseline's manifest, still
+/// inside the temporary worktree at this point) to
+/// `<project_dir>/target/zhao/baseline_manifest.json`. See [`resolve`]'s
+/// own doc comment for why, and for the best-effort/non-fatal contract.
+fn capture_baseline_manifest(manifest_path: &Path, project_dir: &Path) {
+    let dest_dir = project_dir.join("target").join("zhao");
+    if let Err(err) = std::fs::create_dir_all(&dest_dir) {
+        eprintln!(
+            "warning: could not create {} to capture the baseline manifest: {err}",
+            dest_dir.display()
+        );
+        return;
+    }
+
+    // Written via a temp file in the same directory, then renamed into
+    // place -- the same atomic-write precedent `target/zhao/run-
+    // metadata.json` (`crate::metadata::write`) already follows, so a
+    // failure partway through (disk full, the process killed) can never
+    // leave a truncated/corrupt `baseline_manifest.json` overwriting a
+    // previously good one from an earlier run.
+    let dest: PathBuf = dest_dir.join("baseline_manifest.json");
+    let write_result = (|| -> std::io::Result<()> {
+        let contents = std::fs::read(manifest_path)?;
+        let mut temp_file = tempfile::NamedTempFile::new_in(&dest_dir)?;
+        std::io::Write::write_all(&mut temp_file, &contents)?;
+        temp_file.persist(&dest).map_err(|err| err.error)?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        eprintln!(
+            "warning: could not capture the baseline manifest to {}: {err}",
+            dest.display()
+        );
+    }
 }
