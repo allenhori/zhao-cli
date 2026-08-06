@@ -72,8 +72,13 @@ zhao lineage fct_orders            # opens with fct_orders selected
 zhao lineage fct_orders.amount     # opens at column grain
 ```
 
-You can still navigate anywhere else in the project after it opens — this only sets where it
-starts.
+For a large project, a targeted export also renders *only* the target's related subgraph by
+default (its full upstream + downstream transitive closure) rather than the whole DAG — a
+banner at the top says so, with a **Show whole project** button. The whole project's data is
+still fully embedded either way; expanding doesn't regenerate the file, and search still finds
+(and automatically expands to) anything outside the current view, so nothing is ever
+unreachable, just not rendered until you ask for it. A whole-project export (no target) has
+nothing to scope down from, so it always opens fully expanded.
 
 ## Getting a fresh export
 

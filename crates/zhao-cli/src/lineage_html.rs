@@ -248,8 +248,13 @@ fn render_html(graph_data_json: &str, node_term: &str, origin_term: &str) -> Str
       <span class="legend-item"><span class="legend-dot node"></span>{node_term}</span>
     </div>
   </header>
+  <div id="scope-banner">
+    <span id="scope-banner-text"></span>
+    <button id="scope-expand-btn" class="mini-btn" type="button">Show whole project</button>
+  </div>
   <div id="main">
     <div id="graph-scroll"><svg id="graph" xmlns="http://www.w3.org/2000/svg"></svg></div>
+    <div id="panel-resize-handle" title="Drag to resize"></div>
     <aside id="panel">
       <div id="panel-empty">Select a {node_term} or {origin_term} to inspect its lineage.</div>
       <div id="panel-content">
@@ -360,13 +365,32 @@ body {
 .legend-dot.node { background: var(--series-node); }
 .legend-dot.origin { background: var(--series-origin); }
 
+/* Hidden by default -- shown only when the initial view is scoped to a
+   target's related subgraph (issue #40); JS toggles `display` directly,
+   same convention `#panel-empty`/`#panel-content` already use. */
+#scope-banner {
+  display: none; align-items: center; gap: 12px;
+  padding: 8px 20px; background: var(--series-node-soft); border-bottom: 1px solid var(--border);
+  font-size: 13px; color: var(--text-secondary);
+}
+#scope-banner strong { color: var(--text-primary); }
+
 #main { flex: 1; display: flex; overflow: hidden; }
 #graph-scroll { flex: 1; overflow: auto; }
 #graph { display: block; }
 
+/* Issue #33: a drag handle between the graph and the panel. `#panel`'s
+   width is set inline by JS on drag (see `initPanelResize`); this is
+   just the grab target and its hover/active affordance. */
+#panel-resize-handle {
+  width: 6px; flex-shrink: 0; cursor: col-resize; background: var(--border);
+  position: relative;
+}
+#panel-resize-handle:hover, #panel-resize-handle.resizing { background: var(--series-node); }
+
 #panel {
-  width: 300px; flex-shrink: 0; border-left: 1px solid var(--border); background: var(--surface-1);
-  padding: 20px; overflow: auto;
+  width: 300px; min-width: 220px; flex-shrink: 0; border-left: 1px solid var(--border);
+  background: var(--surface-1); padding: 20px; overflow: auto;
 }
 #panel-empty { color: var(--text-muted); font-size: 13px; line-height: 1.5; }
 #panel-content { display: none; }
@@ -425,6 +449,12 @@ body {
 .node-box .col-row:hover { fill: var(--surface-2); }
 .node-box .col-row.col-active { fill: var(--series-node-soft); }
 .node-box .col-row.col-active .col-label { fill: var(--series-node); font-weight: 600; }
+/* A lighter tint than `.col-active` -- the selected column's own row is
+   the strong highlight, connected columns reached by its upstream/
+   downstream trace (in *other* models) get this softer one, so the two
+   read as "selected" vs. "related to it" rather than identical. */
+.node-box .col-row.col-related { fill: var(--series-node-soft); opacity: 0.5; }
+.node-box .col-row.col-related .col-label { fill: var(--series-node); }
 .node-box .col-divider { stroke: var(--gridline); stroke-width: 1; }
 
 .edge { stroke: var(--gridline); stroke-width: 1.5; fill: none; transition: stroke 0.15s ease, stroke-width 0.15s ease, opacity 0.15s ease; }
@@ -464,6 +494,13 @@ const JS: &str = r#"
   let selectedId = null;
   let selectedColumn = null;
   let layout = null; // Map<id, {x, y, w, h}>
+  // `null` means "whole project"; otherwise a Set of node/origin ids
+  // that `computeLayout`/`render` should treat as the only visible
+  // graph -- the initial-view scoping from issue #40. Set once at
+  // startup (to a target's related subgraph, if one was given) and
+  // cleared for good by `expandToWholeProject`; nothing else narrows it
+  // again for the rest of the page's life.
+  let visibleIds = null;
   // Column list order in the side panel: "source" (the model's final
   // `SELECT` order, the default), "az", or "za" -- cycled by the sort
   // button. The graph itself always renders columns in source order
@@ -492,6 +529,7 @@ const JS: &str = r#"
   function computeLayout() {
     const byLayer = new Map();
     for (const n of data.nodes) {
+      if (visibleIds !== null && !visibleIds.has(n.id)) continue;
       if (!byLayer.has(n.layer)) byLayer.set(n.layer, []);
       byLayer.get(n.layer).push(n);
     }
@@ -565,9 +603,22 @@ const JS: &str = r#"
       edgeEls.push(path);
     }
 
+    // Every "id column" pair reached by the selected column's own
+    // upstream/downstream trace, in any model -- used below to give
+    // connected column rows a lighter highlight than the selected
+    // column's own `.col-active` row. Recomputed here (not cached on
+    // `currentColumnResult`) since `render()` can run before that panel
+    // state is updated -- see `selectColumn`.
+    const relatedColumnKeys = new Set();
+    if (selectedId && selectedColumn) {
+      const { up, down } = bfsColumn(selectedId, selectedColumn);
+      for (const r of [...up.resolved, ...down.resolved]) relatedColumnKeys.add(r.id + " " + r.column);
+    }
+
     nodeEls.clear();
     for (const n of data.nodes) {
       const p = layout.pos.get(n.id);
+      if (!p) continue; // scoped out of the current view -- see `visibleIds`
       const g = el("g", { class: `node-box ${n.kind}` });
       g.dataset.id = n.id;
 
@@ -592,13 +643,19 @@ const JS: &str = r#"
           const rowY = p.y + HEADER_H + i * COL_ROW_H;
           const row = el("g", { class: "col-row-group" });
           const active = selectedId === n.id && selectedColumn === col.name;
+          // Lighter highlight for a column reached by the *selected*
+          // column's own upstream/downstream trace, in any other model --
+          // `relatedColumnKeys` is computed once per render() below, not
+          // per row. See issue #33's UX addition.
+          const related = !active && relatedColumnKeys.has(n.id + " " + col.name);
+          const rowClass = active ? " col-active" : related ? " col-related" : "";
           const rowRect = el("rect", {
-            class: "col-row" + (active ? " col-active" : ""), x: p.x, y: rowY, width: p.w, height: COL_ROW_H,
+            class: "col-row" + rowClass, x: p.x, y: rowY, width: p.w, height: COL_ROW_H,
           });
           rowRect.addEventListener("click", (ev) => { ev.stopPropagation(); selectNode(n.id); selectColumn(col.name); });
           row.appendChild(rowRect);
           const label = el("text", {
-            class: "col-label" + (active ? " col-active" : ""), x: p.x + 14, y: rowY + COL_ROW_H / 2 + 4,
+            class: "col-label" + rowClass, x: p.x + 14, y: rowY + COL_ROW_H / 2 + 4,
           });
           const suffix = col.expression ? " ƒ" : "";
           const budget = 24 - suffix.length;
@@ -647,6 +704,37 @@ const JS: &str = r#"
       frontier = next;
     }
     return { ancestors, descendants };
+  }
+
+  // `id`'s full transitive closure (itself plus every ancestor and
+  // descendant) -- the same set `bfsNodeLevel` computes for highlighting,
+  // reused as the *visible* set for the initial scoped view (issue #40).
+  function relatedIds(id) {
+    const { ancestors, descendants } = bfsNodeLevel(id);
+    return new Set([id, ...ancestors, ...descendants]);
+  }
+
+  function updateScopeBanner() {
+    const banner = document.getElementById("scope-banner");
+    if (visibleIds === null) {
+      banner.style.display = "none";
+      return;
+    }
+    const n = selectedId && byId.get(selectedId);
+    const label = n ? `${n.kind === "origin" ? data.origin_term : data.node_term} ${n.name}` : "the selected target";
+    document.getElementById("scope-banner-text").textContent =
+      `Showing ${label} and its lineage only.`;
+    banner.style.display = "flex";
+  }
+
+  // Clears the scope for the rest of the page's life -- there's no path
+  // back to a narrower view once expanded (matches the acceptance
+  // criterion: a one-way escape hatch, not a re-toggleable filter).
+  function expandToWholeProject() {
+    if (visibleIds === null) return;
+    visibleIds = null;
+    updateScopeBanner();
+    render();
   }
 
   // Column-level BFS, mirroring zhao-core::lineage's walk_upstream_column/
@@ -872,7 +960,53 @@ const JS: &str = r#"
     renderSummarySide(summary, "Downstream", down);
   }
 
-  document.getElementById("search").addEventListener("input", applyHighlight);
+  document.getElementById("search").addEventListener("input", () => {
+    // A scoped initial view only has the related subgraph rendered at
+    // all -- searching for something outside it would otherwise just
+    // silently find nothing, which reads as broken rather than
+    // "out of scope." Typing any search term implicitly expands to the
+    // whole project first, same as the explicit banner button.
+    if (document.getElementById("search").value.trim()) expandToWholeProject();
+    applyHighlight();
+  });
+  document.getElementById("scope-expand-btn").addEventListener("click", expandToWholeProject);
+
+  // Issue #33: drag `#panel-resize-handle` to resize `#panel`. Clamped to
+  // [220, main width - 300] so neither extreme can crush the graph area
+  // to nothing or shrink the panel out of legibility -- `#panel` already
+  // has a CSS `min-width: 220px` as a second line of defense, but the
+  // clamp here keeps the handle's own drag feel consistent with that
+  // limit rather than fighting it.
+  (function initPanelResize() {
+    const handle = document.getElementById("panel-resize-handle");
+    const panel = document.getElementById("panel");
+    const mainEl = document.getElementById("main");
+    let dragging = false;
+    let startX = 0;
+    let startWidth = 0;
+
+    handle.addEventListener("mousedown", (ev) => {
+      dragging = true;
+      startX = ev.clientX;
+      startWidth = panel.getBoundingClientRect().width;
+      handle.classList.add("resizing");
+      document.body.style.userSelect = "none";
+      ev.preventDefault();
+    });
+    document.addEventListener("mousemove", (ev) => {
+      if (!dragging) return;
+      const delta = startX - ev.clientX; // dragging left (negative clientX delta) widens the panel
+      const maxWidth = Math.max(220, mainEl.getBoundingClientRect().width - 300);
+      const width = Math.min(maxWidth, Math.max(220, startWidth + delta));
+      panel.style.width = width + "px";
+    });
+    document.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove("resizing");
+      document.body.style.userSelect = "";
+    });
+  })();
   document.getElementById("show-columns").addEventListener("change", (ev) => {
     showColumns = ev.target.checked;
     render();
@@ -896,13 +1030,23 @@ const JS: &str = r#"
     if (selectedId && currentColumnResult) renderPanel(selectedId, currentColumnResult);
   });
 
-  render();
-
+  // A targeted export's initial render scopes down to just the target's
+  // related subgraph (its full upstream/downstream transitive closure) --
+  // the whole project's data is still embedded and `expandToWholeProject`
+  // (the banner button, or typing a search term) un-scopes it without
+  // regenerating the file. No target at all (a whole-project export) has
+  // nothing to scope down from -- render everything, no banner. See
+  // issue #40. (`selectNode` below already calls `render()` itself, so
+  // there's no separate render() needed on the scoped branch.)
   if (data.initial_target) {
+    visibleIds = relatedIds(data.initial_target);
     if (data.initial_column) showColumns = true;
     document.getElementById("show-columns").checked = showColumns;
     selectNode(data.initial_target);
     if (data.initial_column) selectColumn(data.initial_column);
+    updateScopeBanner();
+  } else {
+    render();
   }
 })();
 "#;
@@ -1046,6 +1190,38 @@ mod tests {
         let html = generate(&sample_project(), &DbtVocabulary, None, None);
         assert!(!html.contains("\"initial_target\":"));
         assert!(!html.contains("\"initial_column\":"));
+    }
+
+    /// Acceptance criterion: a targeted export's markup carries the
+    /// scope-banner element and its expand control, since the initial
+    /// render now scopes down to the target's related subgraph. The
+    /// actual scoping/expand *behavior* lives in the embedded JS and is
+    /// verified in a real browser (see issue #40), not here -- this only
+    /// checks the control exists in the emitted document at all.
+    #[test]
+    fn a_targeted_export_carries_the_scope_banner_and_expand_control() {
+        let html = generate(
+            &sample_project(),
+            &DbtVocabulary,
+            Some(NodeId::new("model.p.a")),
+            None,
+        );
+        assert!(html.contains(r#"id="scope-banner""#));
+        assert!(html.contains(r#"id="scope-expand-btn""#));
+        assert!(html.contains("relatedIds"));
+        assert!(html.contains("expandToWholeProject"));
+    }
+
+    /// The scope banner/expand machinery is present in every export's
+    /// markup regardless of whether a target was actually given -- it's
+    /// the embedded JS deciding at load time (via `data.initial_target`)
+    /// whether to scope down at all, not something Rust conditionally
+    /// emits into the page.
+    #[test]
+    fn the_whole_project_export_still_carries_the_scope_banner_markup() {
+        let html = generate(&sample_project(), &DbtVocabulary, None, None);
+        assert!(html.contains(r#"id="scope-banner""#));
+        assert!(html.contains(r#"id="scope-expand-btn""#));
     }
 
     #[test]
