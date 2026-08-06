@@ -28,6 +28,26 @@ pub enum Command {
     /// structural query over the current project's compiled state, not a
     /// Baseline-vs-current diff. No `--state`, no git, no `dbt compile`.
     Lineage(LineageArgs),
+    /// Replaces the current `zhao` binary with a release fetched from
+    /// GitHub Releases -- the one command that makes a network call
+    /// (see issue #28; every other command stays fully offline).
+    Update(UpdateArgs),
+}
+
+/// Arguments for `zhao update`.
+#[derive(Debug, clap::Args)]
+pub struct UpdateArgs {
+    /// A specific release tag to install (e.g. `v0.1.1`), pinning to
+    /// that exact release instead of the latest stable one. Mutually
+    /// exclusive with `--nightly` (which is really just a shorthand for
+    /// the tag `"nightly"`, always the current moving nightly build).
+    #[arg(conflicts_with = "nightly")]
+    pub version: Option<String>,
+
+    /// Installs the latest nightly build instead of the latest stable
+    /// release.
+    #[arg(long)]
+    pub nightly: bool,
 }
 
 /// Arguments for `zhao lineage`.

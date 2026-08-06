@@ -15,6 +15,7 @@ mod lineage_html;
 mod log;
 mod metadata;
 mod report;
+mod update;
 
 use std::process::ExitCode;
 
@@ -29,5 +30,6 @@ fn main() -> ExitCode {
         Command::Check(args) => check::run(args),
         Command::Diff(args) => diff::run(args),
         Command::Lineage(args) => lineage::run(args),
+        Command::Update(args) => update::run(args),
     }
 }

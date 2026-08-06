@@ -69,6 +69,7 @@ fired. Full walkthrough: **[Getting started](docs/getting-started.md)**.
 | `zhao check` | The CI gate — diffs against a Baseline, fails on a breaking change. |
 | `zhao diff` | Same engine, always exits `0` — for local inspection during development. |
 | `zhao lineage` | What's upstream/downstream of a model or column, right now (no diff, no git). |
+| `zhao update` | Replaces the current binary with a release from GitHub Releases. The one command that makes a network call — see [What it doesn't do](#what-it-doesnt-do). |
 
 Full flag reference: **[docs/commands.md](docs/commands.md)**.
 
@@ -123,10 +124,12 @@ Full example and notes: **[docs/ci-integration.md](docs/ci-integration.md)**.
 
 ## What it doesn't do
 
-zhao never makes a network call, never creates a schema/table/artifact inside your
-warehouse, and never asks for a warehouse connection beyond what `dbt run` already needs
-(only for the fully optional `--check-relations` flag). It detects that a schema change
-needs manual evolution or a backfill; it never generates or applies that DDL for you.
+`zhao check`/`zhao diff`/`zhao lineage` never make a network call, never create a
+schema/table/artifact inside your warehouse, and never ask for a warehouse connection beyond
+what `dbt run` already needs (only for the fully optional `--check-relations` flag). They
+detect that a schema change needs manual evolution or a backfill; they never generate or apply
+that DDL for you. `zhao update` is the one deliberate exception — it fetches a release from
+GitHub Releases, and only runs when you explicitly invoke it.
 
 ## Status
 
