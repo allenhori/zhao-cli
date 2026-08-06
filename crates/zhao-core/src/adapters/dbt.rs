@@ -24,11 +24,16 @@
 //! whatever it's called, passes through unchanged") relationships to an
 //! Origin are tracked.
 //!
-//! A calculated column (a function call, `CAST`, arithmetic, or `CASE`) is
+//! A calculated column (a function call, `CAST`, arithmetic, `CASE`, or one
+//! of `EXTRACT`/`CEIL`/`FLOOR`/`POSITION`/`SUBSTRING`/`TRIM`/`OVERLAY` --
+//! sqlparser gives those their own dedicated `Expr` variants rather than
+//! folding them into a generic function call, so they're walked
+//! explicitly rather than falling out of the function-call case) is
 //! *not* automatically unresolved, though: every plain (optionally
 //! qualified) column identifier that expression structurally references --
 //! `coalesce(x.y, 0)`, `x.a + x.b`, `case when x.a > 0 then x.b else x.c
-//! end`, and arbitrary nesting of these -- is collected and traced, so a
+//! end`, `extract(year from x.d)`, and arbitrary nesting of these -- is
+//! collected and traced, so a
 //! calculated column can resolve to *several* upstream columns, not just
 //! one (see `collect_expr_sources`). This is a structural walk, not a
 //! guess: every identifier found either resolves cleanly through the
@@ -1082,8 +1087,71 @@ fn collect_expr_sources_into(
         }
         Expr::Cast { expr: inner, .. }
         | Expr::UnaryOp { expr: inner, .. }
-        | Expr::Nested(inner) => {
+        | Expr::Nested(inner)
+        // `EXTRACT(field FROM expr)`, `CEIL`/`FLOOR(expr [TO field])` --
+        // sqlparser gives these their own `Expr` variants rather than
+        // folding them into `Expr::Function`, so without this arm a
+        // macro-expanded date/rounding call (a common real shape --
+        // issue #34) fell through to the catch-all below and silently
+        // lost its source, even though it's structurally no different
+        // from any other single-argument function call.
+        | Expr::Extract { expr: inner, .. }
+        | Expr::Ceil { expr: inner, .. }
+        | Expr::Floor { expr: inner, .. } => {
             collect_expr_sources_into(inner, from_scope, found);
+        }
+        // `POSITION(expr IN expr)` -- same reasoning, two operands
+        // instead of one.
+        Expr::Position { expr: inner, r#in } => {
+            collect_expr_sources_into(inner, from_scope, found);
+            collect_expr_sources_into(r#in, from_scope, found);
+        }
+        // `SUBSTRING(expr [FROM expr] [FOR expr])` (or its comma-arg
+        // form) -- another dedicated variant, same reasoning.
+        Expr::Substring {
+            expr: inner,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_expr_sources_into(inner, from_scope, found);
+            if let Some(from) = substring_from {
+                collect_expr_sources_into(from, from_scope, found);
+            }
+            if let Some(for_) = substring_for {
+                collect_expr_sources_into(for_, from_scope, found);
+            }
+        }
+        // `TRIM([BOTH|LEADING|TRAILING] [expr FROM] expr)` -- walks the
+        // trimmed expression, the optional `what`-to-trim expression, and
+        // any dialect-specific `trim_characters` list.
+        Expr::Trim {
+            expr: inner,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            collect_expr_sources_into(inner, from_scope, found);
+            if let Some(what) = trim_what {
+                collect_expr_sources_into(what, from_scope, found);
+            }
+            for c in trim_characters.iter().flatten() {
+                collect_expr_sources_into(c, from_scope, found);
+            }
+        }
+        // `OVERLAY(expr PLACING expr FROM expr [FOR expr])`.
+        Expr::Overlay {
+            expr: inner,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            collect_expr_sources_into(inner, from_scope, found);
+            collect_expr_sources_into(overlay_what, from_scope, found);
+            collect_expr_sources_into(overlay_from, from_scope, found);
+            if let Some(for_) = overlay_for {
+                collect_expr_sources_into(for_, from_scope, found);
+            }
         }
         Expr::BinaryOp { left, right, .. } => {
             collect_expr_sources_into(left, from_scope, found);
@@ -1425,6 +1493,124 @@ mod tests {
                 );
             }
             other => panic!("expected Known([total sourced from a and b]), got {other:?}"),
+        }
+    }
+
+    /// Issue #34's repro: a macro that expands to `EXTRACT(field FROM
+    /// expr)` -- sqlparser gives `EXTRACT` its own dedicated `Expr`
+    /// variant rather than folding it into a generic function call
+    /// (unlike `coalesce`/`round`/etc.), so before this fix it fell
+    /// through to the unresolved catch-all despite structurally
+    /// referencing a single, perfectly resolvable upstream column.
+    #[test]
+    fn a_macro_expanded_extract_call_resolves_its_source_column() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query =
+            parse_query(r#"select extract(year from x.created_at) as year from "db"."s"."t" as x"#)
+                .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "year");
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "created_at".to_string())]
+                );
+            }
+            other => panic!("expected Known([year sourced from created_at]), got {other:?}"),
+        }
+    }
+
+    /// The same gap, for the other dedicated `Expr` variants sqlparser
+    /// carves out of what would otherwise read as ordinary function
+    /// calls: `TRIM`, `SUBSTRING`, `POSITION`, `CEIL`/`FLOOR`, `OVERLAY`
+    /// -- all common shapes for string-cleaning/date-rounding dbt
+    /// macros. Each should resolve its inner column reference(s) the
+    /// same as a plain function call would.
+    #[test]
+    fn other_dedicated_sql_expr_variants_resolve_their_source_columns() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"select trim(x.raw_name) as clean_name from "db"."s"."t" as x"#,
+                "raw_name",
+            ),
+            (
+                r#"select substring(x.code from 1 for 3) as prefix from "db"."s"."t" as x"#,
+                "code",
+            ),
+            (
+                r#"select position('a' in x.text) as idx from "db"."s"."t" as x"#,
+                "text",
+            ),
+            (
+                r#"select ceil(x.amount) as rounded from "db"."s"."t" as x"#,
+                "amount",
+            ),
+            (
+                r#"select floor(x.amount) as rounded from "db"."s"."t" as x"#,
+                "amount",
+            ),
+        ];
+
+        for (sql, expected_column) in cases {
+            let query = parse_query(sql).expect("should parse");
+            let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+            match schema {
+                LocalSchema::Known(cols) => {
+                    assert_eq!(cols.len(), 1, "{sql}");
+                    assert_eq!(
+                        cols[0].sources,
+                        vec![(origin("origin.s.t"), expected_column.to_string())],
+                        "{sql}"
+                    );
+                }
+                other => panic!("{sql}: expected a resolved source, got {other:?}"),
+            }
+        }
+    }
+
+    /// No regression in the already-working macro-adjacent case this
+    /// ticket explicitly called out: a plain function call
+    /// (`round(x / 100.0, 2)`, `zhao-dbt-test`'s `cents_to_dollars`
+    /// shape) keeps resolving exactly as before.
+    #[test]
+    fn a_plain_function_call_macro_shape_still_resolves_unaffected() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query =
+            parse_query(r#"select round(x.amount / 100.0, 2) as amount from "db"."s"."t" as x"#)
+                .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "amount".to_string())]
+                );
+            }
+            other => panic!("expected Known([amount sourced from amount]), got {other:?}"),
         }
     }
 
