@@ -141,8 +141,13 @@ pub enum DbtAdapterError {
     /// logging output, with stderr often near-empty even on a real
     /// failure (reserved for something more fundamentally fatal, like a
     /// crash before dbt's own logging even starts) -- surfacing stderr
-    /// alone routinely hides the real reason a compile failed.
-    #[error("dbt compile failed in {project_dir}:\n{stdout}{stderr}")]
+    /// alone routinely hides the real reason a compile failed. The
+    /// `Display` impl always inserts its own `\n` between the two
+    /// (rather than concatenating them directly) -- captured stdout
+    /// isn't guaranteed to end in a trailing newline (e.g. a truncated
+    /// or killed process), so relying on that would risk fusing stdout's
+    /// last line into stderr's first.
+    #[error("dbt compile failed in {project_dir}:\n{stdout}\n{stderr}")]
     CompileFailed {
         /// The project directory `dbt compile` was run in.
         project_dir: String,
@@ -153,8 +158,9 @@ pub enum DbtAdapterError {
         stderr: String,
     },
     /// `dbt deps` ran but exited with a failure. See [`Self::CompileFailed`]
-    /// for why both `stdout` and `stderr` are carried.
-    #[error("dbt deps failed in {project_dir}:\n{stdout}{stderr}")]
+    /// for why both `stdout` and `stderr` are carried, and why the
+    /// `Display` impl inserts its own separating `\n`.
+    #[error("dbt deps failed in {project_dir}:\n{stdout}\n{stderr}")]
     DepsFailed {
         /// The project directory `dbt deps` was run in.
         project_dir: String,
@@ -1706,6 +1712,38 @@ mod tests {
                     "the error's own Display should include dbt's real error, not just \
                      project_dir: {message:?}"
                 );
+            }
+            other => panic!("expected CompileFailed, got {other:?}"),
+        }
+    }
+
+    /// `printf` (unlike `echo`) writes no trailing newline -- proves the
+    /// `Display` impl's own separator, not an assumption that dbt's
+    /// output always happens to end in `\n`, is what keeps captured
+    /// stdout and stderr from fusing into one garbled line when both are
+    /// non-empty.
+    #[cfg(unix)]
+    #[test]
+    fn compile_error_message_separates_stdout_from_stderr_even_without_a_trailing_newline() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(
+            stub_dir.path(),
+            "printf 'STDOUT_END'\necho 'STDERR_START' >&2\nexit 1",
+        );
+
+        let result = DbtAdapter.compile(project_dir.path(), dbt.to_str().expect("utf8 path"), &[]);
+        let message: Option<String> = result.as_ref().err().map(ToString::to_string);
+
+        match result {
+            Err(DbtAdapterError::CompileFailed { .. }) => {
+                let message = message.expect("should be an error");
+                assert!(
+                    !message.contains("STDOUT_ENDSTDERR_START"),
+                    "stdout and stderr should never be fused into one line: {message:?}"
+                );
+                assert!(message.contains("STDOUT_END"), "{message:?}");
+                assert!(message.contains("STDERR_START"), "{message:?}");
             }
             other => panic!("expected CompileFailed, got {other:?}"),
         }
