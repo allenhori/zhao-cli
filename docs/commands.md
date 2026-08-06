@@ -134,3 +134,11 @@ stdout; it's a mirror, not a redirect.
 | `--log-level <mirror\|debug>` | `mirror` | Accepted and parsed (see [Configuring `log`](configuration.md#log)) but not yet wired to anything — the run log has no `debug`-level content defined yet for either this or `zhao.yml`'s `log.level` to switch to. Reserved so a later ticket adding real debug-level content doesn't need another config-shape change. |
 
 No purge/retention logic yet — `target/zhao/logs/` accumulates indefinitely by default.
+
+Any internal `dbt compile`/`dbt deps` subprocess zhao itself runs — `zhao check`/`zhao diff`'s
+git-native Baseline resolution, and `zhao lineage --compile` — has its own captured
+stdout/stderr routed into the same day's log entry too, both on success (previously discarded
+entirely) and on failure (in addition to the terminal error message dbt compile/deps failures
+already surface) — so an internal compile/deps run is always inspectable after the fact,
+without ever printing dbt's raw output to the terminal directly (which would otherwise corrupt
+`--format json` piping).

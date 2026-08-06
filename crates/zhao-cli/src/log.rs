@@ -25,6 +25,75 @@ pub fn mirror(project_dir: &Path, content: &str) {
     }
 }
 
+/// Formats a `dbt compile`/`dbt deps` subprocess's captured stdout/stderr
+/// for the run log -- see issue #36. Shared by both the success path
+/// (routing output that used to be silently discarded) and the failure
+/// path (a `DbtAdapterError::CompileFailed`/`DepsFailed`'s own
+/// `stdout`/`stderr` fields), so a compile/deps entry always looks the
+/// same in the log regardless of which one produced it. `command` is
+/// the dbt subcommand run (`"compile"` or `"deps"`); `dbt_project_dir`
+/// is where it ran -- for git-native Baseline resolution this is the
+/// temporary worktree's path, not the real project directory the log
+/// itself lives under, so it's recorded here for context even though
+/// the worktree itself is gone by the time anyone reads the log.
+pub fn format_dbt_output(
+    command: &str,
+    dbt_project_dir: &Path,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    format!(
+        "$ dbt {command} (in {})\n{stdout}\n{stderr}\n",
+        dbt_project_dir.display()
+    )
+}
+
+/// Routes a `dbt compile`/`dbt deps` call's captured stdout/stderr into
+/// `real_project_dir`'s daily run log -- both a successful run's output
+/// (previously discarded entirely) and a failing one's (already
+/// captured on the error for #30's terminal error message; this adds
+/// the same content to the log for post-hoc inspection too) -- then
+/// passes the `Result` straight through unchanged. Shared by every
+/// call site that routes a `dbt compile`/`dbt deps` invocation's output
+/// this way, whether or not it ran in a temporary git worktree (see
+/// issue #36).
+///
+/// `dbt_project_dir` is where the subcommand actually ran -- for
+/// git-native Baseline resolution this is the temporary worktree's
+/// path, gone by the time anyone reads the log (recorded in the entry
+/// for context regardless); for a direct `--compile` invocation it's
+/// the same as `real_project_dir`. `real_project_dir` is where the log
+/// itself lives, same as every other `target/zhao/` artifact.
+pub fn log_dbt_result(
+    command: &str,
+    dbt_project_dir: &Path,
+    real_project_dir: &Path,
+    result: Result<
+        zhao_core::adapters::dbt::DbtCommandOutput,
+        zhao_core::adapters::dbt::DbtAdapterError,
+    >,
+) -> Result<zhao_core::adapters::dbt::DbtCommandOutput, zhao_core::adapters::dbt::DbtAdapterError> {
+    use zhao_core::adapters::dbt::DbtAdapterError;
+
+    let captured = match &result {
+        Ok(output) => Some((output.stdout.as_str(), output.stderr.as_str())),
+        Err(DbtAdapterError::CompileFailed { stdout, stderr, .. })
+        | Err(DbtAdapterError::DepsFailed { stdout, stderr, .. }) => {
+            Some((stdout.as_str(), stderr.as_str()))
+        }
+        // No captured output to log for anything else (e.g. the `dbt`
+        // command couldn't even be spawned).
+        Err(_) => None,
+    };
+    if let Some((stdout, stderr)) = captured {
+        mirror(
+            real_project_dir,
+            &format_dbt_output(command, dbt_project_dir, stdout, stderr),
+        );
+    }
+    result
+}
+
 fn try_mirror(project_dir: &Path, content: &str) -> std::io::Result<()> {
     let dir = project_dir.join("target").join("zhao").join("logs");
     std::fs::create_dir_all(&dir)?;
