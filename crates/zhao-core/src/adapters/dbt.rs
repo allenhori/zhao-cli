@@ -135,18 +135,38 @@ pub enum DbtAdapterError {
         source: std::io::Error,
     },
     /// `dbt compile` ran but exited with a failure.
-    #[error("dbt compile failed in {project_dir}:\n{stderr}")]
+    ///
+    /// Carries both `stdout` and `stderr`, not just the latter: dbt logs
+    /// most of its actual error detail to stdout as part of its normal
+    /// logging output, with stderr often near-empty even on a real
+    /// failure (reserved for something more fundamentally fatal, like a
+    /// crash before dbt's own logging even starts) -- surfacing stderr
+    /// alone routinely hides the real reason a compile failed. The
+    /// `Display` impl always inserts its own `\n` between the two
+    /// (rather than concatenating them directly) -- captured stdout
+    /// isn't guaranteed to end in a trailing newline (e.g. a truncated
+    /// or killed process), so relying on that would risk fusing stdout's
+    /// last line into stderr's first.
+    #[error("dbt compile failed in {project_dir}:\n{stdout}\n{stderr}")]
     CompileFailed {
         /// The project directory `dbt compile` was run in.
         project_dir: String,
+        /// `dbt compile`'s captured stdout -- where dbt's own logging
+        /// (including most real error detail) actually goes.
+        stdout: String,
         /// `dbt compile`'s captured stderr.
         stderr: String,
     },
-    /// `dbt deps` ran but exited with a failure.
-    #[error("dbt deps failed in {project_dir}:\n{stderr}")]
+    /// `dbt deps` ran but exited with a failure. See [`Self::CompileFailed`]
+    /// for why both `stdout` and `stderr` are carried, and why the
+    /// `Display` impl inserts its own separating `\n`.
+    #[error("dbt deps failed in {project_dir}:\n{stdout}\n{stderr}")]
     DepsFailed {
         /// The project directory `dbt deps` was run in.
         project_dir: String,
+        /// `dbt deps`'s captured stdout -- where dbt's own logging
+        /// (including most real error detail) actually goes.
+        stdout: String,
         /// `dbt deps`'s captured stderr.
         stderr: String,
     },
@@ -191,6 +211,7 @@ impl DbtAdapter {
         if !output.status.success() {
             return Err(DbtAdapterError::CompileFailed {
                 project_dir: project_dir.display().to_string(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
@@ -214,6 +235,7 @@ impl DbtAdapter {
         if !output.status.success() {
             return Err(DbtAdapterError::DepsFailed {
                 project_dir: project_dir.display().to_string(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
@@ -1660,6 +1682,73 @@ mod tests {
         }
     }
 
+    /// dbt logs most of its actual error detail to stdout, not stderr --
+    /// stderr alone is routinely empty even on a real compile failure.
+    /// The error's `Display` (what a user actually sees) must include
+    /// stdout, not just stderr, or the real reason a compile failed is
+    /// silently dropped.
+    #[cfg(unix)]
+    #[test]
+    fn compile_reports_a_clear_error_when_dbts_real_error_is_only_on_stdout() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(
+            stub_dir.path(),
+            "echo 'Compilation Error: column does not exist'\nexit 1",
+        );
+
+        let result = DbtAdapter.compile(project_dir.path(), dbt.to_str().expect("utf8 path"), &[]);
+        let message: Option<String> = result.as_ref().err().map(ToString::to_string);
+
+        match result {
+            Err(DbtAdapterError::CompileFailed { stdout, .. }) => {
+                assert!(
+                    stdout.contains("Compilation Error: column does not exist"),
+                    "stdout should surface: {stdout:?}"
+                );
+                let message = message.expect("should be an error");
+                assert!(
+                    message.contains("Compilation Error: column does not exist"),
+                    "the error's own Display should include dbt's real error, not just \
+                     project_dir: {message:?}"
+                );
+            }
+            other => panic!("expected CompileFailed, got {other:?}"),
+        }
+    }
+
+    /// `printf` (unlike `echo`) writes no trailing newline -- proves the
+    /// `Display` impl's own separator, not an assumption that dbt's
+    /// output always happens to end in `\n`, is what keeps captured
+    /// stdout and stderr from fusing into one garbled line when both are
+    /// non-empty.
+    #[cfg(unix)]
+    #[test]
+    fn compile_error_message_separates_stdout_from_stderr_even_without_a_trailing_newline() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(
+            stub_dir.path(),
+            "printf 'STDOUT_END'\necho 'STDERR_START' >&2\nexit 1",
+        );
+
+        let result = DbtAdapter.compile(project_dir.path(), dbt.to_str().expect("utf8 path"), &[]);
+        let message: Option<String> = result.as_ref().err().map(ToString::to_string);
+
+        match result {
+            Err(DbtAdapterError::CompileFailed { .. }) => {
+                let message = message.expect("should be an error");
+                assert!(
+                    !message.contains("STDOUT_ENDSTDERR_START"),
+                    "stdout and stderr should never be fused into one line: {message:?}"
+                );
+                assert!(message.contains("STDOUT_END"), "{message:?}");
+                assert!(message.contains("STDERR_START"), "{message:?}");
+            }
+            other => panic!("expected CompileFailed, got {other:?}"),
+        }
+    }
+
     #[test]
     fn compile_reports_a_clear_error_when_the_command_cannot_be_run_at_all() {
         let project_dir = tempfile::tempdir().expect("should create temp dir");
@@ -1747,6 +1836,34 @@ mod tests {
         match result {
             Err(DbtAdapterError::DepsFailed { stderr, .. }) => {
                 assert!(stderr.contains("boom"), "stderr should surface: {stderr:?}");
+            }
+            other => panic!("expected DepsFailed, got {other:?}"),
+        }
+    }
+
+    /// Same reasoning as `compile`'s equivalent test: dbt's real error
+    /// detail routinely lands on stdout, not stderr.
+    #[cfg(unix)]
+    #[test]
+    fn deps_reports_a_clear_error_when_dbts_real_error_is_only_on_stdout() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(stub_dir.path(), "echo 'Could not resolve package'\nexit 1");
+
+        let result = DbtAdapter.deps(project_dir.path(), dbt.to_str().expect("utf8 path"), &[]);
+        let message: Option<String> = result.as_ref().err().map(ToString::to_string);
+
+        match result {
+            Err(DbtAdapterError::DepsFailed { stdout, .. }) => {
+                assert!(
+                    stdout.contains("Could not resolve package"),
+                    "stdout should surface: {stdout:?}"
+                );
+                let message = message.expect("should be an error");
+                assert!(
+                    message.contains("Could not resolve package"),
+                    "the error's own Display should include dbt's real error: {message:?}"
+                );
             }
             other => panic!("expected DepsFailed, got {other:?}"),
         }
