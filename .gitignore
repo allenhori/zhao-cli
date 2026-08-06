@@ -1,5 +1,10 @@
 /target
 
+# Personal, per-developer Claude Code permission overrides -- never
+# meant to be shared/committed (unlike .claude/settings.json, which
+# would be team-wide).
+.claude/settings.local.json
+
 # zhao's own run-metadata.json output. Written under any project dir's
 # target/zhao/, including inside test fixtures' checked-in target/
 # directories (those hold real, tracked manifest.json fixtures, so this
