@@ -5,6 +5,7 @@
 //! and never invokes `dbt compile` -- it operates purely on
 //! `<project-dir>/target/manifest.json` as it already is.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use zhao_core::adapters::TransformationToolAdapter;
@@ -37,18 +38,56 @@ pub fn run(args: &LineageArgs) -> ExitCode {
         Err(err) => return fail(&format!("{}: {err}", manifest_path.display())),
     };
 
-    match &args.html {
-        Some(html_path) => run_html(args, &project, html_path),
-        None => run_text(args, &project),
+    if args.text {
+        return run_text(args, &project);
     }
+    run_html(args, &project)
 }
 
-/// The `--html` path: generates the self-contained interactive export.
-fn run_html(
-    args: &LineageArgs,
-    project: &zhao_core::model::ParsedProject,
-    html_path: &std::path::Path,
-) -> ExitCode {
+/// zhao's default filenaming scheme for `zhao lineage`'s HTML export,
+/// under `<project-dir>/target/zhao/lineage_graphs/`: `full_lineage.html`
+/// with no target, else `partial_lineage_[<package>_]<model>[_<column>]
+/// [_upstream_only|_downstream_only].html` -- the package segment only
+/// when `--package` was given, the column segment only for a
+/// column-level target, and no direction suffix at all for the default
+/// "both directions" case.
+fn default_html_path(
+    project_dir: &Path,
+    parsed_target: Option<(&str, Option<&str>, Direction)>,
+    package: Option<&str>,
+) -> PathBuf {
+    let dir = project_dir
+        .join("target")
+        .join("zhao")
+        .join("lineage_graphs");
+    let Some((model, column, direction)) = parsed_target else {
+        return dir.join("full_lineage.html");
+    };
+
+    let mut name = String::from("partial_lineage_");
+    if let Some(package) = package {
+        name.push_str(package);
+        name.push('_');
+    }
+    name.push_str(model);
+    if let Some(column) = column {
+        name.push('_');
+        name.push_str(column);
+    }
+    match direction {
+        Direction::Upstream => name.push_str("_upstream_only"),
+        Direction::Downstream => name.push_str("_downstream_only"),
+        Direction::Both => {}
+    }
+    name.push_str(".html");
+    dir.join(name)
+}
+
+/// The default output mode: generates the self-contained interactive
+/// export, at `--html`'s explicit path when given, else the computed
+/// default under `target/zhao/lineage_graphs/` (see
+/// [`default_html_path`]).
+fn run_html(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> ExitCode {
     let parsed_target = args.parse_target();
 
     // `LineageError`'s own `Display` already gives a clear, actionable
@@ -80,13 +119,24 @@ fn run_html(
         }
     };
 
+    let html_path = args
+        .html
+        .clone()
+        .unwrap_or_else(|| default_html_path(&args.project_dir, parsed_target, package));
+
+    if let Some(parent) = html_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            return fail(&format!("could not create {}: {err}", parent.display()));
+        }
+    }
+
     let html = crate::lineage_html::generate(
         project,
         DbtAdapter.vocabulary(),
         initial_target,
         initial_column,
     );
-    if let Err(err) = std::fs::write(html_path, html) {
+    if let Err(err) = std::fs::write(&html_path, html) {
         return fail(&format!("could not write {}: {err}", html_path.display()));
     }
 
@@ -101,11 +151,12 @@ fn run_html(
     ExitCode::from(EXIT_OK)
 }
 
-/// The default (no `--html`) path: prints text, same as before.
+/// The `--text` path: prints the plain-text report, same as before HTML
+/// became the default.
 fn run_text(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> ExitCode {
     let Some((target_name, target_column, direction)) = args.parse_target() else {
         return fail(
-            "a target is required for text output -- pass --html to generate a whole-project graph without one",
+            "a target is required for --text output -- omit --text to generate a whole-project HTML graph instead",
         );
     };
 
@@ -258,6 +309,127 @@ mod tests {
     use super::*;
     use zhao_core::adapters::dbt::DbtVocabulary;
     use zhao_core::model::{NodeId, OriginId};
+
+    // -----------------------------------------------------------------
+    // `default_html_path` -- the filenaming table from issue #38.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn no_target_defaults_to_full_lineage() {
+        let path = default_html_path(Path::new("."), None, None);
+        assert_eq!(
+            path,
+            PathBuf::from("./target/zhao/lineage_graphs/full_lineage.html")
+        );
+    }
+
+    #[test]
+    fn a_bare_model_target_defaults_to_partial_lineage_model() {
+        let path = default_html_path(
+            Path::new("."),
+            Some(("dim_customers", None, Direction::Both)),
+            None,
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("./target/zhao/lineage_graphs/partial_lineage_dim_customers.html")
+        );
+    }
+
+    #[test]
+    fn an_upstream_only_target_gets_the_upstream_only_suffix() {
+        let path = default_html_path(
+            Path::new("."),
+            Some(("dim_customers", None, Direction::Upstream)),
+            None,
+        );
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "./target/zhao/lineage_graphs/partial_lineage_dim_customers_upstream_only.html"
+            )
+        );
+    }
+
+    #[test]
+    fn a_downstream_only_target_gets_the_downstream_only_suffix() {
+        let path = default_html_path(
+            Path::new("."),
+            Some(("dim_customers", None, Direction::Downstream)),
+            None,
+        );
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "./target/zhao/lineage_graphs/partial_lineage_dim_customers_downstream_only.html"
+            )
+        );
+    }
+
+    #[test]
+    fn a_column_target_appends_the_column_name() {
+        let path = default_html_path(
+            Path::new("."),
+            Some(("dim_customers", Some("customer_id"), Direction::Both)),
+            None,
+        );
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "./target/zhao/lineage_graphs/partial_lineage_dim_customers_customer_id.html"
+            )
+        );
+    }
+
+    #[test]
+    fn a_column_target_with_upstream_only_appends_column_then_direction() {
+        let path = default_html_path(
+            Path::new("."),
+            Some(("dim_customers", Some("customer_id"), Direction::Upstream)),
+            None,
+        );
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "./target/zhao/lineage_graphs/partial_lineage_dim_customers_customer_id_upstream_only.html"
+            )
+        );
+    }
+
+    #[test]
+    fn a_package_flag_prepends_the_package_name() {
+        let path = default_html_path(
+            Path::new("."),
+            Some(("customers", None, Direction::Both)),
+            Some("pkg_b"),
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("./target/zhao/lineage_graphs/partial_lineage_pkg_b_customers.html")
+        );
+    }
+
+    #[test]
+    fn no_package_flag_never_adds_a_package_segment() {
+        let path = default_html_path(
+            Path::new("."),
+            Some(("customers", None, Direction::Both)),
+            None,
+        );
+        assert_eq!(
+            path,
+            PathBuf::from("./target/zhao/lineage_graphs/partial_lineage_customers.html")
+        );
+    }
+
+    #[test]
+    fn no_target_ignores_package_since_theres_nothing_to_scope() {
+        let path = default_html_path(Path::new("."), None, Some("pkg_b"));
+        assert_eq!(
+            path,
+            PathBuf::from("./target/zhao/lineage_graphs/full_lineage.html")
+        );
+    }
 
     #[test]
     fn render_text_lists_both_sections_for_both_directions() {

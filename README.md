@@ -74,8 +74,8 @@ Full flag reference: **[docs/commands.md](docs/commands.md)**.
 
 ## See it, don't just read about it
 
-`zhao lineage --html` exports an interactive, self-contained lineage graph — click a model or
-column to trace exactly what it depends on and what depends on it, search, filter, all
+`zhao lineage` exports an interactive, self-contained lineage graph by default — click a model
+or column to trace exactly what it depends on and what depends on it, search, filter, all
 offline in one HTML file.
 
 ![Clicking a model, expanding columns, then tracing a calculated column's real upstream source](docs/assets/lineage-demo.gif)

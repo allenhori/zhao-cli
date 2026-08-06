@@ -1,13 +1,35 @@
 # Understanding lineage
 
-`zhao lineage --html` turns your project's column-level lineage into a single, self-contained
-HTML file you open in a browser — no server, no build step, no account, works fully offline
-(there's nothing in the file that fetches anything: no CDN script, no font, no external
-stylesheet). It's meant for exploring a project, not for CI.
+`zhao lineage` turns your project's column-level lineage into a single, self-contained HTML
+file you open in a browser — no server, no build step, no account, works fully offline (there's
+nothing in the file that fetches anything: no CDN script, no font, no external stylesheet).
+It's meant for exploring a project, not for CI. HTML is the default output; pass `--text` for
+the old plain-text report instead.
 
 ```bash
-zhao lineage --html lineage.html            # the whole project
-open lineage.html                            # macOS; xdg-open on Linux, or just double-click it
+zhao lineage                                # the whole project, written to a computed path
+open target/zhao/lineage_graphs/full_lineage.html   # macOS; xdg-open on Linux, or just double-click it
+```
+
+## Where it's written
+
+With no `--html <path>`, the export is written under `<project-dir>/target/zhao/lineage_graphs/`
+at a computed path, overwritten in place on repeat runs (no timestamping, no accumulation):
+
+| Invocation | Default path |
+|---|---|
+| no target | `full_lineage.html` |
+| `<model>` | `partial_lineage_<model>.html` |
+| `+<model>` | `partial_lineage_<model>_upstream_only.html` |
+| `<model>+` | `partial_lineage_<model>_downstream_only.html` |
+| `<model>.<column>` | `partial_lineage_<model>_<column>.html` |
+| `+<model>.<column>` | `partial_lineage_<model>_<column>_upstream_only.html` |
+| `<model> --package <pkg>` | `partial_lineage_<pkg>_<model>.html` |
+
+Pass `--html <path>` to write to an explicit path instead:
+
+```bash
+zhao lineage --html lineage.html            # the whole project, at an explicit path
 ```
 
 **[Live demo](assets/lineage-demo.html)** — an actual export from a small fixture project,
@@ -42,12 +64,12 @@ calculated column to trace it back to its actual source, then search for `model.
 
 ## Scoping the initial view
 
-Pass a target the same way you would for text output, and the export opens already focused
+Pass a target the same way you would for `--text` output, and the export opens already focused
 on it:
 
 ```bash
-zhao lineage --html lineage.html fct_orders            # opens with fct_orders selected
-zhao lineage --html lineage.html fct_orders.amount      # opens at column grain
+zhao lineage fct_orders            # opens with fct_orders selected
+zhao lineage fct_orders.amount     # opens at column grain
 ```
 
 You can still navigate anywhere else in the project after it opens — this only sets where it
@@ -55,12 +77,12 @@ starts.
 
 ## Getting a fresh export
 
-By default, `--html` reads whatever's already in `<project-dir>/target/manifest.json` — the
-same "compile it yourself first" contract every other zhao command has. Pass `--compile` to
+By default, `zhao lineage` reads whatever's already in `<project-dir>/target/manifest.json` —
+the same "compile it yourself first" contract every other zhao command has. Pass `--compile` to
 have zhao run `dbt compile` first:
 
 ```bash
-zhao lineage --html lineage.html --compile
+zhao lineage --compile
 ```
 
 ## What "static resolution" can and can't trace
