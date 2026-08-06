@@ -18,7 +18,7 @@ zhao check [OPTIONS]
 |---|---|---|
 | `--state <path>` | — | Use an already-compiled `manifest.json` as the Baseline instead of resolving one via git. |
 | `--project-dir <dir>` | `.` | The dbt project to check. Its current state is read from `<dir>/target/manifest.json`. |
-| `--against <ref>` | `master` | The branch to find a merge-base against, for git-native Baseline resolution. Ignored when `--state` is given. |
+| `--against <ref>` | `master` | The branch to find a merge-base against, for git-native Baseline resolution. Ignored when `--state` is given. Overrides `zhao.yml`'s `against` when given — see [Configuring `zhao.yml`](configuration.md#against). |
 | `--format <text\|json>` | `text` | `json` is the machine-readable shape everything else in this table also applies to — build a PR-comment bot or dashboard on top of it without scraping text. |
 | `--no-color` | — | Disables ANSI color in text output (auto-detected otherwise; no effect on `--format json`). |
 | `--dbt-arg <arg>` | — | Appends one extra argument to every internal `dbt deps`/`dbt compile` call (git-native Baseline resolution only). Repeatable, e.g. `--dbt-arg --target --dbt-arg ci`. Mutually exclusive with `--dbt-args`. |
