@@ -110,6 +110,14 @@ pub struct LineageArgs {
     /// debug-level content doesn't also need another config-shape change.
     #[arg(long = "log-level", value_enum)]
     pub log_level: Option<LogLevelArg>,
+
+    /// One-off override for `zhao.yml`'s `log.retention_days` (see
+    /// issue #37): purges `target/zhao/logs/` files older than this
+    /// many days for this run only, without changing `zhao.yml`. With
+    /// neither this nor `zhao.yml`'s `log.retention_days` set, no
+    /// purging happens at all -- the default is "keep everything."
+    #[arg(long = "purge-logs")]
+    pub purge_logs: Option<u32>,
 }
 
 impl LineageArgs {
@@ -249,6 +257,14 @@ pub struct CheckArgs {
     /// debug-level content doesn't also need another config-shape change.
     #[arg(long = "log-level", value_enum)]
     pub log_level: Option<LogLevelArg>,
+
+    /// One-off override for `zhao.yml`'s `log.retention_days` (see
+    /// issue #37): purges `target/zhao/logs/` files older than this
+    /// many days for this run only, without changing `zhao.yml`. With
+    /// neither this nor `zhao.yml`'s `log.retention_days` set, no
+    /// purging happens at all -- the default is "keep everything."
+    #[arg(long = "purge-logs")]
+    pub purge_logs: Option<u32>,
 }
 
 impl CheckArgs {
@@ -312,6 +328,7 @@ mod tests {
             compile: false,
             package: None,
             log_level: None,
+            purge_logs: None,
         }
     }
 

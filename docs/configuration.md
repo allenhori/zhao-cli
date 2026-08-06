@@ -83,19 +83,25 @@ when given; with neither set, zhao falls back to `master`.
 
 ## `log`
 
-The verbosity of each run's entry in the daily-rotating run log (`target/zhao/logs/<date>.log`
--- see [Command reference](commands.md#the-daily-run-log)):
+Settings for the daily-rotating run log (`target/zhao/logs/<date>.log` -- see
+[Command reference](commands.md#the-daily-run-log)):
 
 ```yaml
 log:
-  level: mirror   # or: debug
+  level: mirror       # or: debug
+  retention_days: 30  # omit entirely to keep everything, forever
 ```
 
-`mirror` (the default) is a literal mirror of whatever was already printed to stdout. `debug`
-is accepted and parsed but not yet wired to anything -- there's no debug-level content defined
-yet for it to switch to; reserved so a later ticket adding real debug-level content doesn't need
-another config-shape change. A CLI `--log-level` flag exists on `check`/`diff`/`lineage` for the
-same reason, also not yet connected to anything.
+`level` -- `mirror` (the default) is a literal mirror of whatever was already printed to
+stdout. `debug` is accepted and parsed but not yet wired to anything -- there's no debug-level
+content defined yet for it to switch to; reserved so a later ticket adding real debug-level
+content doesn't need another config-shape change. A CLI `--log-level` flag exists on
+`check`/`diff`/`lineage` for the same reason, also not yet connected to anything.
+
+`retention_days` -- how many days of `target/zhao/logs/` history to keep; log files older than
+this are purged on every run. Omitted by default, which means no purging happens at all --
+matching the assumption that most environments running zhao are disposable anyway. A CLI
+`--purge-logs <days>` flag overrides this for a single run without changing `zhao.yml`.
 
 ## Monorepos: multiple dbt projects
 

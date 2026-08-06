@@ -107,6 +107,20 @@ impl AdapterVocabulary for DbtVocabulary {
     }
 }
 
+/// A successful `dbt compile`/`dbt deps` run's captured stdout/stderr --
+/// see [`DbtAdapter::compile`]/[`DbtAdapter::deps`]. Discarded before
+/// issue #36; now returned so a caller can route it into the daily run
+/// log for post-hoc inspection, the same way a *failing* run's output
+/// is already carried on [`DbtAdapterError::CompileFailed`]/
+/// [`DbtAdapterError::DepsFailed`].
+#[derive(Debug, Clone, Default)]
+pub struct DbtCommandOutput {
+    /// The subcommand's captured stdout.
+    pub stdout: String,
+    /// The subcommand's captured stderr.
+    pub stderr: String,
+}
+
 /// Everything that can go wrong while an adapter reads and parses a dbt
 /// project's compiled manifest.
 #[derive(Debug, thiserror::Error)]
@@ -211,16 +225,18 @@ impl DbtAdapter {
         project_dir: &Path,
         dbt_command: &str,
         extra_args: &[String],
-    ) -> Result<(), DbtAdapterError> {
+    ) -> Result<DbtCommandOutput, DbtAdapterError> {
         let output = run_dbt_subcommand(dbt_command, "compile", project_dir, extra_args)?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
             return Err(DbtAdapterError::CompileFailed {
                 project_dir: project_dir.display().to_string(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                stdout,
+                stderr,
             });
         }
-        Ok(())
+        Ok(DbtCommandOutput { stdout, stderr })
     }
 
     /// Runs `dbt deps` in `project_dir`, installing any package
@@ -235,16 +251,18 @@ impl DbtAdapter {
         project_dir: &Path,
         dbt_command: &str,
         extra_args: &[String],
-    ) -> Result<(), DbtAdapterError> {
+    ) -> Result<DbtCommandOutput, DbtAdapterError> {
         let output = run_dbt_subcommand(dbt_command, "deps", project_dir, extra_args)?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
             return Err(DbtAdapterError::DepsFailed {
                 project_dir: project_dir.display().to_string(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                stdout,
+                stderr,
             });
         }
-        Ok(())
+        Ok(DbtCommandOutput { stdout, stderr })
     }
 
     /// Reads a compiled manifest's `metadata.adapter_type` -- dbt's own
@@ -1851,6 +1869,35 @@ mod tests {
         );
     }
 
+    /// Issue #36's core change: a successful `compile()` call's captured
+    /// stdout/stderr is returned on `Ok`, not discarded -- previously
+    /// there was no way for a caller to route it into the run log at
+    /// all, even though it was already sitting in memory during the
+    /// run.
+    #[cfg(unix)]
+    #[test]
+    fn compile_returns_its_captured_stdout_and_stderr_on_success() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(
+            stub_dir.path(),
+            "mkdir -p target && echo '{}' > target/manifest.json\n\
+             echo 'compiling...'\n\
+             echo 'a warning' >&2",
+        );
+
+        let output = DbtAdapter
+            .compile(project_dir.path(), dbt.to_str().expect("utf8 path"), &[])
+            .expect("compile should succeed");
+
+        assert!(
+            output.stdout.contains("compiling..."),
+            "{:?}",
+            output.stdout
+        );
+        assert!(output.stderr.contains("a warning"), "{:?}", output.stderr);
+    }
+
     #[cfg(unix)]
     #[test]
     fn compile_reports_a_clear_error_when_dbt_compile_fails() {
@@ -1988,6 +2035,34 @@ mod tests {
         let recorded_args =
             fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
         assert_eq!(recorded_args.trim(), "deps");
+    }
+
+    /// Same as `compile`'s equivalent (see issue #36): a successful
+    /// `deps()` call's captured output is returned, not discarded.
+    #[cfg(unix)]
+    #[test]
+    fn deps_returns_its_captured_stdout_and_stderr_on_success() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(
+            stub_dir.path(),
+            "echo 'installing packages...'\necho 'a deps warning' >&2",
+        );
+
+        let output = DbtAdapter
+            .deps(project_dir.path(), dbt.to_str().expect("utf8 path"), &[])
+            .expect("deps should succeed");
+
+        assert!(
+            output.stdout.contains("installing packages..."),
+            "{:?}",
+            output.stdout
+        );
+        assert!(
+            output.stderr.contains("a deps warning"),
+            "{:?}",
+            output.stderr
+        );
     }
 
     #[cfg(unix)]

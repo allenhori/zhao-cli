@@ -27,7 +27,16 @@ const EXIT_ERROR: u8 = 2;
 /// Runs `zhao lineage` and returns the process exit code.
 pub fn run(args: &LineageArgs) -> ExitCode {
     if args.compile {
-        if let Err(err) = DbtAdapter.compile(&args.project_dir, "dbt", &[]) {
+        // `dbt_project_dir` and `real_project_dir` are the same path
+        // here -- unlike `baseline::resolve`'s git-native Baseline
+        // compile (which runs in a throwaway worktree), `--compile`
+        // runs directly in the real project directory. See issue #36.
+        if let Err(err) = crate::log::log_dbt_result(
+            "compile",
+            &args.project_dir,
+            &args.project_dir,
+            DbtAdapter.compile(&args.project_dir, "dbt", &[]),
+        ) {
             return fail(&err.to_string());
         }
     }
@@ -48,10 +57,26 @@ pub fn run(args: &LineageArgs) -> ExitCode {
         return fail(&err);
     }
 
-    if args.text {
-        return run_text(args, &project);
-    }
-    run_html(args, &project)
+    let exit_code = if args.text {
+        run_text(args, &project)
+    } else {
+        run_html(args, &project)
+    };
+
+    // `--purge-logs` wins when explicitly passed; otherwise `zhao.yml`'s
+    // `log.retention_days`; otherwise no purging. A `zhao.yml` load
+    // failure here is silently treated as "no retention configured"
+    // rather than failing the whole command -- `zhao lineage` doesn't
+    // otherwise depend on `zhao.yml` at all, so a config problem
+    // shouldn't block a query that doesn't need it. See issue #37.
+    let log_retention_days = args.purge_logs.or_else(|| {
+        zhao_core::config::Config::load_for_project(&args.project_dir)
+            .ok()
+            .and_then(|config| config.log_retention_days())
+    });
+    crate::log::purge(&args.project_dir, log_retention_days);
+
+    exit_code
 }
 
 /// Writes `<project_dir>/target/zhao/full_lineage.json`: a direct

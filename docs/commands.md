@@ -132,8 +132,22 @@ stdout; it's a mirror, not a redirect.
 | Flag | Default | What it does |
 |---|---|---|
 | `--log-level <mirror\|debug>` | `mirror` | Accepted and parsed (see [Configuring `log`](configuration.md#log)) but not yet wired to anything — the run log has no `debug`-level content defined yet for either this or `zhao.yml`'s `log.level` to switch to. Reserved so a later ticket adding real debug-level content doesn't need another config-shape change. |
+| `--purge-logs <days>` | — | One-off override for `zhao.yml`'s `log.retention_days` (see [Configuring `log`](configuration.md#log)): purges `target/zhao/logs/` files older than `<days>` days for this run only, without changing `zhao.yml`. |
 
-No purge/retention logic yet — `target/zhao/logs/` accumulates indefinitely by default.
+With neither `--purge-logs` nor `zhao.yml`'s `log.retention_days` set, no purging happens at
+all — `target/zhao/logs/` accumulates indefinitely by default, matching the assumption that
+most environments running zhao are disposable anyway. Purging only ever removes files under
+`target/zhao/logs/` matching the `<YYYY-MM-DD>.log` pattern this log itself writes and older
+than the configured window — never any other `target/zhao/` artifact, and never a log still
+within the window.
+
+Any internal `dbt compile`/`dbt deps` subprocess zhao itself runs — `zhao check`/`zhao diff`'s
+git-native Baseline resolution, and `zhao lineage --compile` — has its own captured
+stdout/stderr routed into the same day's log entry too, both on success (previously discarded
+entirely) and on failure (in addition to the terminal error message dbt compile/deps failures
+already surface) — so an internal compile/deps run is always inspectable after the fact,
+without ever printing dbt's raw output to the terminal directly (which would otherwise corrupt
+`--format json` piping).
 
 ## `zhao update`
 

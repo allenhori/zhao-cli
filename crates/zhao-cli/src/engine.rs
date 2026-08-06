@@ -27,6 +27,10 @@ pub(crate) struct EngineOutput {
     pub report: Report,
     /// The current project state the report was built from.
     pub current: zhao_core::model::ParsedProject,
+    /// The resolved run-log retention window (`--purge-logs` if given,
+    /// else `zhao.yml`'s `log.retention_days`, else `None`) -- see
+    /// [`purge_run_logs`] and issue #37.
+    pub log_retention_days: Option<u32>,
 }
 
 /// Runs the full engine pipeline -- Baseline resolution, diff, Rule
@@ -78,7 +82,23 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         report = apply_check_relations(report, args, &current_manifest, &dbt_passthrough_args);
     }
 
-    Ok(EngineOutput { report, current })
+    // `--purge-logs` wins when explicitly passed; otherwise `zhao.yml`'s
+    // `log.retention_days`; otherwise `None` (no purging). See issue #37.
+    let log_retention_days = args.purge_logs.or_else(|| config.log_retention_days());
+
+    Ok(EngineOutput {
+        report,
+        current,
+        log_retention_days,
+    })
+}
+
+/// Purges old `target/zhao/logs/` entries per `log_retention_days` (see
+/// [`EngineOutput::log_retention_days`]) -- a thin wrapper so `zhao
+/// check`/`zhao diff` don't need to reach into `crate::log` directly.
+/// A no-op when `log_retention_days` is `None`. See issue #37.
+pub(crate) fn purge_run_logs(args: &CheckArgs, log_retention_days: Option<u32>) {
+    crate::log::purge(&args.project_dir, log_retention_days);
 }
 
 /// `--check-relations`: upgrades or drops each conditional schema-
