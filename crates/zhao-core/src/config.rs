@@ -76,6 +76,7 @@ pub struct Config {
     overrides: HashMap<RuleId, Severity>,
     defer_target: Option<String>,
     defer_state: Option<String>,
+    against: Option<String>,
 }
 
 impl Default for Config {
@@ -85,6 +86,7 @@ impl Default for Config {
             overrides: HashMap::new(),
             defer_target: None,
             defer_state: None,
+            against: None,
         }
     }
 }
@@ -117,6 +119,15 @@ impl Config {
     /// all -- that's a `zhao-cli`-side decision, not this crate's).
     pub fn defer_state(&self) -> Option<&str> {
         self.defer_state.as_deref()
+    }
+
+    /// The configured ref to resolve a git-native Baseline's merge-base
+    /// against (e.g. `"main"`), if `zhao.yml` sets one. `None` if it
+    /// doesn't -- callers should fall back to zhao's own default
+    /// (`"master"`) the same way they already fall back when neither
+    /// this nor a CLI override is given.
+    pub fn against(&self) -> Option<&str> {
+        self.against.as_deref()
     }
 
     /// Loads a single `zhao.yml` from the given path. Returns
@@ -184,6 +195,7 @@ struct ConfigLayer {
     overrides: HashMap<RuleId, Severity>,
     defer_target: Option<String>,
     defer_state: Option<String>,
+    against: Option<String>,
 }
 
 impl ConfigLayer {
@@ -218,6 +230,7 @@ impl ConfigLayer {
             overrides,
             defer_target: self.defer_target.or(base.defer_target),
             defer_state: self.defer_state.or(base.defer_state),
+            against: self.against.or(base.against),
         }
     }
 
@@ -227,6 +240,7 @@ impl ConfigLayer {
             overrides: self.overrides,
             defer_target: self.defer_target,
             defer_state: self.defer_state,
+            against: self.against,
         }
     }
 }
@@ -250,6 +264,8 @@ struct RawConfig {
     rules: HashMap<String, String>,
     #[serde(default)]
     defer: Option<RawDeferConfig>,
+    #[serde(default)]
+    against: Option<String>,
 }
 
 /// The `defer:` section of `zhao.yml` -- see
@@ -303,6 +319,7 @@ impl RawConfig {
             overrides,
             defer_target,
             defer_state,
+            against: self.against,
         })
     }
 }
@@ -697,5 +714,31 @@ mod tests {
         // Root's value still applies for the key the project-local file
         // doesn't touch.
         assert_eq!(config.defer_target(), Some("prod"));
+    }
+
+    #[test]
+    fn missing_against_leaves_it_unset() {
+        let config = Config::load(Path::new("/nonexistent/zhao.yml")).expect("should be ok");
+        assert_eq!(config.against(), None);
+    }
+
+    #[test]
+    fn against_is_read_from_zhao_yml() {
+        let file = write_temp_yaml("against: main\n");
+        let config = Config::load(file.path()).expect("should parse");
+
+        assert_eq!(config.against(), Some("main"));
+    }
+
+    #[test]
+    fn project_local_against_wins_over_root() {
+        let repo = fake_repo();
+        fs::write(repo.root.join("zhao.yml"), "against: main\n").expect("should write root config");
+        fs::write(repo.project_dir.join("zhao.yml"), "against: develop\n")
+            .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        assert_eq!(config.against(), Some("develop"));
     }
 }

@@ -36,15 +36,24 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     let current_manifest = args.project_dir.join("target").join("manifest.json");
 
     let dbt_passthrough_args = args.dbt_passthrough_args()?;
+    let config = Config::load_for_project(&args.project_dir).map_err(|err| err.to_string())?;
+    // `--against` wins when explicitly passed; otherwise `zhao.yml`'s
+    // `against`; otherwise zhao's own default. Resolved once, up front,
+    // so both Baseline resolution and the staleness check (which must
+    // agree on what "the target branch" is) use the exact same value.
+    let against = args
+        .against
+        .clone()
+        .or_else(|| config.against().map(str::to_string))
+        .unwrap_or_else(|| "master".to_string());
     let baseline = crate::baseline::resolve(
         args.state.as_deref(),
         &args.project_dir,
-        &args.against,
+        &against,
         &dbt_passthrough_args,
     )
     .map_err(|err| err.to_string())?;
     let current = load_manifest(&current_manifest)?;
-    let config = Config::load_for_project(&args.project_dir).map_err(|err| err.to_string())?;
 
     let changes = diff(&baseline, &current);
     let findings = evaluate(&baseline, &changes, &config);
@@ -60,7 +69,7 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
             .or_else(|| config.defer_state().map(str::to_string)),
     };
     let mut report = Report::new(&changes, &findings)
-        .with_staleness_warning(is_stale(&args.project_dir, &args.against))
+        .with_staleness_warning(is_stale(&args.project_dir, &against))
         .with_recommended_command(DbtAdapter.vocabulary())
         .with_defer_plan(&current, DbtAdapter.vocabulary(), &defer_settings)
         .with_schema_evolution_warnings(&current);

@@ -1322,6 +1322,99 @@ mod git_native_baseline {
         );
     }
 
+    /// Same shape as `repo_with_baseline_and_current`, but the default
+    /// branch is named `main` (not `master`) -- since zhao's own
+    /// hardcoded default is `"master"`, a merge-base resolution that
+    /// only succeeds against `main` can only be working because
+    /// `zhao.yml`'s `against` (or an explicit `--against`) was actually
+    /// read, not because it happened to coincide with the built-in
+    /// default.
+    fn repo_with_main_branch_and_current(
+        baseline_manifest: &str,
+        current_manifest: &str,
+    ) -> TestRepo {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = dir.path().to_path_buf();
+        let repo = TestRepo { _dir: dir, path };
+        repo.git(&["init", "--initial-branch=main"]);
+        repo.git(&["config", "user.email", "test@zhao.invalid"]);
+        repo.git(&["config", "user.name", "zhao test"]);
+
+        repo.write("dbt_manifest_source.json", baseline_manifest);
+        repo.commit("baseline state");
+
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("README.md", "an unrelated change on the feature branch\n");
+        repo.commit("feature work, ahead of main");
+
+        repo.write("target/manifest.json", current_manifest);
+        repo
+    }
+
+    /// Acceptance criterion: `zhao.yml`'s `against` is honored for
+    /// git-native Baseline resolution when no `--against` flag is given.
+    #[test]
+    fn zhao_yml_against_is_honored_with_no_cli_flag() {
+        let stub_dir = stub_dbt_dir();
+        let repo = repo_with_main_branch_and_current(
+            &rules_baseline_manifest_json(),
+            &rules_project_current_manifest_json(),
+        );
+        repo.write("zhao.yml", "against: main\n");
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env("PATH", path_with_stub_dbt_prepended(&stub_dir))
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .arg("--format")
+            .arg("json")
+            .output()
+            .expect("command should run");
+
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "expected exit 0 or 1 (a real merge-base was found and diffed), got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Acceptance criterion: an explicit `--against` flag overrides a
+    /// conflicting `zhao.yml` value.
+    #[test]
+    fn cli_against_flag_overrides_a_conflicting_zhao_yml_value() {
+        let stub_dir = stub_dbt_dir();
+        let repo = repo_with_main_branch_and_current(
+            &rules_baseline_manifest_json(),
+            &rules_project_current_manifest_json(),
+        );
+        // A deliberately wrong zhao.yml value -- the CLI flag should win,
+        // not this.
+        repo.write("zhao.yml", "against: does-not-exist\n");
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env("PATH", path_with_stub_dbt_prepended(&stub_dir))
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .arg("--against")
+            .arg("main")
+            .arg("--format")
+            .arg("json")
+            .output()
+            .expect("command should run");
+
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "expected exit 0 or 1 (--against main should win over zhao.yml's bogus value), got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Acceptance criterion 3: a clear, actionable error (exit 2) when
     /// `dbt` isn't invokable. `PATH` is overridden to a directory holding
     /// only a `git` symlink -- deterministic regardless of whether a real

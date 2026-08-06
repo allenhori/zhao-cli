@@ -68,6 +68,19 @@ Both are optional and independent. `state` alone still produces a full, ready-to
 function without a state path. `--defer-target`/`--defer-state` CLI flags override either
 value when given.
 
+## `against`
+
+The branch `zhao check`/`zhao diff`'s git-native Baseline resolution finds a merge-base
+against, when `--state` isn't given:
+
+```yaml
+against: main
+```
+
+Saves passing `--against main` on every invocation just because your default branch isn't
+called `master` (zhao's own built-in default). The CLI `--against` flag still overrides this
+when given; with neither set, zhao falls back to `master`.
+
 ## Monorepos: multiple dbt projects
 
 A root-level `zhao.yml` (at the nearest ancestor directory containing `.git`) acts as the
@@ -101,4 +114,6 @@ rules:
 defer:
   target: prod
   state: artifacts/prod/manifest.json
+
+against: main
 ```

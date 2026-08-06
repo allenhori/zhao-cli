@@ -127,9 +127,15 @@ pub struct CheckArgs {
     pub project_dir: PathBuf,
 
     /// The ref to resolve a git-native Baseline's merge-base against.
-    /// Ignored when `--state` is given.
-    #[arg(long, default_value = "master")]
-    pub against: String,
+    /// Ignored when `--state` is given. Overrides `zhao.yml`'s `against`
+    /// when given; with neither set, defaults to `"master"`. No
+    /// `default_value` here (unlike most flags) specifically so the
+    /// engine can tell "the user explicitly passed --against" apart from
+    /// "nothing was passed at all" -- otherwise a `zhao.yml`-configured
+    /// value could never be distinguished from clap's own default and
+    /// would always lose to it.
+    #[arg(long)]
+    pub against: Option<String>,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
