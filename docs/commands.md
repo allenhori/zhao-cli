@@ -120,3 +120,17 @@ resolver can't fully trace) as `(unresolved)` — visible, never silently droppe
 Every invocation also unconditionally writes `target/zhao/full_lineage.json` — the whole
 project's lineage graph, independent of `TARGET`/`--text`/`--html`, meant for other tooling to
 read directly. See [Understanding lineage](lineage-html.md#targetzhaofull_lineagejson).
+
+## The daily run log
+
+Every `check`/`diff`/`lineage` run also appends its own stdout to
+`target/zhao/logs/<YYYY-MM-DD>.log`, one file per calendar day, rotated at midnight — always
+on, no flag needed, the same "unconditional machine-readable output" precedent as
+`target/zhao/run-metadata.json`. This never changes what's actually printed to the real
+stdout; it's a mirror, not a redirect.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--log-level <mirror\|debug>` | `mirror` | Accepted and parsed (see [Configuring `log`](configuration.md#log)) but not yet wired to anything — the run log has no `debug`-level content defined yet for either this or `zhao.yml`'s `log.level` to switch to. Reserved so a later ticket adding real debug-level content doesn't need another config-shape change. |
+
+No purge/retention logic yet — `target/zhao/logs/` accumulates indefinitely by default.

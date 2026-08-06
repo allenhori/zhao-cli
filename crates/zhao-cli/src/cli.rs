@@ -80,6 +80,16 @@ pub struct LineageArgs {
     /// bare name is already unambiguous.
     #[arg(long)]
     pub package: Option<String>,
+
+    /// The intended CLI override for `zhao.yml`'s `log.level` (see issue
+    /// #35). Accepted and parsed now -- neither this flag nor `zhao.yml`'s
+    /// own `log.level` actually changes anything about the daily run log
+    /// yet, since its only defined content today (`Mirror`) is a literal,
+    /// unmodified copy of stdout, and `Debug` has no defined content of
+    /// its own to switch to -- reserved so a later ticket adding real
+    /// debug-level content doesn't also need another config-shape change.
+    #[arg(long = "log-level", value_enum)]
+    pub log_level: Option<LogLevelArg>,
 }
 
 impl LineageArgs {
@@ -209,6 +219,16 @@ pub struct CheckArgs {
     /// themselves. Overrides `zhao.yml`'s `defer.state` when given.
     #[arg(long = "defer-state")]
     pub defer_state: Option<PathBuf>,
+
+    /// The intended CLI override for `zhao.yml`'s `log.level` (see issue
+    /// #35). Accepted and parsed now -- neither this flag nor `zhao.yml`'s
+    /// own `log.level` actually changes anything about the daily run log
+    /// yet, since its only defined content today (`Mirror`) is a literal,
+    /// unmodified copy of stdout, and `Debug` has no defined content of
+    /// its own to switch to -- reserved so a later ticket adding real
+    /// debug-level content doesn't also need another config-shape change.
+    #[arg(long = "log-level", value_enum)]
+    pub log_level: Option<LogLevelArg>,
 }
 
 impl CheckArgs {
@@ -237,6 +257,27 @@ pub enum OutputFormat {
     Json,
 }
 
+/// The CLI-facing spelling of [`zhao_core::config::LogLevel`] -- a
+/// separate type (rather than deriving `ValueEnum` on the `zhao-core`
+/// type directly) so `zhao-core` doesn't need a `clap` dependency just
+/// for this one flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LogLevelArg {
+    /// A literal mirror of whatever was already printed to stdout.
+    Mirror,
+    /// Reserved for a later ticket's richer, internal-only content.
+    Debug,
+}
+
+impl From<LogLevelArg> for zhao_core::config::LogLevel {
+    fn from(value: LogLevelArg) -> Self {
+        match value {
+            LogLevelArg::Mirror => zhao_core::config::LogLevel::Mirror,
+            LogLevelArg::Debug => zhao_core::config::LogLevel::Debug,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +291,7 @@ mod tests {
             text: false,
             compile: false,
             package: None,
+            log_level: None,
         }
     }
 

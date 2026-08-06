@@ -171,11 +171,13 @@ fn run_html(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> Ex
     let absolute_path = html_path
         .canonicalize()
         .unwrap_or_else(|_| html_path.to_path_buf());
-    println!(
-        "Wrote {} -- open it at file://{}",
+    let printed = format!(
+        "Wrote {} -- open it at file://{}\n",
         html_path.display(),
         absolute_path.display()
     );
+    print!("{printed}");
+    crate::log::mirror(&args.project_dir, &printed);
     ExitCode::from(EXIT_OK)
 }
 
@@ -206,6 +208,7 @@ fn run_text(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> Ex
     };
 
     print!("{text}");
+    crate::log::mirror(&args.project_dir, &text);
     ExitCode::from(EXIT_OK)
 }
 
