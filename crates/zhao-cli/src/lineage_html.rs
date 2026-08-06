@@ -248,6 +248,10 @@ fn render_html(graph_data_json: &str, node_term: &str, origin_term: &str) -> Str
       <span class="legend-item"><span class="legend-dot node"></span>{node_term}</span>
     </div>
   </header>
+  <div id="scope-banner">
+    <span id="scope-banner-text"></span>
+    <button id="scope-expand-btn" class="mini-btn" type="button">Show whole project</button>
+  </div>
   <div id="main">
     <div id="graph-scroll"><svg id="graph" xmlns="http://www.w3.org/2000/svg"></svg></div>
     <aside id="panel">
@@ -360,6 +364,16 @@ body {
 .legend-dot.node { background: var(--series-node); }
 .legend-dot.origin { background: var(--series-origin); }
 
+/* Hidden by default -- shown only when the initial view is scoped to a
+   target's related subgraph (issue #40); JS toggles `display` directly,
+   same convention `#panel-empty`/`#panel-content` already use. */
+#scope-banner {
+  display: none; align-items: center; gap: 12px;
+  padding: 8px 20px; background: var(--series-node-soft); border-bottom: 1px solid var(--border);
+  font-size: 13px; color: var(--text-secondary);
+}
+#scope-banner strong { color: var(--text-primary); }
+
 #main { flex: 1; display: flex; overflow: hidden; }
 #graph-scroll { flex: 1; overflow: auto; }
 #graph { display: block; }
@@ -464,6 +478,13 @@ const JS: &str = r#"
   let selectedId = null;
   let selectedColumn = null;
   let layout = null; // Map<id, {x, y, w, h}>
+  // `null` means "whole project"; otherwise a Set of node/origin ids
+  // that `computeLayout`/`render` should treat as the only visible
+  // graph -- the initial-view scoping from issue #40. Set once at
+  // startup (to a target's related subgraph, if one was given) and
+  // cleared for good by `expandToWholeProject`; nothing else narrows it
+  // again for the rest of the page's life.
+  let visibleIds = null;
   // Column list order in the side panel: "source" (the model's final
   // `SELECT` order, the default), "az", or "za" -- cycled by the sort
   // button. The graph itself always renders columns in source order
@@ -492,6 +513,7 @@ const JS: &str = r#"
   function computeLayout() {
     const byLayer = new Map();
     for (const n of data.nodes) {
+      if (visibleIds !== null && !visibleIds.has(n.id)) continue;
       if (!byLayer.has(n.layer)) byLayer.set(n.layer, []);
       byLayer.get(n.layer).push(n);
     }
@@ -568,6 +590,7 @@ const JS: &str = r#"
     nodeEls.clear();
     for (const n of data.nodes) {
       const p = layout.pos.get(n.id);
+      if (!p) continue; // scoped out of the current view -- see `visibleIds`
       const g = el("g", { class: `node-box ${n.kind}` });
       g.dataset.id = n.id;
 
@@ -647,6 +670,37 @@ const JS: &str = r#"
       frontier = next;
     }
     return { ancestors, descendants };
+  }
+
+  // `id`'s full transitive closure (itself plus every ancestor and
+  // descendant) -- the same set `bfsNodeLevel` computes for highlighting,
+  // reused as the *visible* set for the initial scoped view (issue #40).
+  function relatedIds(id) {
+    const { ancestors, descendants } = bfsNodeLevel(id);
+    return new Set([id, ...ancestors, ...descendants]);
+  }
+
+  function updateScopeBanner() {
+    const banner = document.getElementById("scope-banner");
+    if (visibleIds === null) {
+      banner.style.display = "none";
+      return;
+    }
+    const n = selectedId && byId.get(selectedId);
+    const label = n ? `${n.kind === "origin" ? data.origin_term : data.node_term} ${n.name}` : "the selected target";
+    document.getElementById("scope-banner-text").textContent =
+      `Showing ${label} and its lineage only.`;
+    banner.style.display = "flex";
+  }
+
+  // Clears the scope for the rest of the page's life -- there's no path
+  // back to a narrower view once expanded (matches the acceptance
+  // criterion: a one-way escape hatch, not a re-toggleable filter).
+  function expandToWholeProject() {
+    if (visibleIds === null) return;
+    visibleIds = null;
+    updateScopeBanner();
+    render();
   }
 
   // Column-level BFS, mirroring zhao-core::lineage's walk_upstream_column/
@@ -872,7 +926,16 @@ const JS: &str = r#"
     renderSummarySide(summary, "Downstream", down);
   }
 
-  document.getElementById("search").addEventListener("input", applyHighlight);
+  document.getElementById("search").addEventListener("input", () => {
+    // A scoped initial view only has the related subgraph rendered at
+    // all -- searching for something outside it would otherwise just
+    // silently find nothing, which reads as broken rather than
+    // "out of scope." Typing any search term implicitly expands to the
+    // whole project first, same as the explicit banner button.
+    if (document.getElementById("search").value.trim()) expandToWholeProject();
+    applyHighlight();
+  });
+  document.getElementById("scope-expand-btn").addEventListener("click", expandToWholeProject);
   document.getElementById("show-columns").addEventListener("change", (ev) => {
     showColumns = ev.target.checked;
     render();
@@ -896,13 +959,23 @@ const JS: &str = r#"
     if (selectedId && currentColumnResult) renderPanel(selectedId, currentColumnResult);
   });
 
-  render();
-
+  // A targeted export's initial render scopes down to just the target's
+  // related subgraph (its full upstream/downstream transitive closure) --
+  // the whole project's data is still embedded and `expandToWholeProject`
+  // (the banner button, or typing a search term) un-scopes it without
+  // regenerating the file. No target at all (a whole-project export) has
+  // nothing to scope down from -- render everything, no banner. See
+  // issue #40. (`selectNode` below already calls `render()` itself, so
+  // there's no separate render() needed on the scoped branch.)
   if (data.initial_target) {
+    visibleIds = relatedIds(data.initial_target);
     if (data.initial_column) showColumns = true;
     document.getElementById("show-columns").checked = showColumns;
     selectNode(data.initial_target);
     if (data.initial_column) selectColumn(data.initial_column);
+    updateScopeBanner();
+  } else {
+    render();
   }
 })();
 "#;
@@ -1046,6 +1119,38 @@ mod tests {
         let html = generate(&sample_project(), &DbtVocabulary, None, None);
         assert!(!html.contains("\"initial_target\":"));
         assert!(!html.contains("\"initial_column\":"));
+    }
+
+    /// Acceptance criterion: a targeted export's markup carries the
+    /// scope-banner element and its expand control, since the initial
+    /// render now scopes down to the target's related subgraph. The
+    /// actual scoping/expand *behavior* lives in the embedded JS and is
+    /// verified in a real browser (see issue #40), not here -- this only
+    /// checks the control exists in the emitted document at all.
+    #[test]
+    fn a_targeted_export_carries_the_scope_banner_and_expand_control() {
+        let html = generate(
+            &sample_project(),
+            &DbtVocabulary,
+            Some(NodeId::new("model.p.a")),
+            None,
+        );
+        assert!(html.contains(r#"id="scope-banner""#));
+        assert!(html.contains(r#"id="scope-expand-btn""#));
+        assert!(html.contains("relatedIds"));
+        assert!(html.contains("expandToWholeProject"));
+    }
+
+    /// The scope banner/expand machinery is present in every export's
+    /// markup regardless of whether a target was actually given -- it's
+    /// the embedded JS deciding at load time (via `data.initial_target`)
+    /// whether to scope down at all, not something Rust conditionally
+    /// emits into the page.
+    #[test]
+    fn the_whole_project_export_still_carries_the_scope_banner_markup() {
+        let html = generate(&sample_project(), &DbtVocabulary, None, None);
+        assert!(html.contains(r#"id="scope-banner""#));
+        assert!(html.contains(r#"id="scope-expand-btn""#));
     }
 
     #[test]
