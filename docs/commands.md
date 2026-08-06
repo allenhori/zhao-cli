@@ -114,3 +114,9 @@ Downstream:
 A column-level target additionally reports any node with real connectivity in that direction
 whose specific column mapping couldn't be resolved (a computed expression zhao's static SQL
 resolver can't fully trace) as `(unresolved)` — visible, never silently dropped.
+
+### `target/zhao/full_lineage.json`
+
+Every invocation also unconditionally writes `target/zhao/full_lineage.json` — the whole
+project's lineage graph, independent of `TARGET`/`--text`/`--html`, meant for other tooling to
+read directly. See [Understanding lineage](lineage-html.md#targetzhaofull_lineagejson).
