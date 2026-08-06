@@ -104,6 +104,7 @@ pub struct Config {
     defer_state: Option<String>,
     against: Option<String>,
     log_level: LogLevel,
+    log_retention_days: Option<u32>,
 }
 
 impl Default for Config {
@@ -115,6 +116,7 @@ impl Default for Config {
             defer_state: None,
             against: None,
             log_level: LogLevel::default(),
+            log_retention_days: None,
         }
     }
 }
@@ -163,6 +165,16 @@ impl Config {
     /// of the cascade.
     pub fn log_level(&self) -> LogLevel {
         self.log_level
+    }
+
+    /// The configured run-log retention window, in days -- see issue
+    /// #37. `None` (the default, if `zhao.yml` sets no
+    /// `log.retention_days` at any level of the cascade) means "keep
+    /// everything, purge nothing," matching the assumption that most
+    /// environments running zhao are disposable anyway. `Some(n)` means
+    /// purge log files older than `n` days on every run.
+    pub fn log_retention_days(&self) -> Option<u32> {
+        self.log_retention_days
     }
 
     /// Loads a single `zhao.yml` from the given path. Returns
@@ -232,6 +244,7 @@ struct ConfigLayer {
     defer_state: Option<String>,
     against: Option<String>,
     log_level: Option<LogLevel>,
+    log_retention_days: Option<u32>,
 }
 
 impl ConfigLayer {
@@ -268,6 +281,7 @@ impl ConfigLayer {
             defer_state: self.defer_state.or(base.defer_state),
             against: self.against.or(base.against),
             log_level: self.log_level.or(base.log_level),
+            log_retention_days: self.log_retention_days.or(base.log_retention_days),
         }
     }
 
@@ -279,6 +293,7 @@ impl ConfigLayer {
             defer_state: self.defer_state,
             against: self.against,
             log_level: self.log_level.unwrap_or_default(),
+            log_retention_days: self.log_retention_days,
         }
     }
 }
@@ -313,6 +328,8 @@ struct RawConfig {
 struct RawLogConfig {
     #[serde(default)]
     level: Option<String>,
+    #[serde(default)]
+    retention_days: Option<u32>,
 }
 
 /// The `defer:` section of `zhao.yml` -- see
@@ -361,7 +378,11 @@ impl RawConfig {
             Some(defer) => (defer.target, defer.state),
         };
 
-        let log_level = match self.log.and_then(|log| log.level) {
+        let (log_level_name, log_retention_days) = match self.log {
+            None => (None, None),
+            Some(log) => (log.level, log.retention_days),
+        };
+        let log_level = match log_level_name {
             None => None,
             Some(name) => Some(LogLevel::from_config_name(&name).ok_or_else(|| {
                 ConfigError::InvalidLogLevel {
@@ -378,6 +399,7 @@ impl RawConfig {
             defer_state,
             against: self.against,
             log_level,
+            log_retention_days,
         })
     }
 }
@@ -549,6 +571,33 @@ mod tests {
         let file = write_temp_yaml("log:\n  level: verbose\n");
         let result = Config::load(file.path());
         assert!(matches!(result, Err(ConfigError::InvalidLogLevel { .. })));
+    }
+
+    /// Issue #37's acceptance criterion: no purging happens (unset)
+    /// unless explicitly configured -- the default remains "keep
+    /// everything."
+    #[test]
+    fn log_retention_days_defaults_to_none_when_unset() {
+        let config = Config::load(Path::new("/nonexistent/zhao.yml")).expect("should be ok");
+        assert_eq!(config.log_retention_days(), None);
+    }
+
+    #[test]
+    fn log_retention_days_is_parsed_from_zhao_yml() {
+        let file = write_temp_yaml("log:\n  retention_days: 14\n");
+        let config = Config::load(file.path()).expect("should parse");
+        assert_eq!(config.log_retention_days(), Some(14));
+    }
+
+    /// `log.level` and `log.retention_days` are independent keys under
+    /// the same `log:` section -- setting one doesn't require or clear
+    /// the other.
+    #[test]
+    fn log_level_and_retention_days_are_independent() {
+        let file = write_temp_yaml("log:\n  level: debug\n  retention_days: 7\n");
+        let config = Config::load(file.path()).expect("should parse");
+        assert_eq!(config.log_level(), LogLevel::Debug);
+        assert_eq!(config.log_retention_days(), Some(7));
     }
 
     #[test]
