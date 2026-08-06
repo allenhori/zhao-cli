@@ -37,9 +37,9 @@ pub struct LineageArgs {
     /// name (or `model.column` for column-level lineage) shows both
     /// upstream and downstream; a `+` prefix shows only upstream
     /// (ancestors); a `+` suffix shows only downstream (descendants).
-    /// Required for text output; optional for `--html`, where omitting
-    /// it embeds the whole project's lineage graph instead of scoping to
-    /// one target.
+    /// Required for `--text`; optional for the default HTML output,
+    /// where omitting it embeds the whole project's lineage graph
+    /// instead of scoping to one target.
     pub target: Option<String>,
 
     /// The dbt project directory to query. Its current compiled manifest
@@ -49,11 +49,19 @@ pub struct LineageArgs {
     #[arg(long, default_value = ".")]
     pub project_dir: PathBuf,
 
-    /// Generates a self-contained, interactive HTML lineage graph at
-    /// this path instead of printing text. A local development
-    /// convenience -- not intended to run in CI.
-    #[arg(long)]
+    /// Writes the self-contained, interactive HTML lineage graph to this
+    /// explicit path instead of the computed default under
+    /// `target/zhao/lineage_graphs/`. HTML is already the default output
+    /// mode -- this only overrides *where* it's written, not whether it's
+    /// produced; pass `--text` for the old plain-text report instead.
+    #[arg(long, conflicts_with = "text")]
     pub html: Option<PathBuf>,
+
+    /// Prints the old plain-text report to stdout instead of the default
+    /// HTML export. A target is still required for `--text`, same as
+    /// text output always required one.
+    #[arg(long, conflicts_with = "html")]
+    pub text: bool,
 
     /// Runs `dbt compile` in `--project-dir` before generating the
     /// export, for a guaranteed-fresh view. Without it, the existing
@@ -239,6 +247,7 @@ mod tests {
             target: Some(target.to_string()),
             project_dir: PathBuf::from("."),
             html: None,
+            text: false,
             compile: false,
             package: None,
         }

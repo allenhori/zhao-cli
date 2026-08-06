@@ -77,14 +77,31 @@ zhao lineage [OPTIONS] [TARGET]
 | `model_name+` | Downstream only (descendants). |
 | `model_name.column_name` | Same, at column grain — traces the specific column's real lineage, not just "this model depends on that one." |
 
+`TARGET` is optional: omit it and the export embeds the whole project instead of scoping to one
+model.
+
 | Flag | Default | What it does |
 |---|---|---|
 | `--project-dir <dir>` | `.` | The dbt project to query. |
-| `--html <path>` | — | Writes a self-contained, interactive HTML lineage graph to `path` instead of printing text — see [Understanding lineage](lineage-html.md). `TARGET` becomes optional with this flag: omit it to embed the whole project. |
+| `--html <path>` | — | Writes the interactive HTML export to this explicit path instead of the computed default (see below). HTML is already the default output mode — this only overrides *where* it's written. |
+| `--text` | — | Prints the plain-text report to stdout instead of HTML. `TARGET` is required with this flag. |
 | `--compile` | — | Runs `dbt compile` first, for a guaranteed-fresh view. Without it, the existing `target/manifest.json` is read as-is. |
 | `--package <name>` | — | Disambiguates `TARGET` when its bare model name matches more than one model across dbt packages (a real but uncommon shape — internal packages, dbt Mesh). The error without this flag names every candidate's full ID, which is exactly what to pass here. |
 
-### Text output
+### The interactive HTML export (default)
+
+With no `--text`/`--html`, `zhao lineage` writes a self-contained, interactive HTML lineage
+graph under `target/zhao/lineage_graphs/` at a computed path — see
+[Understanding lineage](lineage-html.md) for what you get and the full filename table.
+
+```bash
+zhao lineage                              # whole project -> target/zhao/lineage_graphs/full_lineage.html
+zhao lineage fct_orders                   # one model -> .../partial_lineage_fct_orders.html
+zhao lineage fct_orders.amount            # one column -> .../partial_lineage_fct_orders_amount.html
+zhao lineage --html out.html fct_orders   # explicit path, same scoping rules
+```
+
+### `--text`: the plain-text report
 
 ```
 Upstream:
@@ -97,14 +114,3 @@ Downstream:
 A column-level target additionally reports any node with real connectivity in that direction
 whose specific column mapping couldn't be resolved (a computed expression zhao's static SQL
 resolver can't fully trace) as `(unresolved)` — visible, never silently dropped.
-
-### `--html`: the interactive export
-
-```bash
-zhao lineage --html lineage.html                    # whole project
-zhao lineage --html lineage.html fct_orders          # scoped to one model
-zhao lineage --html lineage.html fct_orders.amount   # scoped to one column
-open lineage.html
-```
-
-See [Understanding lineage](lineage-html.md) for what you get.

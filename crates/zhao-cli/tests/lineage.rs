@@ -22,6 +22,7 @@ fn bare_target_shows_both_upstream_and_downstream() {
     let output = Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("stg_orders")
         .arg("--project-dir")
         .arg(fixture("rules_project"))
@@ -53,6 +54,7 @@ fn plus_prefix_shows_only_upstream() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("+dim_customers")
         .arg("--project-dir")
         .arg(fixture("rules_project"))
@@ -76,6 +78,7 @@ fn plus_suffix_shows_only_downstream() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("stg_orders+")
         .arg("--project-dir")
         .arg(fixture("rules_project"))
@@ -134,6 +137,7 @@ fn a_package_flag_disambiguates_an_ambiguous_target() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("customers")
         .arg("--package")
         .arg("pkg_b")
@@ -272,6 +276,7 @@ fn a_model_with_no_connections_produces_a_clear_nothing_found_result_not_an_erro
     let output = Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("isolated")
         .arg("--project-dir")
         .arg(dir.path())
@@ -297,6 +302,7 @@ fn bare_column_target_shows_resolved_upstream_and_downstream_columns() {
     let output = Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("stg_customers.customer_id")
         .arg("--project-dir")
         .arg(fixture("rules_project"))
@@ -324,6 +330,7 @@ fn plus_prefix_on_a_column_target_shows_only_upstream() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("+stg_customers.customer_id")
         .arg("--project-dir")
         .arg(fixture("rules_project"))
@@ -345,6 +352,7 @@ fn plus_suffix_on_a_column_target_shows_only_downstream() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("stg_customers.customer_id+")
         .arg("--project-dir")
         .arg(fixture("rules_project"))
@@ -370,6 +378,7 @@ fn a_calculated_column_traces_through_nested_functions_and_cte_hops() {
     let output = Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("dim_customers.number_of_orders")
         .arg("--project-dir")
         .arg(fixture("rules_project"))
@@ -411,6 +420,7 @@ fn model_level_targets_still_work_unchanged() {
     let output = Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("stg_customers")
         .arg("--project-dir")
         .arg(fixture("rules_project"))
@@ -557,17 +567,302 @@ fn html_export_is_fully_self_contained() {
     );
 }
 
-/// Acceptance criterion (implied, shared with text output): a target is
-/// required unless `--html` is given -- bare `zhao lineage` with neither
-/// produces a clear error, not a panic or silent no-op.
+/// Acceptance criterion: `--text` still requires a target -- HTML being
+/// the default doesn't change `--text`'s own contract.
 #[test]
-fn no_target_and_no_html_produces_a_clear_error() {
+fn text_with_no_target_produces_a_clear_error() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("lineage")
+        .arg("--text")
         .arg("--project-dir")
         .arg(fixture("rules_project"))
         .assert()
         .code(2)
         .stderr(predicate::str::contains("error:"));
+}
+
+// ---------------------------------------------------------------------
+// HTML as the default output (issue #38): no `--text`/`--html` at all.
+// ---------------------------------------------------------------------
+
+/// Acceptance criterion: with no `--text`/`--html`, `zhao lineage`
+/// produces HTML (not text) at the computed default path under
+/// `target/zhao/lineage_graphs/` -- a bare invocation with no target at
+/// all now succeeds (HTML mode needs no target), rather than the old
+/// "target required" error.
+#[test]
+fn default_mode_with_no_target_writes_full_lineage_html() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture("rules_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy manifest");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let expected = project_dir
+        .join("target")
+        .join("zhao")
+        .join("lineage_graphs")
+        .join("full_lineage.html");
+    assert!(
+        expected.exists(),
+        "expected {} to exist",
+        expected.display()
+    );
+    let html = std::fs::read_to_string(&expected).expect("should read generated file");
+    assert!(html.contains("model.zhao_dbt_test.dim_customers"));
+}
+
+/// Acceptance criterion: the default-mode filename table -- a bare model
+/// target.
+#[test]
+fn default_mode_with_a_bare_target_uses_the_partial_lineage_filename() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture("rules_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy manifest");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("stg_customers")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let expected = project_dir
+        .join("target")
+        .join("zhao")
+        .join("lineage_graphs")
+        .join("partial_lineage_stg_customers.html");
+    assert!(
+        expected.exists(),
+        "expected {} to exist",
+        expected.display()
+    );
+}
+
+/// Acceptance criterion: the default-mode filename table -- `+<model>`
+/// gets the `_upstream_only` suffix.
+#[test]
+fn default_mode_with_a_plus_prefix_target_uses_the_upstream_only_filename() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture("rules_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy manifest");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("+dim_customers")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let expected = project_dir
+        .join("target")
+        .join("zhao")
+        .join("lineage_graphs")
+        .join("partial_lineage_dim_customers_upstream_only.html");
+    assert!(
+        expected.exists(),
+        "expected {} to exist",
+        expected.display()
+    );
+}
+
+/// Acceptance criterion: the default-mode filename table -- `<model>+`
+/// gets the `_downstream_only` suffix.
+#[test]
+fn default_mode_with_a_plus_suffix_target_uses_the_downstream_only_filename() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture("rules_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy manifest");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("stg_orders+")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let expected = project_dir
+        .join("target")
+        .join("zhao")
+        .join("lineage_graphs")
+        .join("partial_lineage_stg_orders_downstream_only.html");
+    assert!(
+        expected.exists(),
+        "expected {} to exist",
+        expected.display()
+    );
+}
+
+/// Acceptance criterion: the default-mode filename table -- a bare
+/// `<model>.<column>` target appends the column name, no direction
+/// suffix.
+#[test]
+fn default_mode_with_a_column_target_uses_the_column_filename() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture("rules_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy manifest");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("stg_customers.customer_id")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let expected = project_dir
+        .join("target")
+        .join("zhao")
+        .join("lineage_graphs")
+        .join("partial_lineage_stg_customers_customer_id.html");
+    assert!(
+        expected.exists(),
+        "expected {} to exist",
+        expected.display()
+    );
+}
+
+/// Acceptance criterion: the default-mode filename table --
+/// `+<model>.<column>` appends the column name, then the
+/// `_upstream_only` suffix.
+#[test]
+fn default_mode_with_a_plus_prefix_column_target_uses_the_column_upstream_only_filename() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture("rules_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy manifest");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("+stg_customers.customer_id")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let expected = project_dir
+        .join("target")
+        .join("zhao")
+        .join("lineage_graphs")
+        .join("partial_lineage_stg_customers_customer_id_upstream_only.html");
+    assert!(
+        expected.exists(),
+        "expected {} to exist",
+        expected.display()
+    );
+}
+
+/// Acceptance criterion: the default-mode filename table -- a
+/// `--package`-qualified target prepends the package name.
+#[test]
+fn default_mode_with_a_package_flag_prepends_the_package_to_the_filename() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture("ambiguous_package_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy manifest");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("customers")
+        .arg("--package")
+        .arg("pkg_b")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .assert()
+        .code(0);
+
+    let expected = project_dir
+        .join("target")
+        .join("zhao")
+        .join("lineage_graphs")
+        .join("partial_lineage_pkg_b_customers.html");
+    assert!(
+        expected.exists(),
+        "expected {} to exist",
+        expected.display()
+    );
+}
+
+/// Acceptance criterion: `--html <path>` still works as an explicit
+/// override of the computed default path.
+#[test]
+fn an_explicit_html_path_overrides_the_computed_default() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let out = dir.path().join("custom.html");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--html")
+        .arg(&out)
+        .arg("stg_customers")
+        .arg("--project-dir")
+        .arg(fixture("rules_project"))
+        .assert()
+        .code(0);
+
+    assert!(out.exists(), "expected {} to exist", out.display());
 }
