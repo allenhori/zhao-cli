@@ -14,6 +14,15 @@
 //! a "kept" occurrence with a different occurrence than a human reading
 //! the SQL would assume -- joins are only ever compared by kind here,
 //! never by what they actually join on.
+//!
+//! `STRUCT` field comparison (`diff_struct_fields`, private) only ever
+//! runs one level deep, matching [`crate::model::Column::struct_fields`]'s own
+//! one-level-only extraction: a nested field that's itself a `STRUCT`
+//! (a struct-within-a-struct), an array-of-structs' element shape, or a
+//! map's value-type evolution are all out of scope here, not silently
+//! misdiffed -- there's simply no deeper shape on either
+//! [`crate::model::StructField`] for this function to compare in the
+//! first place.
 
 use crate::model::{Column, ColumnName, JoinKind, Node, NodeId, ParsedProject};
 
@@ -65,6 +74,50 @@ pub enum Change {
         /// position no longer exists (the join was removed).
         to_kind: Option<JoinKind>,
     },
+    /// A field present in the current state's `STRUCT` shape for a column
+    /// that wasn't in that same column's Baseline shape. Only produced
+    /// when *both* states happen to have a statically-knowable
+    /// `struct_fields` shape for that column -- see
+    /// [`Column::struct_fields`]; exactly the same "only compare when both
+    /// sides actually document it" rule [`Change::ColumnTypeChanged`]
+    /// already follows for a column's own top-level type, one level
+    /// deeper.
+    StructFieldAdded {
+        /// The Node the column belongs to.
+        node: NodeId,
+        /// The struct-typed column the field was added to.
+        column: ColumnName,
+        /// The added field's name.
+        field: ColumnName,
+    },
+    /// A field present in the Baseline's `STRUCT` shape for a column
+    /// that's no longer in that same column's current-state shape. Same
+    /// "both sides knowable" precondition as [`Change::StructFieldAdded`].
+    StructFieldRemoved {
+        /// The Node the column belongs to.
+        node: NodeId,
+        /// The struct-typed column the field was removed from.
+        column: ColumnName,
+        /// The removed field's name.
+        field: ColumnName,
+    },
+    /// A field present in both states' `STRUCT` shape for a column, but
+    /// whose documented type differs -- only produced when *both* states
+    /// happen to document a type for that specific field (a
+    /// `STRUCT(...)`/`named_struct(...)` constructor's fields frequently
+    /// don't; see [`crate::model::StructField::data_type`]).
+    StructFieldTypeChanged {
+        /// The Node the column belongs to.
+        node: NodeId,
+        /// The struct-typed column the field belongs to.
+        column: ColumnName,
+        /// The field whose documented type changed.
+        field: ColumnName,
+        /// The type documented in the Baseline.
+        from_type: String,
+        /// The type documented in the current state.
+        to_type: String,
+    },
 }
 
 /// Computes the [`Change`]s between a Baseline and current [`ParsedProject`].
@@ -99,7 +152,8 @@ fn diff_columns(baseline: &Node, current: &Node) -> Vec<Change> {
                 column: current_col.name.clone(),
             }),
             Some(baseline_col) => {
-                changes.extend(column_type_change(&current.id, baseline_col, current_col))
+                changes.extend(column_type_change(&current.id, baseline_col, current_col));
+                changes.extend(diff_struct_fields(&current.id, baseline_col, current_col));
             }
         }
     }
@@ -128,6 +182,69 @@ fn column_type_change(node: &NodeId, baseline: &Column, current: &Column) -> Opt
         from_type: from_type.clone(),
         to_type: to_type.clone(),
     })
+}
+
+/// Compares a column's `STRUCT` internal field shape between the Baseline
+/// and current state, exactly the same way [`diff_columns`] compares a
+/// Node's own top-level columns -- fields added, fields removed, and
+/// fields present in both whose documented type differs -- but only when
+/// *both* sides happen to have a statically-knowable shape for this
+/// specific column (see [`Column::struct_fields`]). If either side is
+/// `None` (unknown, not "empty"), this produces no `Change` at all: a
+/// `None` shape carries no information to compare against, and treating
+/// it as "no fields" would silently manufacture a false "every field was
+/// removed" (or "every field was added") Change out of pure ignorance --
+/// exactly the kind of guess this crate's diff/rules layers otherwise
+/// never make (see [`column_type_change`], which applies the identical
+/// "only compare when both sides document it" rule one level up).
+fn diff_struct_fields(node: &NodeId, baseline: &Column, current: &Column) -> Vec<Change> {
+    let (Some(baseline_fields), Some(current_fields)) =
+        (&baseline.struct_fields, &current.struct_fields)
+    else {
+        return Vec::new();
+    };
+
+    let mut changes = Vec::new();
+
+    for current_field in current_fields {
+        match baseline_fields
+            .iter()
+            .find(|f| f.name == current_field.name)
+        {
+            None => changes.push(Change::StructFieldAdded {
+                node: node.clone(),
+                column: current.name.clone(),
+                field: current_field.name.clone(),
+            }),
+            Some(baseline_field) => {
+                if let (Some(from_type), Some(to_type)) =
+                    (&baseline_field.data_type, &current_field.data_type)
+                {
+                    if from_type != to_type {
+                        changes.push(Change::StructFieldTypeChanged {
+                            node: node.clone(),
+                            column: current.name.clone(),
+                            field: current_field.name.clone(),
+                            from_type: from_type.clone(),
+                            to_type: to_type.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    for baseline_field in baseline_fields {
+        if !current_fields.iter().any(|f| f.name == baseline_field.name) {
+            changes.push(Change::StructFieldRemoved {
+                node: node.clone(),
+                column: current.name.clone(),
+                field: baseline_field.name.clone(),
+            });
+        }
+    }
+
+    changes
 }
 
 /// A single step in an edit script transforming one join-kind sequence
@@ -240,7 +357,7 @@ fn diff_joins(baseline: &Node, current: &Node) -> Vec<Change> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Materialization;
+    use crate::model::{Materialization, StructField};
 
     fn node(id: &str, columns: Vec<Column>, joins: Vec<JoinKind>) -> Node {
         Node {
@@ -257,6 +374,26 @@ mod tests {
             name: ColumnName::new(name),
             data_type: data_type.map(str::to_string),
             expression: None,
+            struct_fields: None,
+        }
+    }
+
+    /// A struct-typed column carrying an explicit, statically-knowable
+    /// field shape -- see [`Column::struct_fields`].
+    fn struct_column(name: &str, fields: &[(&str, Option<&str>)]) -> Column {
+        Column {
+            name: ColumnName::new(name),
+            data_type: None,
+            expression: None,
+            struct_fields: Some(
+                fields
+                    .iter()
+                    .map(|(field_name, field_type)| StructField {
+                        name: ColumnName::new(*field_name),
+                        data_type: field_type.map(|t| t.to_string()),
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -407,6 +544,125 @@ mod tests {
             name: "x".to_string(),
         });
         let current = project(vec![n]);
+
+        assert_eq!(diff(&baseline, &current), Vec::new());
+    }
+
+    #[test]
+    fn detects_a_struct_field_added_and_removed_when_both_sides_know_the_shape() {
+        let baseline = project(vec![node(
+            "model.a",
+            vec![struct_column(
+                "payload",
+                &[("user_id", Some("bigint")), ("legacy_flag", None)],
+            )],
+            vec![],
+        )]);
+        let current = project(vec![node(
+            "model.a",
+            vec![struct_column(
+                "payload",
+                &[("user_id", Some("bigint")), ("email", None)],
+            )],
+            vec![],
+        )]);
+
+        let changes = diff(&baseline, &current);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.contains(&Change::StructFieldAdded {
+            node: NodeId::new("model.a"),
+            column: ColumnName::new("payload"),
+            field: ColumnName::new("email"),
+        }));
+        assert!(changes.contains(&Change::StructFieldRemoved {
+            node: NodeId::new("model.a"),
+            column: ColumnName::new("payload"),
+            field: ColumnName::new("legacy_flag"),
+        }));
+    }
+
+    #[test]
+    fn detects_a_struct_field_type_change_only_when_both_sides_document_that_fields_type() {
+        let baseline = project(vec![node(
+            "model.a",
+            vec![struct_column(
+                "payload",
+                &[("amount", Some("bigint")), ("note", None)],
+            )],
+            vec![],
+        )]);
+        let current = project(vec![node(
+            "model.a",
+            vec![struct_column(
+                "payload",
+                &[("amount", Some("int")), ("note", Some("string"))],
+            )],
+            vec![],
+        )]);
+
+        // `amount` documents a type on both sides -- produces a Change.
+        // `note` only documents a type on the current side -- nothing to
+        // compare against, so no Change, not a guessed one (the same rule
+        // `detects_a_documented_type_change_but_not_when_only_one_side_documents_it`
+        // already exercises for a column's own top-level type).
+        assert_eq!(
+            diff(&baseline, &current),
+            vec![Change::StructFieldTypeChanged {
+                node: NodeId::new("model.a"),
+                column: ColumnName::new("payload"),
+                field: ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            }]
+        );
+    }
+
+    /// The whole point of `struct_fields` being `Option<Vec<StructField>>`
+    /// rather than a plain (possibly empty) `Vec<StructField>`: when the
+    /// shape isn't statically knowable on *either* side (the common case
+    /// -- a struct column passed through unchanged, no `CAST`/constructor
+    /// in the immediate SQL), this must never manufacture a Change out of
+    /// thin air, even though the column itself is otherwise identical.
+    #[test]
+    fn produces_no_struct_field_change_when_the_shape_is_unknown_on_both_sides() {
+        let baseline = project(vec![node(
+            "model.a",
+            vec![Column {
+                name: ColumnName::new("payload"),
+                data_type: None,
+                expression: None,
+                struct_fields: None,
+            }],
+            vec![],
+        )]);
+        let current = baseline.clone();
+
+        assert_eq!(diff(&baseline, &current), Vec::new());
+    }
+
+    /// The asymmetric case: the shape is knowable on only one side (e.g.
+    /// the current state gained an explicit `CAST(... AS STRUCT<...>)`
+    /// that the Baseline's compiled SQL never had). Still no Change --
+    /// there's nothing on the other side to compare the newly-knowable
+    /// shape against, so asserting every field in it was "added" would be
+    /// exactly the kind of guess this function exists to avoid.
+    #[test]
+    fn produces_no_struct_field_change_when_only_one_side_knows_the_shape() {
+        let baseline = project(vec![node(
+            "model.a",
+            vec![Column {
+                name: ColumnName::new("payload"),
+                data_type: None,
+                expression: None,
+                struct_fields: None,
+            }],
+            vec![],
+        )]);
+        let current = project(vec![node(
+            "model.a",
+            vec![struct_column("payload", &[("user_id", Some("bigint"))])],
+            vec![],
+        )]);
 
         assert_eq!(diff(&baseline, &current), Vec::new());
     }

@@ -1099,6 +1099,7 @@ mod tests {
                     name: zhao_core::model::ColumnName::new(*c),
                     data_type: None,
                     expression: None,
+                    struct_fields: None,
                 })
                 .collect(),
             joins: Vec::new(),

@@ -61,17 +61,33 @@
 //! modeled, only which base column a nested reference ultimately reads
 //! from. See `collect_expr_sources_into`'s `CompoundIdentifier`,
 //! `JsonAccess`, and `CompoundFieldAccess` arms.
+//!
+//! A `STRUCT`-typed column's own internal field *shape* (as opposed to
+//! lineage through it, above) is a separate concern this adapter also
+//! handles, for schema/type-evolution detection rather than
+//! column-lineage tracing: `extract_struct_shape` (private -- not part of
+//! this crate's public API) recognizes a column's immediate defining
+//! expression being a `CAST(... AS STRUCT<...>)`, a `STRUCT(...)`
+//! constructor, or a `named_struct(...)` call that names every field
+//! explicitly, and records that shape on
+//! [`crate::model::Column::struct_fields`]. One level deep only (a
+//! nested field that's itself a `STRUCT`, an array-of-structs' element
+//! shape, and a map's value-type evolution are all out of scope), and
+//! *not* propagated across a CTE hop, a rename, or a wildcard expansion
+//! the way lineage `sources` are -- only a column's own immediate SQL in
+//! the model actually being resolved ever produces a shape; see
+//! `ResolvedColumn::struct_fields`'s doc comment (also private).
 
 use super::warehouse::{QueryExecutor, RELATION_EXISTS_MACRO, RelationIdentity};
 use super::{AdapterVocabulary, TransformationToolAdapter};
 use crate::model::{
     Column, ColumnLineage, ColumnName, JoinKind, LineageEdge, Materialization, Node, NodeId,
-    Origin, OriginId, ParsedProject, Upstream,
+    Origin, OriginId, ParsedProject, StructField, Upstream,
 };
 use serde::Deserialize;
 use sqlparser::ast::{
-    AccessExpr, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem,
-    SetExpr, Statement, Subscript, TableFactor, TableWithJoins,
+    AccessExpr, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select,
+    SelectItem, SetExpr, Statement, Subscript, TableFactor, TableWithJoins, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -642,6 +658,18 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
             _ => HashMap::new(),
         };
 
+        // A column's `STRUCT` field shape, when its immediate defining
+        // expression made one statically knowable -- see
+        // `extract_struct_shape`. Looked up the same way `expressions`
+        // is, immediately above.
+        let struct_shapes: HashMap<&str, &[StructField]> = match &local_schema {
+            LocalSchema::Known(cols) => cols
+                .iter()
+                .filter_map(|c| c.struct_fields.as_deref().map(|f| (c.name.as_str(), f)))
+                .collect(),
+            _ => HashMap::new(),
+        };
+
         let documented_columns: Vec<Column> = columns
             .iter()
             .map(|name| Column {
@@ -651,6 +679,7 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
                     .get(name.as_str())
                     .and_then(|doc| doc.data_type.clone()),
                 expression: expressions.get(name.as_str()).map(|e| e.to_string()),
+                struct_fields: struct_shapes.get(name.as_str()).map(|f| f.to_vec()),
             })
             .collect();
 
@@ -755,6 +784,20 @@ struct ResolvedColumn {
     name: String,
     sources: Vec<(Upstream, String)>,
     expression: Option<String>,
+    /// This column's `STRUCT` internal field shape, when its *immediate*
+    /// defining expression is a `CAST(... AS STRUCT<...>)` or a
+    /// `STRUCT(...)`/`named_struct(...)` constructor that names every
+    /// field explicitly -- see [`extract_struct_shape`]. `None` otherwise,
+    /// including for a plain passthrough/rename of an upstream struct
+    /// column: unlike `sources` (which carries forward through a CTE hop
+    /// via [`source_of`]), this is deliberately *not* propagated across
+    /// CTE hops or wildcard expansion -- only a column's own immediate
+    /// SQL in *this* model ever produces a shape, matching the "knowable
+    /// from the compiled SQL" scope this feature was built for (see
+    /// [`Column::struct_fields`]'s doc comment). A struct column that's
+    /// merely renamed or passed through, even from an upstream CTE that
+    /// itself had an explicit shape, stays `None` here.
+    struct_fields: Option<Vec<StructField>>,
 }
 
 /// The resolved shape of a query or CTE, as far as this adapter could
@@ -1025,6 +1068,13 @@ fn expand_wildcard_of(
                         name: c.as_str().to_string(),
                         sources: vec![(upstream.clone(), c.as_str().to_string())],
                         expression: None,
+                        // A wildcard expansion only ever has an upstream
+                        // Node's resolved column *names* to work with
+                        // (`resolved_schemas: HashMap<NodeId,
+                        // Vec<ColumnName>>` never carried full `Column`
+                        // detail) -- there's no shape to carry forward
+                        // even if the upstream column had one.
+                        struct_fields: None,
                     })
                     .collect(),
             )
@@ -1074,11 +1124,158 @@ fn resolve_expr_column(
         other => other.to_string(),
     });
 
+    let struct_fields = extract_struct_shape(expr);
+
     ResolvedColumn {
         name,
         sources,
         expression,
+        struct_fields,
     }
+}
+
+/// Extracts a `STRUCT`-typed column's internal field shape from its
+/// *immediate* defining expression, when -- and only when -- that shape is
+/// stated explicitly enough to trust. Three shapes are recognized, all
+/// dialect-general (Databricks/Spark, BigQuery, and DuckDB all use some
+/// combination of these -- see the module-level "Known limitations" doc
+/// comment):
+///
+/// - `CAST(expr AS STRUCT<field_name field_type, ...>)` -- sqlparser's
+///   [`DataType::Struct`], produced by `CAST ... AS STRUCT<...>` on every
+///   dialect above.
+/// - `STRUCT(expr1 [AS name1] [, ...])`, with or without a leading
+///   `STRUCT<field_name field_type, ...>` type definition -- sqlparser's
+///   dedicated [`Expr::Struct`] (BigQuery's and Databricks' `STRUCT(...)`
+///   constructor).
+/// - `named_struct('field1', expr1, 'field2', expr2, ...)` -- Databricks'/
+///   Spark's alternating-key-value-argument constructor function, which
+///   sqlparser has no dedicated `Expr` variant for (it parses as an
+///   ordinary [`Expr::Function`]), so this walks its argument list itself.
+///
+/// Anything else -- most importantly, a plain (possibly qualified)
+/// identifier reference, which is what a struct column passed through
+/// unchanged via `SELECT *` or a bare `ref()` column reference compiles
+/// to -- returns `None`. `None` is also returned, deliberately, whenever a
+/// recognized shape doesn't name *every* one of its fields explicitly
+/// (e.g. a typeless `STRUCT(1, 2)` with no `AS name` on either value, or a
+/// `named_struct(...)` call whose key argument isn't a literal string):
+/// reporting only the fields that *do* have a name would misrepresent the
+/// struct's real shape, and reporting none of them under a `Some(vec![])`
+/// would misrepresent "we don't know" as "it's empty" -- both worse than
+/// admitting the whole shape isn't confidently knowable here. See
+/// [`Column::struct_fields`]'s doc comment for why `None` is the only
+/// value this crate ever uses for "unknown."
+fn extract_struct_shape(expr: &Expr) -> Option<Vec<StructField>> {
+    match expr {
+        Expr::Cast {
+            data_type: DataType::Struct(fields, _bracket_kind),
+            ..
+        } => {
+            let mut out = Vec::with_capacity(fields.len());
+            for field in fields {
+                let name = field.field_name.as_ref()?;
+                out.push(StructField {
+                    name: ColumnName::new(name.value.clone()),
+                    data_type: Some(field.field_type.to_string()),
+                });
+            }
+            Some(out)
+        }
+        Expr::Struct { values, fields } if !fields.is_empty() => {
+            // Typed `STRUCT<field_name field_type, ...>(expr1, ...)`:
+            // field names/types come from the type definition, not the
+            // values (typed syntax forbids a value-level `AS name` --
+            // sqlparser itself rejects it, see `parse_struct_field_expr`).
+            let mut out = Vec::with_capacity(fields.len());
+            for field in fields {
+                let name = field.field_name.as_ref()?;
+                out.push(StructField {
+                    name: ColumnName::new(name.value.clone()),
+                    data_type: Some(field.field_type.to_string()),
+                });
+            }
+            Some(out)
+        }
+        Expr::Struct { values, fields: _ } => {
+            // Typeless `STRUCT(expr1 [AS name1], ...)`: only a value
+            // explicitly aliased with `AS name` names its field at all --
+            // sqlparser represents that as `Expr::Named`. A value with no
+            // `AS` has no stated name to report.
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let Expr::Named { name, .. } = value else {
+                    return None;
+                };
+                out.push(StructField {
+                    name: ColumnName::new(name.value.clone()),
+                    // A constructor's value expression only ever states a
+                    // *name*, never a type -- the type is merely implied
+                    // by the value, which this adapter does not attempt
+                    // to infer (see `StructField::data_type`'s doc
+                    // comment).
+                    data_type: None,
+                });
+            }
+            Some(out)
+        }
+        Expr::Function(function) if is_named_struct_call(function) => {
+            extract_named_struct_shape(function)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `function` is a call to Databricks'/Spark's `named_struct`
+/// constructor -- matched by name only (case-insensitively, the same way
+/// SQL identifiers are themselves case-insensitive by default), since
+/// sqlparser has no dedicated `Expr` variant for it.
+fn is_named_struct_call(function: &sqlparser::ast::Function) -> bool {
+    function
+        .name
+        .0
+        .last()
+        .map(|part| part.to_string().eq_ignore_ascii_case("named_struct"))
+        .unwrap_or(false)
+}
+
+/// Extracts a `named_struct('field1', expr1, 'field2', expr2, ...)` call's
+/// field names -- every even-indexed (0-based) argument must be a single-
+/// quoted string literal naming the field; every odd-indexed argument is
+/// that field's value (its type isn't stated, so `data_type` is always
+/// `None`). Returns `None` for anything that doesn't match this shape
+/// exactly (an odd argument count, a non-literal or non-string key, a
+/// named/wildcard argument, ...) -- see [`extract_struct_shape`]'s doc
+/// comment for why a partial match is never reported as a partial result.
+fn extract_named_struct_shape(function: &sqlparser::ast::Function) -> Option<Vec<StructField>> {
+    let FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    if list.args.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(list.args.len() / 2);
+    for pair in list.args.chunks_exact(2) {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(key))) = &pair[0] else {
+            return None;
+        };
+        let Value::SingleQuotedString(field_name) = &key.value else {
+            return None;
+        };
+        // The value argument itself isn't inspected further -- only its
+        // presence (confirming this is a real key/value pair, not some
+        // other two-argument function that happens to share the name) is
+        // needed; its type is never knowable from this call alone.
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(_value)) = &pair[1] else {
+            return None;
+        };
+        out.push(StructField {
+            name: ColumnName::new(field_name.clone()),
+            data_type: None,
+        });
+    }
+    Some(out)
 }
 
 /// Recursively collects every distinct upstream column that `expr`
@@ -2829,5 +3026,241 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
             DbtVocabulary.node_display_name("stg_customers"),
             "stg_customers"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // STRUCT internal field shape extraction (issue #53).
+    // -----------------------------------------------------------------
+
+    fn struct_field(name: &str, data_type: Option<&str>) -> StructField {
+        StructField {
+            name: ColumnName::new(name),
+            data_type: data_type.map(str::to_string),
+        }
+    }
+
+    /// A `CAST(... AS STRUCT<...>)` on Databricks/Spark-shaped compiled
+    /// SQL extracts every field's name and type.
+    #[test]
+    fn a_cast_to_struct_extracts_its_named_and_typed_fields() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"select cast(x.raw_payload as struct<user_id bigint, name string>) as payload from "db"."s"."t" as x"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "payload");
+                assert_eq!(
+                    cols[0].struct_fields,
+                    Some(vec![
+                        struct_field("user_id", Some("BIGINT")),
+                        struct_field("name", Some("STRING")),
+                    ])
+                );
+            }
+            other => panic!("expected Known([payload with a struct shape]), got {other:?}"),
+        }
+    }
+
+    /// BigQuery/Databricks' typeless `STRUCT(expr AS name, ...)`
+    /// constructor extracts each explicitly-named field, with no type
+    /// (a constructor's value only ever states a name, never a type).
+    #[test]
+    fn a_typeless_struct_constructor_extracts_its_named_fields_with_no_type() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"select struct(x.user_id as user_id, x.name as name) as payload from "db"."s"."t" as x"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "payload");
+                assert_eq!(
+                    cols[0].struct_fields,
+                    Some(vec![
+                        struct_field("user_id", None),
+                        struct_field("name", None)
+                    ])
+                );
+            }
+            other => panic!("expected Known([payload with a struct shape]), got {other:?}"),
+        }
+    }
+
+    /// BigQuery's typed `STRUCT<field_name field_type, ...>(expr1, ...)`
+    /// constructor extracts each field's name and type from the type
+    /// definition itself, not the values.
+    #[test]
+    fn a_typed_struct_constructor_extracts_its_named_and_typed_fields() {
+        let query =
+            parse_query("select struct<user_id int64, name string>(1, 'a') as payload from t")
+                .expect("should parse");
+        let known_relations: HashMap<QualifiedName, Upstream> = HashMap::new();
+        let resolved_schemas = HashMap::new();
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "payload");
+                let fields = cols[0]
+                    .struct_fields
+                    .as_ref()
+                    .expect("typed struct constructor should produce a known shape");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name, ColumnName::new("user_id"));
+                assert_eq!(fields[1].name, ColumnName::new("name"));
+            }
+            other => panic!("expected Known([payload with a struct shape]), got {other:?}"),
+        }
+    }
+
+    /// Databricks'/Spark's `named_struct('field', expr, ...)` constructor
+    /// extracts every field name from its literal key arguments.
+    #[test]
+    fn a_named_struct_call_extracts_its_named_fields() {
+        let query = parse_query(
+            "select named_struct('user_id', x.id, 'name', x.full_name) as payload from t as x",
+        )
+        .expect("should parse");
+        let known_relations: HashMap<QualifiedName, Upstream> = HashMap::new();
+        let resolved_schemas = HashMap::new();
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "payload");
+                assert_eq!(
+                    cols[0].struct_fields,
+                    Some(vec![
+                        struct_field("user_id", None),
+                        struct_field("name", None)
+                    ])
+                );
+            }
+            other => panic!("expected Known([payload with a struct shape]), got {other:?}"),
+        }
+    }
+
+    /// Acceptance criterion (c): the overwhelmingly common case -- a
+    /// struct-typed column simply passed through (here, a plain rename
+    /// with no `CAST`/constructor in the immediate SQL) -- must produce
+    /// no struct shape at all, not a guessed empty one. `struct_fields`
+    /// stays a real `None`, exactly the same "unknown, not empty"
+    /// contract `Column::data_type` already has for an undocumented type.
+    #[test]
+    fn a_plain_passthrough_column_produces_no_struct_shape() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(r#"select x.payload as payload from "db"."s"."t" as x"#)
+            .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "payload");
+                assert_eq!(
+                    cols[0].struct_fields, None,
+                    "a plain passthrough/rename must never produce a guessed struct shape"
+                );
+            }
+            other => panic!("expected Known([payload with no struct shape]), got {other:?}"),
+        }
+    }
+
+    /// A wildcard expanded alongside another projection item (forcing
+    /// `expand_wildcard_of`'s enumeration path, rather than the pure
+    /// `SELECT * FROM <one thing>` shortcut that just propagates a
+    /// `Passthrough` unchanged) never carries forward an upstream
+    /// column's struct shape, even when the upstream column itself had
+    /// one -- wildcard expansion only ever has resolved column *names* to
+    /// work with (`resolved_schemas: HashMap<NodeId, Vec<ColumnName>>`),
+    /// never the upstream `Column`'s own detail (see
+    /// `expand_wildcard_of`'s doc comment).
+    #[test]
+    fn a_wildcard_expansion_never_carries_forward_an_upstream_struct_shape() {
+        let mut known_relations: HashMap<QualifiedName, Upstream> = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "up".to_string()),
+            Upstream::Node(NodeId::new("model.upstream")),
+        );
+        let mut resolved_schemas = HashMap::new();
+        resolved_schemas.insert(
+            NodeId::new("model.upstream"),
+            vec![ColumnName::new("payload")],
+        );
+
+        // The upstream Node itself resolved `payload` with a real struct
+        // shape (via an explicit CAST) -- but that detail lives only in
+        // *that* build's own `LocalSchema::Known`, never in
+        // `resolved_schemas`, so this downstream model's wildcard
+        // expansion of it has no way to see it.
+        let query =
+            parse_query(r#"select *, 1 as extra_col from "db"."s"."up""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                let payload = cols
+                    .iter()
+                    .find(|c| c.name == "payload")
+                    .expect("payload should be expanded from the wildcard");
+                assert_eq!(
+                    payload.struct_fields, None,
+                    "wildcard expansion must never carry forward an upstream struct shape"
+                );
+            }
+            other => panic!("expected Known([payload, extra_col]), got {other:?}"),
+        }
+    }
+
+    /// A `named_struct(...)` call with a non-literal (or missing) key
+    /// argument -- or any other shape this extraction doesn't recognize
+    /// as fully self-describing -- must not produce a partial field list;
+    /// it stays `None`, not a shape missing an entry.
+    #[test]
+    fn a_named_struct_call_with_a_non_literal_key_produces_no_struct_shape() {
+        let query = parse_query("select named_struct(x.key_col, x.id) as payload from t as x")
+            .expect("should parse");
+        let known_relations: HashMap<QualifiedName, Upstream> = HashMap::new();
+        let resolved_schemas = HashMap::new();
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].struct_fields, None,
+                    "a non-literal named_struct key must not produce a partial/guessed shape"
+                );
+            }
+            other => panic!("expected Known([payload with no struct shape]), got {other:?}"),
+        }
     }
 }

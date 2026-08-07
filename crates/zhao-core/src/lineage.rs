@@ -727,6 +727,7 @@ mod tests {
                     name: ColumnName::new(*c),
                     data_type: None,
                     expression: None,
+                    struct_fields: None,
                 })
                 .collect(),
             ..node(id)

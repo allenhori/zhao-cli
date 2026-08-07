@@ -8,7 +8,9 @@
 //!   `bigint`). An unrecognized type name -- including non-integer types
 //!   like `varchar` -- never fires this Rule. Guessing "this is narrower"
 //!   for a comparison we can't actually make sense of would be worse than
-//!   not firing at all.
+//!   not firing at all. The same narrow integer-width comparison, and the
+//!   same "never guess" refusal on anything else, is reused verbatim for
+//!   [`RuleId::StructFieldTypeNarrowed`] one level deeper.
 //! - **Join cardinality** is ranked `Inner` (tightest) < `Left`/`Right`
 //!   (tied) < `Full` (loosest). `Cross` is deliberately excluded from the
 //!   ranking -- a cartesian product isn't a "loosening" of row-matching
@@ -56,6 +58,30 @@ pub enum RuleId {
     JoinCardinalityLoosened,
     /// A column was added. Informational by default.
     ColumnAdded,
+    /// A field was removed from a `STRUCT`-typed column's internal shape,
+    /// where that shape was statically knowable in both the Baseline and
+    /// current state (see [`crate::model::Column::struct_fields`]). The
+    /// same category of breaking change as
+    /// [`RuleId::ColumnRemovedWithActiveReferences`] one level deeper --
+    /// a `STRUCT`'s field list is as real a contract as a Node's own
+    /// column list -- but without that Rule's own column-lineage-based
+    /// "was it actively referenced" check: nested-field lineage isn't
+    /// tracked at that granularity (a nested field access always
+    /// collapses to its base column, see the dbt adapter's module-level
+    /// "Known limitations" doc comment), so this fires unconditionally on
+    /// every detected removal rather than only a referenced one. Default
+    /// `error`, the same tier `ColumnRemovedWithActiveReferences` uses.
+    StructFieldRemoved,
+    /// A field was added to a `STRUCT`-typed column's internal shape.
+    /// Informational by default, the same as [`RuleId::ColumnAdded`] one
+    /// level up.
+    StructFieldAdded,
+    /// A field within a `STRUCT`-typed column's internal shape narrowed
+    /// its documented type (the same narrow, integer-width-only
+    /// comparison [`RuleId::ColumnTypeNarrowed`] uses -- see the
+    /// module-level "Known limitations" doc comment). `warn` by default,
+    /// the same tier `ColumnTypeNarrowed` uses.
+    StructFieldTypeNarrowed,
 }
 
 impl RuleId {
@@ -66,6 +92,9 @@ impl RuleId {
             RuleId::ColumnTypeNarrowed => Severity::Warn,
             RuleId::JoinCardinalityLoosened => Severity::Warn,
             RuleId::ColumnAdded => Severity::Pass,
+            RuleId::StructFieldRemoved => Severity::Error,
+            RuleId::StructFieldAdded => Severity::Pass,
+            RuleId::StructFieldTypeNarrowed => Severity::Warn,
         }
     }
 
@@ -76,6 +105,9 @@ impl RuleId {
             RuleId::ColumnTypeNarrowed => "column-type-narrowed",
             RuleId::JoinCardinalityLoosened => "join-cardinality-loosened",
             RuleId::ColumnAdded => "column-added",
+            RuleId::StructFieldRemoved => "struct-field-removed",
+            RuleId::StructFieldAdded => "struct-field-added",
+            RuleId::StructFieldTypeNarrowed => "struct-field-type-narrowed",
         }
     }
 
@@ -88,6 +120,9 @@ impl RuleId {
             "column-type-narrowed" => Some(RuleId::ColumnTypeNarrowed),
             "join-cardinality-loosened" => Some(RuleId::JoinCardinalityLoosened),
             "column-added" => Some(RuleId::ColumnAdded),
+            "struct-field-removed" => Some(RuleId::StructFieldRemoved),
+            "struct-field-added" => Some(RuleId::StructFieldAdded),
+            "struct-field-type-narrowed" => Some(RuleId::StructFieldTypeNarrowed),
             _ => None,
         }
     }
@@ -95,12 +130,15 @@ impl RuleId {
     /// Every Rule in the v1 catalog, in declaration order. Exists so
     /// callers (e.g. an "unknown rule name" error message) can list valid
     /// names without duplicating the catalog themselves.
-    pub fn all() -> [RuleId; 4] {
+    pub fn all() -> [RuleId; 7] {
         [
             RuleId::ColumnRemovedWithActiveReferences,
             RuleId::ColumnTypeNarrowed,
             RuleId::JoinCardinalityLoosened,
             RuleId::ColumnAdded,
+            RuleId::StructFieldRemoved,
+            RuleId::StructFieldAdded,
+            RuleId::StructFieldTypeNarrowed,
         ]
     }
 }
@@ -151,6 +189,37 @@ pub enum FindingDetail {
         /// The added column.
         column: ColumnName,
     },
+    /// See [`RuleId::StructFieldRemoved`].
+    StructFieldRemoved {
+        /// The Node the column belongs to.
+        node: NodeId,
+        /// The struct-typed column the field was removed from.
+        column: ColumnName,
+        /// The removed field.
+        field: ColumnName,
+    },
+    /// See [`RuleId::StructFieldAdded`].
+    StructFieldAdded {
+        /// The Node the column belongs to.
+        node: NodeId,
+        /// The struct-typed column the field was added to.
+        column: ColumnName,
+        /// The added field.
+        field: ColumnName,
+    },
+    /// See [`RuleId::StructFieldTypeNarrowed`].
+    StructFieldTypeNarrowed {
+        /// The Node the column belongs to.
+        node: NodeId,
+        /// The struct-typed column the field belongs to.
+        column: ColumnName,
+        /// The field whose documented type narrowed.
+        field: ColumnName,
+        /// The field's documented type in the Baseline.
+        from_type: String,
+        /// The field's documented type in the current state.
+        to_type: String,
+    },
 }
 
 impl FindingDetail {
@@ -163,6 +232,9 @@ impl FindingDetail {
             FindingDetail::ColumnTypeNarrowed { .. } => RuleId::ColumnTypeNarrowed,
             FindingDetail::JoinCardinalityLoosened { .. } => RuleId::JoinCardinalityLoosened,
             FindingDetail::ColumnAdded { .. } => RuleId::ColumnAdded,
+            FindingDetail::StructFieldRemoved { .. } => RuleId::StructFieldRemoved,
+            FindingDetail::StructFieldAdded { .. } => RuleId::StructFieldAdded,
+            FindingDetail::StructFieldTypeNarrowed { .. } => RuleId::StructFieldTypeNarrowed,
         }
     }
 }
@@ -218,6 +290,39 @@ fn evaluate_change(baseline: &ParsedProject, change: &Change, config: &Config) -
                 },
             )]
         }
+        Change::StructFieldRemoved {
+            node,
+            column,
+            field,
+        } => vec![finding(
+            config,
+            FindingDetail::StructFieldRemoved {
+                node: node.clone(),
+                column: column.clone(),
+                field: field.clone(),
+            },
+        )],
+        Change::StructFieldAdded {
+            node,
+            column,
+            field,
+        } => vec![finding(
+            config,
+            FindingDetail::StructFieldAdded {
+                node: node.clone(),
+                column: column.clone(),
+                field: field.clone(),
+            },
+        )],
+        Change::StructFieldTypeChanged {
+            node,
+            column,
+            field,
+            from_type,
+            to_type,
+        } => struct_field_type_narrowed(node, column, field, from_type, to_type, config)
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -292,6 +397,37 @@ fn column_type_narrowed(
             FindingDetail::ColumnTypeNarrowed {
                 node: node.clone(),
                 column: column.clone(),
+                from_type: from_type.to_string(),
+                to_type: to_type.to_string(),
+            },
+        )
+    })
+}
+
+/// The struct-field counterpart to [`column_type_narrowed`], one level
+/// deeper: fires under exactly the same "recognized integer type,
+/// genuinely narrower" condition, reusing [`integer_width_rank`] verbatim
+/// rather than a parallel comparison that could drift out of sync with
+/// it. See [`RuleId::StructFieldTypeNarrowed`] for why this doesn't (and
+/// can't) additionally check for active downstream references the way
+/// [`column_removed_with_active_references`] does.
+fn struct_field_type_narrowed(
+    node: &NodeId,
+    column: &ColumnName,
+    field: &ColumnName,
+    from_type: &str,
+    to_type: &str,
+    config: &Config,
+) -> Option<Finding> {
+    let from_rank = integer_width_rank(from_type)?;
+    let to_rank = integer_width_rank(to_type)?;
+    (to_rank < from_rank).then(|| {
+        finding(
+            config,
+            FindingDetail::StructFieldTypeNarrowed {
+                node: node.clone(),
+                column: column.clone(),
+                field: field.clone(),
                 from_type: from_type.to_string(),
                 to_type: to_type.to_string(),
             },
@@ -665,6 +801,198 @@ mod tests {
         assert_eq!(
             severities.iter().filter(|s| **s == Severity::Warn).count(),
             2
+        );
+        assert_eq!(
+            severities.iter().filter(|s| **s == Severity::Pass).count(),
+            1
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Struct-internal field evolution (issue #53).
+    // -----------------------------------------------------------------
+
+    /// Acceptance criterion (a): a struct field being removed is detected
+    /// as breaking (`error` severity), unconditionally -- unlike
+    /// `column-removed-with-active-references`, this doesn't (and can't)
+    /// gate on an active downstream reference, since nested-field lineage
+    /// isn't tracked at that granularity. See
+    /// [`RuleId::StructFieldRemoved`]'s doc comment.
+    #[test]
+    fn struct_field_removed_fires_as_error_severity() {
+        let changes = vec![Change::StructFieldRemoved {
+            node: node_id("model.a"),
+            column: column("payload"),
+            field: column("legacy_flag"),
+        }];
+
+        assert_eq!(
+            evaluate(&empty_project(), &changes, &Config::default()),
+            vec![Finding {
+                severity: Severity::Error,
+                detail: FindingDetail::StructFieldRemoved {
+                    node: node_id("model.a"),
+                    column: column("payload"),
+                    field: column("legacy_flag"),
+                },
+            }]
+        );
+    }
+
+    /// Acceptance criterion (b): a struct field being added is detected as
+    /// non-breaking/pass, matching `column-added`'s own precedent.
+    #[test]
+    fn struct_field_added_fires_as_pass_severity() {
+        let changes = vec![Change::StructFieldAdded {
+            node: node_id("model.a"),
+            column: column("payload"),
+            field: column("email"),
+        }];
+
+        assert_eq!(
+            evaluate(&empty_project(), &changes, &Config::default()),
+            vec![Finding {
+                severity: Severity::Pass,
+                detail: FindingDetail::StructFieldAdded {
+                    node: node_id("model.a"),
+                    column: column("payload"),
+                    field: column("email"),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn struct_field_type_narrowed_fires_on_a_recognized_narrowing() {
+        let changes = vec![Change::StructFieldTypeChanged {
+            node: node_id("model.a"),
+            column: column("payload"),
+            field: column("amount"),
+            from_type: "bigint".to_string(),
+            to_type: "int".to_string(),
+        }];
+
+        assert_eq!(
+            evaluate(&empty_project(), &changes, &Config::default()),
+            vec![Finding {
+                severity: Severity::Warn,
+                detail: FindingDetail::StructFieldTypeNarrowed {
+                    node: node_id("model.a"),
+                    column: column("payload"),
+                    field: column("amount"),
+                    from_type: "bigint".to_string(),
+                    to_type: "int".to_string(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn struct_field_type_narrowed_does_not_fire_on_a_widening() {
+        let changes = vec![Change::StructFieldTypeChanged {
+            node: node_id("model.a"),
+            column: column("payload"),
+            field: column("amount"),
+            from_type: "int".to_string(),
+            to_type: "bigint".to_string(),
+        }];
+
+        assert_eq!(
+            evaluate(&empty_project(), &changes, &Config::default()),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn struct_field_type_narrowed_does_not_fire_on_an_unrecognized_type_pair() {
+        // Neither side is a recognized integer type -- never guess, same
+        // as `column_type_narrowed_does_not_fire_on_an_unrecognized_type_pair`.
+        let changes = vec![Change::StructFieldTypeChanged {
+            node: node_id("model.a"),
+            column: column("payload"),
+            field: column("note"),
+            from_type: "varchar(255)".to_string(),
+            to_type: "varchar(50)".to_string(),
+        }];
+
+        assert_eq!(
+            evaluate(&empty_project(), &changes, &Config::default()),
+            Vec::new()
+        );
+    }
+
+    /// Acceptance criterion (c): when a column's struct shape isn't
+    /// statically knowable on both sides, `diff()` (see `diff.rs`'s own
+    /// tests) never produces a `StructField*` `Change` for it in the
+    /// first place -- so there is, by construction, nothing for this
+    /// module to evaluate and no Rule can fire. This test pins that
+    /// contract from the Rule-evaluation side: an empty Change list
+    /// (exactly what an "unknown shape" comparison produces) yields zero
+    /// struct-evolution Findings, not a guessed one.
+    #[test]
+    fn no_struct_evolution_finding_fires_when_there_is_no_struct_field_change_to_evaluate() {
+        let findings = evaluate(&empty_project(), &[], &Config::default());
+        assert!(findings.is_empty());
+    }
+
+    /// `zhao.yml` can name every new Rule by its documented config name,
+    /// round-tripping through `RuleId::all()` the same way the original
+    /// four Rules already do -- guards against a typo in `config_name`/
+    /// `from_config_name` silently drifting apart.
+    #[test]
+    fn every_struct_evolution_rule_config_name_round_trips() {
+        for rule in [
+            RuleId::StructFieldRemoved,
+            RuleId::StructFieldAdded,
+            RuleId::StructFieldTypeNarrowed,
+        ] {
+            assert_eq!(RuleId::from_config_name(rule.config_name()), Some(rule));
+            assert!(RuleId::all().contains(&rule));
+        }
+    }
+
+    /// All three struct-evolution Rules can fire together on a fixture
+    /// with simultaneous changes, exactly mirroring
+    /// `all_four_rules_fire_together_on_a_fixture_with_simultaneous_changes`
+    /// above for the original top-level-column Rules.
+    #[test]
+    fn all_three_struct_evolution_rules_fire_together_on_a_fixture_with_simultaneous_changes() {
+        let changes = vec![
+            Change::StructFieldRemoved {
+                node: node_id("model.a"),
+                column: column("payload"),
+                field: column("legacy_flag"),
+            },
+            Change::StructFieldAdded {
+                node: node_id("model.a"),
+                column: column("payload"),
+                field: column("email"),
+            },
+            Change::StructFieldTypeChanged {
+                node: node_id("model.a"),
+                column: column("payload"),
+                field: column("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        ];
+
+        let findings = evaluate(&empty_project(), &changes, &Config::default());
+        assert_eq!(findings.len(), 3);
+
+        let rules: Vec<RuleId> = findings.iter().map(|f| f.detail.rule()).collect();
+        assert!(rules.contains(&RuleId::StructFieldRemoved));
+        assert!(rules.contains(&RuleId::StructFieldAdded));
+        assert!(rules.contains(&RuleId::StructFieldTypeNarrowed));
+
+        let severities: Vec<Severity> = findings.iter().map(|f| f.severity).collect();
+        assert_eq!(
+            severities.iter().filter(|s| **s == Severity::Error).count(),
+            1
+        );
+        assert_eq!(
+            severities.iter().filter(|s| **s == Severity::Warn).count(),
+            1
         );
         assert_eq!(
             severities.iter().filter(|s| **s == Severity::Pass).count(),

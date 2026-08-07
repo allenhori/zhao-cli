@@ -79,6 +79,32 @@ impl fmt::Display for ColumnName {
     }
 }
 
+/// A single field within a `STRUCT`-typed [`Column`]'s internal shape, when
+/// that shape happens to be statically knowable -- see
+/// [`Column::struct_fields`].
+///
+/// Reuses [`ColumnName`] for a field's own name rather than introducing a
+/// parallel wrapper type: structurally, a struct field *is* just a nested
+/// column -- the same "named, optionally typed" shape [`Column`] itself has
+/// one level up, and there's no risk of a field name and a column name
+/// being confused for each other at a call site the way, say, a `NodeId`
+/// and a `ColumnName` could be (they never appear as substitutable
+/// arguments anywhere in this crate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructField {
+    /// This field's name.
+    pub name: ColumnName,
+    /// This field's data type, when the extraction that produced this
+    /// shape happened to capture one. A `CAST(... AS STRUCT<...>)`'s
+    /// explicit field types always do; a `STRUCT(...)`/`named_struct(...)`
+    /// constructor's fields often don't, since a constructor only names
+    /// its fields -- their types are merely *implied* by each field's
+    /// value expression, which this adapter does not attempt to infer
+    /// (see the dbt adapter's module-level "Known limitations" doc
+    /// comment) rather than guess at.
+    pub data_type: Option<String>,
+}
+
 /// A single column within a [`Node`]'s or [`Origin`]'s schema: its name
 /// and, where documented, its data type.
 ///
@@ -104,6 +130,22 @@ pub struct Column {
     /// byte-identical to the original source text (whitespace,
     /// capitalization, and equivalent syntax may differ).
     pub expression: Option<String>,
+    /// This column's internal `STRUCT` field shape, when it's a
+    /// `STRUCT`-typed column *and* that shape was statically knowable from
+    /// the compiled SQL -- an explicit `CAST(... AS STRUCT<...>)`, or a
+    /// `STRUCT(...)`/`named_struct(...)` constructor call that names its
+    /// fields. `None` in every other case -- most importantly, `None` is
+    /// the *only* value used for "not knowable" (a struct column simply
+    /// passed through via `SELECT *` or an unadorned `ref()`, with no
+    /// `CAST`/constructor in the immediate SQL): this is never a guessed
+    /// or empty shape standing in for "unknown," matching this crate's
+    /// "never guess, only report what's structurally certain" philosophy
+    /// (see [`Column::data_type`]'s own doc comment, and the dbt adapter's
+    /// module-level "Known limitations" doc comment). One level deep
+    /// only -- a nested field that's itself a `STRUCT` never has its own
+    /// `struct_fields` populated; see the dbt adapter's struct-extraction
+    /// code for why arbitrarily deep nesting is explicitly out of scope.
+    pub struct_fields: Option<Vec<StructField>>,
 }
 
 /// The kind of join a [`Node`]'s definition uses to combine two relations.
