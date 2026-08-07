@@ -65,17 +65,18 @@
 //! A `STRUCT`-typed column's own internal field *shape* (as opposed to
 //! lineage through it, above) is a separate concern this adapter also
 //! handles, for schema/type-evolution detection rather than
-//! column-lineage tracing: [`extract_struct_shape`] recognizes a column's
-//! immediate defining expression being a `CAST(... AS STRUCT<...>)`, a
-//! `STRUCT(...)` constructor, or a `named_struct(...)` call that names
-//! every field explicitly, and records that shape on
+//! column-lineage tracing: `extract_struct_shape` (private -- not part of
+//! this crate's public API) recognizes a column's immediate defining
+//! expression being a `CAST(... AS STRUCT<...>)`, a `STRUCT(...)`
+//! constructor, or a `named_struct(...)` call that names every field
+//! explicitly, and records that shape on
 //! [`crate::model::Column::struct_fields`]. One level deep only (a
 //! nested field that's itself a `STRUCT`, an array-of-structs' element
 //! shape, and a map's value-type evolution are all out of scope), and
 //! *not* propagated across a CTE hop, a rename, or a wildcard expansion
 //! the way lineage `sources` are -- only a column's own immediate SQL in
 //! the model actually being resolved ever produces a shape; see
-//! [`ResolvedColumn::struct_fields`]'s doc comment.
+//! `ResolvedColumn::struct_fields`'s doc comment (also private).
 
 use super::warehouse::{QueryExecutor, RELATION_EXISTS_MACRO, RelationIdentity};
 use super::{AdapterVocabulary, TransformationToolAdapter};

@@ -15,8 +15,8 @@
 //! the SQL would assume -- joins are only ever compared by kind here,
 //! never by what they actually join on.
 //!
-//! `STRUCT` field comparison ([`diff_struct_fields`]) only ever runs one
-//! level deep, matching [`crate::model::Column::struct_fields`]'s own
+//! `STRUCT` field comparison (`diff_struct_fields`, private) only ever
+//! runs one level deep, matching [`crate::model::Column::struct_fields`]'s own
 //! one-level-only extraction: a nested field that's itself a `STRUCT`
 //! (a struct-within-a-struct), an array-of-structs' element shape, or a
 //! map's value-type evolution are all out of scope here, not silently
