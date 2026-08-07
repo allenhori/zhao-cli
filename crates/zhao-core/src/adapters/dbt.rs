@@ -50,6 +50,17 @@
 //! hops away it was actually computed -- the final model's column isn't
 //! misattributed to the trivial passthrough reference that happens to sit
 //! in the outermost `SELECT`.
+//!
+//! Struct/nested-field access -- Databricks/Spark, BigQuery, and DuckDB's
+//! `STRUCT` dot notation (`payload.user_id`, qualified or not), Snowflake's
+//! and Databricks' semi-structured `VARIANT` colon access (`payload:user_id`),
+//! and array/map subscript access mixed with either (`events[0].event_type`,
+//! `m['key']`) -- all resolve to their base column, the same "trace what's
+//! structurally certain, don't guess deeper" trade-off as a calculated
+//! column above: the struct/variant/array's own internal shape is never
+//! modeled, only which base column a nested reference ultimately reads
+//! from. See `collect_expr_sources_into`'s `CompoundIdentifier`,
+//! `JsonAccess`, and `CompoundFieldAccess` arms.
 
 use super::warehouse::{QueryExecutor, RELATION_EXISTS_MACRO, RelationIdentity};
 use super::{AdapterVocabulary, TransformationToolAdapter};
@@ -59,8 +70,8 @@ use crate::model::{
 };
 use serde::Deserialize;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, SetExpr,
-    Statement, TableFactor, TableWithJoins,
+    AccessExpr, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem,
+    SetExpr, Statement, Subscript, TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -1075,13 +1086,117 @@ fn collect_expr_sources_into(
 
     match expr {
         Expr::Identifier(ident) => {
-            push_dedup(resolve_unqualified(&ident.value, from_scope), found);
-        }
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
             push_dedup(
-                resolve_qualified(&parts[0].value, &parts[1].value, from_scope),
+                resolve_unqualified(std::slice::from_ref(&ident.value), from_scope),
                 found,
             );
+        }
+        // A dotted identifier chain, N >= 2 parts. Ordinarily `table.column`,
+        // but this is also exactly how a struct/`STRUCT`-typed column's
+        // nested field access compiles on Databricks, BigQuery, and DuckDB
+        // (`t.payload.user_id`, or even `payload.user_id` with no table
+        // alias at all if `payload` itself is a struct column) -- sqlparser
+        // represents both shapes identically, as a flat `CompoundIdentifier`.
+        // If `parts[0]` resolves as a real table alias, the rest of the
+        // path is resolved against that relation; otherwise the whole path
+        // is tried as an unqualified (possibly struct-field-accessing)
+        // reference. See [`resolve_qualified`]/[`resolve_unqualified`] and
+        // [`resolve_path_on_schema`] for how a multi-part path collapses to
+        // its base column when no exact longer match exists in scope.
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            let path: Vec<String> = parts.iter().map(|p| p.value.clone()).collect();
+            if from_scope.contains_key(&path[0]) {
+                push_dedup(
+                    resolve_qualified(&path[0], &path[1..], from_scope),
+                    found,
+                );
+            } else {
+                push_dedup(resolve_unqualified(&path, from_scope), found);
+            }
+        }
+        // Snowflake's and Databricks' semi-structured (`VARIANT`) colon
+        // access, e.g. `payload:user_id` or `t.payload:user.id`. Unlike a
+        // struct's dot-notation field access above, a `VARIANT` field has
+        // no fixed schema at all -- there's no scenario (documented or
+        // otherwise) where a longer dotted name could be a real column, so
+        // this only traces `value` (the base column reference being
+        // accessed) and drops the JSON path entirely, rather than attempting to
+        // collapse it into a longer dotted name the way `CompoundIdentifier`
+        // does.
+        Expr::JsonAccess { value, .. } => {
+            collect_expr_sources_into(value, from_scope, found);
+        }
+        // Bracket/subscript access mixed with (or instead of) dot access --
+        // array indexing (`arr[0]`), map access (`m['key']`), or a chain
+        // combining both with struct field access (`t.events[0].event_type`).
+        //
+        // sqlparser only folds a *pure* dot chain into `CompoundIdentifier`
+        // -- the moment a `[...]` appears anywhere in the chain, `root`
+        // stays just the single leading identifier (`t`) and every
+        // subsequent dotted field name (`events`, `event_type`) lives in
+        // `access_chain` as its own `AccessExpr::Dot`, not folded into
+        // `root`. So `t.events[0].event_type` is
+        // `CompoundFieldAccess { root: Identifier(t), access_chain:
+        // [Dot(events), Subscript(0), Dot(event_type)] }` -- resolving
+        // `root` alone would treat the table alias `t` itself as a bare
+        // column reference. Instead, the leading run of plain-identifier
+        // `Dot` entries (up to the first `Subscript`) is folded back onto
+        // `root` into one path and resolved exactly like a
+        // `CompoundIdentifier` of the same shape (base-column collapse,
+        // same as above). Any `Dot` entries *after* the first `Subscript`
+        // aren't attempted (there's no relation to resolve them against --
+        // the value's actual type past a subscript isn't tracked). Every
+        // subscript's own index/slice expressions are still walked, since
+        // those can themselves reference a column (e.g. `arr[other_col]`),
+        // the same way a function argument is.
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            let mut path = match root.as_ref() {
+                Expr::Identifier(ident) => Some(vec![ident.value.clone()]),
+                Expr::CompoundIdentifier(parts) => {
+                    Some(parts.iter().map(|p| p.value.clone()).collect())
+                }
+                other => {
+                    collect_expr_sources_into(other, from_scope, found);
+                    None
+                }
+            };
+
+            let mut chain = access_chain.iter().peekable();
+            if let Some(path) = &mut path {
+                while let Some(AccessExpr::Dot(Expr::Identifier(ident))) = chain.peek() {
+                    path.push(ident.value.clone());
+                    chain.next();
+                }
+                if from_scope.contains_key(&path[0]) {
+                    push_dedup(resolve_qualified(&path[0], &path[1..], from_scope), found);
+                } else {
+                    push_dedup(resolve_unqualified(path, from_scope), found);
+                }
+            }
+
+            // Whatever's left in `chain` (any subscripts, plus any
+            // non-identifier `Dot` access after the path-building run
+            // above stopped) -- only subscripts' own index/slice
+            // expressions are walked; see the doc comment above for why a
+            // trailing non-identifier `Dot` isn't otherwise attempted.
+            for access in chain {
+                if let AccessExpr::Subscript(subscript) = access {
+                    match subscript {
+                        Subscript::Index { index } => {
+                            collect_expr_sources_into(index, from_scope, found);
+                        }
+                        Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        } => {
+                            for bound in [lower_bound, upper_bound, stride].into_iter().flatten() {
+                                collect_expr_sources_into(bound, from_scope, found);
+                            }
+                        }
+                    }
+                }
+            }
         }
         // A window function (`OVER (...)`) is deliberately not attempted
         // (see the module-level "Known limitations" doc comment): its
@@ -1198,38 +1313,55 @@ fn collect_expr_sources_into(
     }
 }
 
-/// Resolves a plain unqualified column reference. Returns every source it
-/// carries when it resolves through an already-multi-sourced calculated
-/// column (see [`source_of`]); returns nothing when ambiguous among
-/// several relations in scope.
+/// Resolves a plain unqualified column reference -- possibly a nested
+/// struct/`STRUCT`-field path (e.g. Databricks/Spark `payload.user_id`,
+/// where `payload` is a struct-typed column, not a table alias). Returns
+/// every source it carries when it resolves through an already-multi-
+/// sourced calculated column (see [`source_of`]); returns nothing when
+/// ambiguous among several relations in scope.
+///
+/// `path` is the full dotted identifier, e.g. `["payload", "user_id"]`.
+/// See [`resolve_path_on_schema`] for how a multi-part path is matched.
 fn resolve_unqualified(
-    column: &str,
+    path: &[String],
     from_scope: &HashMap<String, LocalSchema>,
 ) -> Vec<(Upstream, String)> {
     if from_scope.len() == 1 {
         return match from_scope.values().next() {
-            Some(only) => source_of(only, column),
+            Some(only) => resolve_path_on_schema(only, path),
             None => Vec::new(),
         };
     }
 
     // A `Known` relation's columns are enumerated -- it either definitely
-    // has this column or definitely doesn't, so a `Known` hit is
-    // authoritative and wins over merely-possible matches.
-    let known_hits: Vec<&LocalSchema> = from_scope
-        .values()
-        .filter(|schema| matches!(schema, LocalSchema::Known(cols) if cols.iter().any(|c| c.name == column)))
-        .collect();
-    match known_hits.len() {
-        1 => return source_of(known_hits[0], column),
-        n if n > 1 => return Vec::new(), // genuinely ambiguous among Known relations
-        _ => {}
+    // has this (possibly dotted) column or definitely doesn't, so a
+    // `Known` hit is authoritative and wins over merely-possible matches.
+    // Tried longest dotted prefix first (most specific -- an upstream
+    // CTE/subquery whose own SELECT list literally aliases a dotted name,
+    // e.g. `select payload.user_id as "payload.user_id" from ...`, is the
+    // only way a `Known` relation's column list ever contains a dotted
+    // name -- `schema.yml` docs never feed into `LocalSchema` at all, see
+    // [`resolve_path_on_schema`]), falling back to shorter prefixes down
+    // to just the base column name.
+    for len in (1..=path.len()).rev() {
+        let candidate = path[..len].join(".");
+        let known_hits: Vec<&LocalSchema> = from_scope
+            .values()
+            .filter(|schema| matches!(schema, LocalSchema::Known(cols) if cols.iter().any(|c| c.name == candidate)))
+            .collect();
+        match known_hits.len() {
+            1 => return source_of(known_hits[0], &candidate),
+            n if n > 1 => return Vec::new(), // genuinely ambiguous among Known relations
+            _ => {}
+        }
     }
 
-    // No `Known` relation claims this column -- fall back to
+    // No `Known` relation claims any dotted prefix -- fall back to
     // `Passthrough` relations, whose real columns we can't enumerate to
     // either confirm or rule out, so only resolve if exactly one is in
-    // scope (more than one is genuinely ambiguous).
+    // scope (more than one is genuinely ambiguous). Collapses to the base
+    // column name only -- see [`resolve_path_on_schema`] for why a
+    // `Passthrough` never trusts a longer dotted name.
     let passthrough_hits: Vec<&Upstream> = from_scope
         .values()
         .filter_map(|schema| match schema {
@@ -1238,19 +1370,62 @@ fn resolve_unqualified(
         })
         .collect();
     match passthrough_hits.len() {
-        1 => vec![(passthrough_hits[0].clone(), column.to_string())],
+        1 => vec![(passthrough_hits[0].clone(), path[0].clone())],
         _ => Vec::new(),
     }
 }
 
+/// Resolves `path` (the identifier parts after the qualifier) against
+/// whichever relation `qualifier` names in `from_scope` -- possibly a
+/// nested struct-field path (e.g. `t.payload.user_id`, `t` a table alias,
+/// `payload` a struct-typed column). See [`resolve_path_on_schema`].
 fn resolve_qualified(
     qualifier: &str,
-    column: &str,
+    path: &[String],
     from_scope: &HashMap<String, LocalSchema>,
 ) -> Vec<(Upstream, String)> {
     match from_scope.get(qualifier) {
-        Some(schema) => source_of(schema, column),
+        Some(schema) => resolve_path_on_schema(schema, path),
         None => Vec::new(),
+    }
+}
+
+/// Resolves a (possibly multi-part, struct-field-accessing) dotted path
+/// against a single already-identified relation.
+///
+/// - `Known`: tries the longest dotted prefix first (`path.join(".")`),
+///   falling back to progressively shorter prefixes down to just
+///   `path[0]` if no longer prefix is an actual column on this relation.
+///   `Known` columns come entirely from the query's own already-resolved
+///   CTEs/subqueries (never from `schema.yml`, which this SQL-parsing
+///   layer never reads at all -- see `RawColumnDoc`'s own use, applied
+///   only afterward to enrich already-resolved columns with a documented
+///   `data_type`), so a dotted match here only ever fires when an
+///   upstream CTE's own SELECT list literally aliased a dotted name
+///   (`select payload.user_id as "payload.user_id" from ...`). Otherwise
+///   this correctly falls through to `path[0]` -- e.g. `payload.user_id`
+///   resolving to the base `payload` struct column when nothing in scope
+///   is named exactly `"payload.user_id"`.
+/// - `Passthrough`: an Origin's (or an unprocessed upstream Node's) real
+///   columns are never known (see the module's "Known limitations" doc
+///   comment), so there's no way to confirm whether a longer dotted name
+///   is itself the real column -- always collapses to `path[0]`, the
+///   base column, rather than guessing a longer name is correct.
+/// - `Opaque`: never resolves, same as a single-part reference.
+fn resolve_path_on_schema(schema: &LocalSchema, path: &[String]) -> Vec<(Upstream, String)> {
+    match schema {
+        LocalSchema::Known(_) => {
+            for len in (1..=path.len()).rev() {
+                let candidate = path[..len].join(".");
+                let result = source_of(schema, &candidate);
+                if !result.is_empty() {
+                    return result;
+                }
+            }
+            Vec::new()
+        }
+        LocalSchema::Passthrough(upstream) => vec![(upstream.clone(), path[0].clone())],
+        LocalSchema::Opaque => Vec::new(),
     }
 }
 
@@ -1755,6 +1930,227 @@ mod tests {
     /// An unqualified column ambiguous among several relations in scope
     /// contributes nothing to a larger expression, rather than a wrong
     /// guess at which relation it meant.
+    /// Databricks/Spark, BigQuery, and DuckDB all compile a `STRUCT`
+    /// column's nested field access to plain dot notation -- indistinguishable
+    /// at the parser level from `table.column`. A qualified 3-part chain
+    /// (`t.payload.user_id`) must resolve to the base `payload` column on
+    /// `t`, not fall through unresolved the way a `parts.len() == 2`-only
+    /// guard would.
+    #[test]
+    fn a_qualified_struct_field_access_resolves_to_the_base_struct_column() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(r#"select t.payload.user_id from "db"."s"."t" as t"#)
+            .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "user_id");
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "payload".to_string())],
+                    "a struct field access should trace to its base struct column"
+                );
+            }
+            other => panic!("expected Known([user_id sourced from payload]), got {other:?}"),
+        }
+    }
+
+    /// The same struct field access, but with no table alias at all --
+    /// `payload` isn't a real relation alias, so `payload.user_id` must
+    /// fall back to unqualified resolution (treating `payload` as the
+    /// base column) rather than being dropped as an unresolvable
+    /// qualifier lookup.
+    #[test]
+    fn an_unqualified_struct_field_access_resolves_to_the_base_struct_column() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query =
+            parse_query(r#"select payload.user_id from "db"."s"."t""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "payload".to_string())]
+                );
+            }
+            other => panic!("expected Known([user_id sourced from payload]), got {other:?}"),
+        }
+    }
+
+    /// Snowflake's (and Databricks') semi-structured `VARIANT` colon
+    /// access (`t.payload:user_id`) parses as a distinct `JsonAccess`
+    /// expression wrapping a `CompoundIdentifier`, not as a longer
+    /// `CompoundIdentifier` itself -- must still resolve to the base
+    /// `payload` column, dropping the JSON path.
+    #[test]
+    fn a_qualified_variant_colon_access_resolves_to_the_base_column() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(r#"select t.payload:user_id from "db"."s"."t" as t"#)
+            .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "payload".to_string())]
+                );
+            }
+            other => panic!("expected Known([.. sourced from payload]), got {other:?}"),
+        }
+    }
+
+    /// Same colon access, unqualified -- single table in scope, `payload`
+    /// resolved directly as the base column.
+    #[test]
+    fn an_unqualified_variant_colon_access_resolves_to_the_base_column() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query =
+            parse_query(r#"select payload:user_id from "db"."s"."t""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "payload".to_string())]
+                );
+            }
+            other => panic!("expected Known([.. sourced from payload]), got {other:?}"),
+        }
+    }
+
+    /// A struct field access chained after an array subscript (a common
+    /// BigQuery/DuckDB/Databricks shape for `ARRAY<STRUCT<...>>` columns,
+    /// e.g. an `events` column holding an array of event structs) parses
+    /// as `CompoundFieldAccess`, not `CompoundIdentifier` -- must still
+    /// trace back to the base `events` column.
+    #[test]
+    fn a_struct_field_access_after_an_array_subscript_resolves_to_the_base_column() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(r#"select t.events[0].event_type from "db"."s"."t" as t"#)
+            .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "events".to_string())]
+                );
+            }
+            other => panic!("expected Known([.. sourced from events]), got {other:?}"),
+        }
+    }
+
+    /// A subscript's own index expression can itself reference a column
+    /// (`arr[other_col]`) -- must be traced the same way a function
+    /// argument is, not silently dropped as part of "the subscript key
+    /// isn't attempted."
+    #[test]
+    fn a_column_referenced_inside_a_subscript_index_is_traced() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(r#"select t.arr[t.idx] as picked from "db"."s"."t" as t"#)
+            .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "picked");
+                assert!(
+                    cols[0]
+                        .sources
+                        .contains(&(origin("origin.s.t"), "arr".to_string()))
+                );
+                assert!(
+                    cols[0]
+                        .sources
+                        .contains(&(origin("origin.s.t"), "idx".to_string()))
+                );
+            }
+            other => panic!("expected Known([picked sourced from arr and idx]), got {other:?}"),
+        }
+    }
+
+    /// If an upstream CTE's own SELECT list happens to alias a column
+    /// under a literal dotted name matching the full struct-field path,
+    /// that more specific match wins over collapsing to the base column --
+    /// the longest-dotted-prefix-first search in `resolve_path_on_schema`.
+    #[test]
+    fn an_exact_dotted_alias_on_an_upstream_cte_wins_over_the_base_column_collapse() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"with a as (select payload.user_id as "payload.user_id", payload as payload from "db"."s"."t")
+               select x.payload.user_id from a as x"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "payload".to_string())],
+                    "should resolve through the CTE's own \"payload.user_id\" alias (itself \
+                     sourced from the base \"payload\" column), not collapse straight to the \
+                     CTE's separate \"payload\" passthrough column"
+                );
+            }
+            other => panic!("expected Known([.. resolved via the dotted alias]), got {other:?}"),
+        }
+    }
+
     #[test]
     fn an_ambiguous_sub_reference_inside_a_larger_expression_contributes_nothing() {
         let mut known_relations = HashMap::new();
