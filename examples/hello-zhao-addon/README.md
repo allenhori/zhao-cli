@@ -104,5 +104,8 @@ discouraged.
 - No error-hardening beyond "print a clear message and exit 1." A real Addon should be much more
   careful about this than a teaching example needs to be.
 
-See [ADR 0010](https://github.com/allenhori/zhao/blob/master/docs/adr/0010-addon-interface-is-subprocess-plus-file-contract.md)
-in the `zhao` planning repo for the full design rationale behind this contract.
+The contract is deliberately just a subprocess plus files — no shared library, no compiled-in
+knowledge on `zhao-cli`'s side of any specific Addon, discovery purely by the `zhao-<name>`
+naming convention on `PATH`. That's what keeps an Addon like this one entirely independent:
+any language, any license, any release cadence, as long as it honors the three-part contract
+above.
