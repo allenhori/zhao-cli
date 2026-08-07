@@ -81,6 +81,32 @@ Saves passing `--against main` on every invocation just because your default bra
 called `master` (zhao's own built-in default). The CLI `--against` flag still overrides this
 when given; with neither set, zhao falls back to `master`.
 
+## `dbt-command`/`dbt-args`
+
+The executable (and, if you like, a wrapper's own leading flags) zhao invokes for every `dbt`
+subprocess call it makes itself (`dbt deps`/`dbt compile` for git-native Baseline resolution,
+`dbt run-operation` for `--check-relations`, `dbt compile` for `zhao lineage --compile`):
+
+```yaml
+dbt-command: dbt          # zhao's own default -- resolved via PATH
+dbt-command: uv run dbt   # a project that only ever invokes dbt through uv
+dbt-command: dw some-flag # a custom in-house wrapper, with its own leading flag
+```
+
+Shell-word-split, so a multi-word value works as a genuine prefix — `dw some-flag` runs as
+`dw some-flag deps`/`dw some-flag compile`/etc, not as one literal (nonexistent) executable
+named `"dw some-flag"`. Assumes you know what your own wrapper does with any flags placed
+ahead of the subcommand; zhao never interprets them. The CLI `--dbt-command` flag overrides
+this when given; with neither set, zhao falls back to `"dbt"`.
+
+`dbt-args` (or the CLI's `--dbt-arg`/`--dbt-args`) is separate and additive — extra arguments
+appended *after* the subcommand (`--target`, `--vars`, ...), not part of the command prefix
+itself:
+
+```yaml
+dbt-args: "--target ci"
+```
+
 ## `log`
 
 Settings for the daily-rotating run log (`target/zhao/logs/<date>.log` -- see

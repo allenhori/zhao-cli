@@ -17,3 +17,8 @@
 # needs its own ignore entry since the /target rule above only anchors to
 # the repo root.
 examples/hello-zhao-addon/target
+
+# Isolated git worktrees created by background implementation agents
+# (e.g. for issue-scoped, sandboxed work) -- never meant to be committed
+# as part of the checkout that spawned them.
+/.worktrees/

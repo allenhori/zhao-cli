@@ -221,6 +221,18 @@ pub struct CheckArgs {
     )]
     pub dbt_args: Option<String>,
 
+    /// The executable/prefix zhao invokes for every `dbt` subprocess call
+    /// it makes internally (`dbt deps`/`dbt compile` for Baseline
+    /// resolution, `dbt run-operation` for `--check-relations`) --
+    /// ordinarily just `"dbt"`, resolved via `PATH`. Accepts a multi-word
+    /// prefix (shell-word-split, same as `--dbt-args`), so a project
+    /// already using its own wrapper instead of invoking `dbt` directly
+    /// (e.g. `"uv run dbt"`, or a custom wrapper like `"dw some-flag"`)
+    /// can point zhao at that instead. Overrides `zhao.yml`'s
+    /// `dbt-command` when given; with neither set, defaults to `"dbt"`.
+    #[arg(long = "dbt-command", allow_hyphen_values = true)]
+    pub dbt_command: Option<String>,
+
     /// Upgrades the conditional schema-evolution flag (see the "Schema
     /// evolution" report section) into a definitive one, or drops it
     /// entirely, by actually checking whether each flagged model exists

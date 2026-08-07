@@ -105,6 +105,8 @@ pub struct Config {
     against: Option<String>,
     log_level: LogLevel,
     log_retention_days: Option<u32>,
+    dbt_command: Option<String>,
+    dbt_args: Option<String>,
 }
 
 impl Default for Config {
@@ -117,6 +119,8 @@ impl Default for Config {
             against: None,
             log_level: LogLevel::default(),
             log_retention_days: None,
+            dbt_command: None,
+            dbt_args: None,
         }
     }
 }
@@ -158,6 +162,28 @@ impl Config {
     /// this nor a CLI override is given.
     pub fn against(&self) -> Option<&str> {
         self.against.as_deref()
+    }
+
+    /// The executable/prefix to invoke for every `dbt` subprocess call
+    /// zhao itself makes (`compile`, `deps`, live relation checks, ...),
+    /// if `zhao.yml` sets one -- e.g. `"uv run dbt"`, or a custom wrapper
+    /// like `"dw some-flag"` a project's own tooling already uses instead
+    /// of invoking `dbt` directly. `None` if it doesn't -- callers fall
+    /// back to `"dbt"`, resolved via `PATH`, the same as zhao's v1
+    /// default. Shell-word-split by the caller, not here (see
+    /// `adapters::dbt::run_dbt_subcommand`), so a multi-word value works
+    /// as a genuine prefix, not a single literal executable name.
+    pub fn dbt_command(&self) -> Option<&str> {
+        self.dbt_command.as_deref()
+    }
+
+    /// Extra arguments (shell-word-style, e.g. `"--target ci"`) appended
+    /// to every `dbt` subprocess call zhao itself makes, if `zhao.yml`
+    /// sets any. `None` if it doesn't -- a CLI-supplied `--dbt-arg`/
+    /// `--dbt-args` always wins over this when both are present (see
+    /// `zhao-cli`'s own `CheckArgs::dbt_passthrough_args`).
+    pub fn dbt_args(&self) -> Option<&str> {
+        self.dbt_args.as_deref()
     }
 
     /// The configured run-log verbosity (see [`LogLevel`]) -- defaults to
@@ -245,6 +271,8 @@ struct ConfigLayer {
     against: Option<String>,
     log_level: Option<LogLevel>,
     log_retention_days: Option<u32>,
+    dbt_command: Option<String>,
+    dbt_args: Option<String>,
 }
 
 impl ConfigLayer {
@@ -282,6 +310,8 @@ impl ConfigLayer {
             against: self.against.or(base.against),
             log_level: self.log_level.or(base.log_level),
             log_retention_days: self.log_retention_days.or(base.log_retention_days),
+            dbt_command: self.dbt_command.or(base.dbt_command),
+            dbt_args: self.dbt_args.or(base.dbt_args),
         }
     }
 
@@ -294,6 +324,8 @@ impl ConfigLayer {
             against: self.against,
             log_level: self.log_level.unwrap_or_default(),
             log_retention_days: self.log_retention_days,
+            dbt_command: self.dbt_command,
+            dbt_args: self.dbt_args,
         }
     }
 }
@@ -321,6 +353,10 @@ struct RawConfig {
     against: Option<String>,
     #[serde(default)]
     log: Option<RawLogConfig>,
+    #[serde(rename = "dbt-command", default)]
+    dbt_command: Option<String>,
+    #[serde(rename = "dbt-args", default)]
+    dbt_args: Option<String>,
 }
 
 /// The `log:` section of `zhao.yml` -- see [`Config::log_level`].
@@ -400,6 +436,8 @@ impl RawConfig {
             against: self.against,
             log_level,
             log_retention_days,
+            dbt_command: self.dbt_command,
+            dbt_args: self.dbt_args,
         })
     }
 }
@@ -877,5 +915,37 @@ mod tests {
         let config = Config::load_for_project(&repo.project_dir).expect("should parse");
 
         assert_eq!(config.against(), Some("develop"));
+    }
+
+    #[test]
+    fn missing_dbt_command_leaves_it_unset() {
+        let config = Config::load(Path::new("/nonexistent/zhao.yml")).expect("should be ok");
+        assert_eq!(config.dbt_command(), None);
+        assert_eq!(config.dbt_args(), None);
+    }
+
+    #[test]
+    fn dbt_command_and_args_are_read_from_zhao_yml() {
+        let file = write_temp_yaml("dbt-command: \"uv run dbt\"\ndbt-args: \"--target ci\"\n");
+        let config = Config::load(file.path()).expect("should parse");
+
+        assert_eq!(config.dbt_command(), Some("uv run dbt"));
+        assert_eq!(config.dbt_args(), Some("--target ci"));
+    }
+
+    #[test]
+    fn project_local_dbt_command_wins_over_root() {
+        let repo = fake_repo();
+        fs::write(repo.root.join("zhao.yml"), "dbt-command: dbt\n")
+            .expect("should write root config");
+        fs::write(
+            repo.project_dir.join("zhao.yml"),
+            "dbt-command: \"dw some-flag\"\n",
+        )
+        .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        assert_eq!(config.dbt_command(), Some("dw some-flag"));
     }
 }
