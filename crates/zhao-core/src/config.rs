@@ -107,6 +107,7 @@ pub struct Config {
     log_retention_days: Option<u32>,
     dbt_command: Option<String>,
     dbt_args: Option<String>,
+    tool: Option<String>,
 }
 
 impl Default for Config {
@@ -121,6 +122,7 @@ impl Default for Config {
             log_retention_days: None,
             dbt_command: None,
             dbt_args: None,
+            tool: None,
         }
     }
 }
@@ -184,6 +186,16 @@ impl Config {
     /// `zhao-cli`'s own `CheckArgs::dbt_passthrough_args`).
     pub fn dbt_args(&self) -> Option<&str> {
         self.dbt_args.as_deref()
+    }
+
+    /// The configured Transformation Tool Adapter name (e.g. `"dbt"`), if
+    /// `zhao.yml` sets a `tool:` key. `None` if it doesn't -- the ordinary
+    /// case, since this is only ever consulted as a fallback when
+    /// auto-detection (by project marker file) can't produce a single
+    /// answer on its own; it never overrides a detection that already
+    /// succeeded. See `zhao_core::adapters::resolve_tool_name`.
+    pub fn tool(&self) -> Option<&str> {
+        self.tool.as_deref()
     }
 
     /// The configured run-log verbosity (see [`LogLevel`]) -- defaults to
@@ -273,6 +285,7 @@ struct ConfigLayer {
     log_retention_days: Option<u32>,
     dbt_command: Option<String>,
     dbt_args: Option<String>,
+    tool: Option<String>,
 }
 
 impl ConfigLayer {
@@ -312,6 +325,7 @@ impl ConfigLayer {
             log_retention_days: self.log_retention_days.or(base.log_retention_days),
             dbt_command: self.dbt_command.or(base.dbt_command),
             dbt_args: self.dbt_args.or(base.dbt_args),
+            tool: self.tool.or(base.tool),
         }
     }
 
@@ -326,6 +340,7 @@ impl ConfigLayer {
             log_retention_days: self.log_retention_days,
             dbt_command: self.dbt_command,
             dbt_args: self.dbt_args,
+            tool: self.tool,
         }
     }
 }
@@ -357,6 +372,8 @@ struct RawConfig {
     dbt_command: Option<String>,
     #[serde(rename = "dbt-args", default)]
     dbt_args: Option<String>,
+    #[serde(default)]
+    tool: Option<String>,
 }
 
 /// The `log:` section of `zhao.yml` -- see [`Config::log_level`].
@@ -438,6 +455,7 @@ impl RawConfig {
             log_retention_days,
             dbt_command: self.dbt_command,
             dbt_args: self.dbt_args,
+            tool: self.tool,
         })
     }
 }
@@ -947,5 +965,31 @@ mod tests {
         let config = Config::load_for_project(&repo.project_dir).expect("should parse");
 
         assert_eq!(config.dbt_command(), Some("dw some-flag"));
+    }
+
+    #[test]
+    fn missing_tool_leaves_it_unset() {
+        let config = Config::load(Path::new("/nonexistent/zhao.yml")).expect("should be ok");
+        assert_eq!(config.tool(), None);
+    }
+
+    #[test]
+    fn tool_is_read_from_zhao_yml() {
+        let file = write_temp_yaml("tool: dbt\n");
+        let config = Config::load(file.path()).expect("should parse");
+
+        assert_eq!(config.tool(), Some("dbt"));
+    }
+
+    #[test]
+    fn project_local_tool_wins_over_root() {
+        let repo = fake_repo();
+        fs::write(repo.root.join("zhao.yml"), "tool: dbt\n").expect("should write root config");
+        fs::write(repo.project_dir.join("zhao.yml"), "tool: sqlmesh\n")
+            .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        assert_eq!(config.tool(), Some("sqlmesh"));
     }
 }

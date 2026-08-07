@@ -5,10 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
-use zhao_core::adapters::TransformationToolAdapter;
-use zhao_core::adapters::dbt::{DbtAdapter, DbtAdapterError};
+use zhao_core::adapters::dbt::DbtAdapterError;
 use zhao_core::git::{self, GitError};
 use zhao_core::model::ParsedProject;
+
+use crate::adapter::ResolvedAdapter;
 
 /// Everything that can go wrong resolving a Baseline.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +32,10 @@ pub enum BaselineError {
 }
 
 /// Resolves the Baseline `zhao check` diffs the current project against.
+///
+/// `adapter` is the already-resolved Transformation Tool Adapter (see
+/// `crate::adapter::ResolvedAdapter`) -- every `parse`/`compile`/`deps`
+/// call below goes through it, never a hardcoded concrete adapter type.
 ///
 /// If `state_path` is given, it's parsed directly (`extra_args` is
 /// ignored in this path -- there's no `dbt` invocation to pass them to).
@@ -60,6 +65,7 @@ pub enum BaselineError {
 /// Only meaningful for this git-native path -- `--state <path>` returns
 /// above, before anything is compiled, so there's nothing to capture.
 pub fn resolve(
+    adapter: &ResolvedAdapter,
     state_path: Option<&Path>,
     project_dir: &Path,
     against: &str,
@@ -67,7 +73,7 @@ pub fn resolve(
     extra_args: &[String],
 ) -> Result<ParsedProject, BaselineError> {
     if let Some(path) = state_path {
-        return DbtAdapter
+        return adapter
             .parse(path)
             .map_err(|source| BaselineError::Manifest {
                 path: path.display().to_string(),
@@ -95,19 +101,19 @@ pub fn resolve(
             "deps",
             &worktree_project_dir,
             project_dir,
-            DbtAdapter.deps(&worktree_project_dir, dbt_command, extra_args),
+            adapter.deps(&worktree_project_dir, dbt_command, extra_args),
         )?;
     }
     crate::log::log_dbt_result(
         "compile",
         &worktree_project_dir,
         project_dir,
-        DbtAdapter.compile(&worktree_project_dir, dbt_command, extra_args),
+        adapter.compile(&worktree_project_dir, dbt_command, extra_args),
     )?;
 
     let manifest_path = worktree_project_dir.join("target").join("manifest.json");
     capture_baseline_manifest(&manifest_path, project_dir);
-    Ok(DbtAdapter.parse(&manifest_path)?)
+    Ok(adapter.parse(&manifest_path)?)
 }
 
 /// Routes a `dbt compile`/`dbt deps` subcommand's captured stdout/stderr

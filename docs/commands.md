@@ -17,7 +17,7 @@ zhao check [OPTIONS]
 | Flag | Default | What it does |
 |---|---|---|
 | `--state <path>` | — | Use an already-compiled `manifest.json` as the Baseline instead of resolving one via git. |
-| `--project-dir <dir>` | `.` | The dbt project to check. Its current state is read from `<dir>/target/manifest.json` — run `dbt compile` in the project first; zhao refuses to run against a stale one (see `--allow-stale-manifest` below). |
+| `--project-dir <dir>` | `.` | The dbt project to check. Its current state is read from `<dir>/target/manifest.json` — run `dbt compile` in the project first; zhao refuses to run against a stale one (see `--allow-stale-manifest` below). Which Transformation Tool Adapter to read it with is auto-detected from `<dir>` itself (a `dbt_project.yml` marker means dbt, the only adapter zhao ships today); see [`tool`](configuration.md#tool) for the (rarely needed) fallback. |
 | `--against <ref>` | `master` | The branch to find a merge-base against, for git-native Baseline resolution. Ignored when `--state` is given. Overrides `zhao.yml`'s `against` when given — see [Configuring `zhao.yml`](configuration.md#against). |
 | `--format <text\|json>` | `text` | `json` is the machine-readable shape everything else in this table also applies to — build a PR-comment bot or dashboard on top of it without scraping text. |
 | `--no-color` | — | Disables ANSI color in text output (auto-detected otherwise; no effect on `--format json`). |
@@ -85,7 +85,7 @@ model.
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--project-dir <dir>` | `.` | The dbt project to query. |
+| `--project-dir <dir>` | `.` | The dbt project to query. Which Transformation Tool Adapter to read it with is auto-detected the same way as `zhao check`'s `--project-dir` — see [`tool`](configuration.md#tool). |
 | `--html <path>` | — | Writes the interactive HTML export to this explicit path instead of the computed default (see below). HTML is already the default output mode — this only overrides *where* it's written. |
 | `--text` | — | Prints the plain-text report to stdout instead of HTML. `TARGET` is required with this flag. |
 | `--compile` | — | Runs `dbt compile` first, for a guaranteed-fresh view. Without it, the existing `target/manifest.json` is read as-is. |

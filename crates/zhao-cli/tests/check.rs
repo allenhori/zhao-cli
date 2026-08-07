@@ -11,6 +11,28 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(name)
 }
 
+/// Writes the marker file adapter auto-detection looks for
+/// (`dbt_project.yml`) into `dir`, with its mtime pinned to the Unix
+/// epoch -- far older than any manifest a test writes or copies in
+/// afterward, so it can never trip the unrelated current-manifest-
+/// freshness check. Pinning matters specifically because `std::fs::copy`
+/// (used by several fixtures below to bring in a real manifest) can
+/// preserve the *source* file's original mtime on some platforms/
+/// filesystems (e.g. an APFS `clonefile` copy) rather than stamping
+/// "now" -- an ordinary "write the marker first" ordering isn't reliably
+/// enough on its own to guarantee the marker looks older.
+fn write_dbt_project_marker(dir: &Path) {
+    let path = dir.join("dbt_project.yml");
+    std::fs::write(&path, "name: fixture\nversion: '1.0.0'\n")
+        .expect("should write dbt_project.yml marker");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("should reopen dbt_project.yml")
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)
+        .expect("should set an old mtime on dbt_project.yml");
+}
+
 /// Acceptance criteria 1, 2, 4, 5 together: with no `--format json`,
 /// `zhao check` produces the three-part human-readable report, the
 /// "Changed" section lists exactly the Nodes that changed with the
@@ -794,6 +816,10 @@ fn fake_monorepo(project_manifest_fixture: &str) -> (tempfile::TempDir, std::pat
 
     let project_dir = dir.path().join("services").join("analytics");
     std::fs::create_dir_all(project_dir.join("target")).expect("should create project target dir");
+    // The marker adapter auto-detection looks for -- written before the
+    // manifest copy below so its mtime never trips the unrelated
+    // current-manifest-freshness check.
+    write_dbt_project_marker(&project_dir);
     std::fs::copy(
         fixture(project_manifest_fixture)
             .join("target")
@@ -877,6 +903,7 @@ fn a_single_project_repo_behaves_exactly_as_before_monorepo_support() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     std::fs::create_dir_all(dir.path().join(".git")).expect("should create .git marker");
     std::fs::create_dir_all(dir.path().join("target")).expect("should create target dir");
+    write_dbt_project_marker(dir.path());
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -1001,6 +1028,10 @@ mod check_relations {
         let baseline_path = dir.path().join("baseline_manifest.json");
         std::fs::write(&baseline_path, incremental_manifest("select 1 as id"))
             .expect("should write baseline manifest");
+        // The marker adapter auto-detection looks for -- written before
+        // the current manifest below so its mtime never trips the
+        // unrelated current-manifest-freshness check.
+        write_dbt_project_marker(dir.path());
 
         std::fs::create_dir_all(dir.path().join("target")).expect("should create target dir");
         std::fs::write(
@@ -1177,6 +1208,13 @@ mod git_native_baseline {
         repo.git(&["init", "--initial-branch=master"]);
         repo.git(&["config", "user.email", "test@zhao.invalid"]);
         repo.git(&["config", "user.name", "zhao test"]);
+        // The marker adapter auto-detection looks for -- written before
+        // the caller's first commit, so it's tracked (and thus present in
+        // every checked-out commit/worktree) from the very start. Written
+        // ahead of `target/manifest.json` (always written later, after at
+        // least one commit) so its mtime never trips the unrelated
+        // current-manifest-freshness check.
+        repo.write("dbt_project.yml", "name: fixture\nversion: '1.0.0'\n");
         repo
     }
 
@@ -1340,6 +1378,8 @@ mod git_native_baseline {
         repo.git(&["config", "user.email", "test@zhao.invalid"]);
         repo.git(&["config", "user.name", "zhao test"]);
 
+        // See `new_test_repo`'s identical write for why.
+        repo.write("dbt_project.yml", "name: fixture\nversion: '1.0.0'\n");
         repo.write("dbt_manifest_source.json", baseline_manifest);
         repo.commit("baseline state");
 
@@ -1877,6 +1917,25 @@ mod staleness_warning {
         // untracked `target/manifest.json` written below -- a real dbt
         // project gitignores `target/` for the same reason.
         repo.commit(".gitignore", "target/\n", "ignore target/");
+        // The marker adapter auto-detection looks for -- committed ahead
+        // of `target/manifest.json` (copied in below, untracked). Its
+        // mtime is then pinned to the Unix epoch, same as
+        // `write_dbt_project_marker`: `std::fs::copy` below can preserve
+        // the *source* fixture's own original mtime on some platforms
+        // (e.g. an APFS `clonefile` copy) rather than stamping "now", so
+        // committing it first isn't reliably enough on its own to
+        // guarantee it looks older than the copied-in manifest.
+        repo.commit(
+            "dbt_project.yml",
+            "name: fixture\nversion: '1.0.0'\n",
+            "add dbt_project.yml",
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(repo.path.join("dbt_project.yml"))
+            .expect("should reopen dbt_project.yml")
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .expect("should set an old mtime on dbt_project.yml");
         repo.commit("README.md", "on master\n", "on master");
         repo.git(&["checkout", "-b", "feature"]);
         repo.commit("README.md", "on feature\n", "feature work, ahead of master");

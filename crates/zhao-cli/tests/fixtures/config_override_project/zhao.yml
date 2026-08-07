@@ -1,3 +1,4 @@
 preset: strict
 rules:
   column-added: pass
+tool: dbt

@@ -1,3 +1,4 @@
 defer:
   target: staging
   state: artifacts/staging/manifest.json
+tool: dbt

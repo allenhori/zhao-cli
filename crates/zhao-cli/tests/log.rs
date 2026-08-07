@@ -8,6 +8,27 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(name)
 }
 
+/// Writes the marker file adapter auto-detection looks for
+/// (`dbt_project.yml`) into `dir`, with its mtime pinned to the Unix
+/// epoch -- far older than any manifest a test copies in afterward, so
+/// it can never trip the unrelated current-manifest-freshness check.
+/// Pinning matters specifically because `std::fs::copy` (used below to
+/// bring in a real fixture manifest) can preserve the *source* file's
+/// original mtime on some platforms/filesystems (e.g. an APFS
+/// `clonefile` copy) rather than stamping "now" -- writing the marker
+/// first isn't reliably enough on its own to guarantee it looks older.
+fn write_dbt_project_marker(dir: &std::path::Path) {
+    let path = dir.join("dbt_project.yml");
+    std::fs::write(&path, "name: fixture\nversion: '1.0.0'\n")
+        .expect("should write dbt_project.yml marker");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("should reopen dbt_project.yml")
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)
+        .expect("should set an old mtime on dbt_project.yml");
+}
+
 fn today() -> String {
     let days = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -37,6 +58,7 @@ fn a_lineage_run_appends_its_stdout_to_todays_log() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -79,6 +101,7 @@ fn multiple_runs_the_same_day_append_to_the_same_file() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -119,6 +142,7 @@ fn the_log_mirror_never_changes_real_stdout_output() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -152,6 +176,7 @@ fn a_log_level_flag_is_accepted_without_error() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -199,6 +224,10 @@ fn stub_dbt_command(dir: &std::path::Path, script: &str) -> std::path::PathBuf {
 fn a_successful_compiles_output_is_routed_into_the_run_log() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
+    // A real dbt project always has this before `dbt compile` can even
+    // run -- `--compile` still needs adapter auto-detection to succeed
+    // up front, same as every other command.
+    write_dbt_project_marker(project_dir);
     let stub_dir = tempfile::tempdir().expect("should create temp dir");
     stub_dbt_command(
         stub_dir.path(),
@@ -254,6 +283,7 @@ fn with_no_purge_flag_or_config_old_logs_are_kept() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -288,6 +318,7 @@ fn purge_logs_flag_removes_logs_older_than_the_given_window() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
