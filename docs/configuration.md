@@ -21,6 +21,9 @@ not shown in Downstream impact unless something else made the model impactful):
 | `column-type-narrowed` | `warn` | A column's documented type narrowed (e.g. `bigint` → `int`) — silent truncation risk. |
 | `join-cardinality-loosened` | `warn` | A join's cardinality loosened (`INNER` → `LEFT`/`FULL`) — potential row-count/duplication regression. |
 | `column-added` | `pass` | A column was added. Informational by default — nothing downstream could already depend on a column that didn't exist. |
+| `struct-field-removed` | `error` | A field was removed from a `STRUCT`-typed column's internal shape, where that shape was statically knowable (an explicit `CAST(... AS STRUCT<...>)` or `STRUCT(...)`/`named_struct(...)` constructor in the compiled SQL) in both the Baseline and current state. |
+| `struct-field-added` | `pass` | A field was added to a `STRUCT`-typed column's internal shape, under the same "shape known on both sides" condition as `struct-field-removed`. |
+| `struct-field-type-narrowed` | `warn` | A field within a `STRUCT`-typed column's internal shape narrowed its documented type — the same integer-width narrowing `column-type-narrowed` detects, one level deeper. |
 
 ## Presets
 

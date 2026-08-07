@@ -92,7 +92,10 @@ fn detects_the_full_set_of_deliberate_changes_between_two_real_manifests() {
             Change::ColumnAdded { node, .. }
             | Change::ColumnRemoved { node, .. }
             | Change::ColumnTypeChanged { node, .. }
-            | Change::JoinChanged { node, .. } => node,
+            | Change::JoinChanged { node, .. }
+            | Change::StructFieldAdded { node, .. }
+            | Change::StructFieldRemoved { node, .. }
+            | Change::StructFieldTypeChanged { node, .. } => node,
         };
         assert!(
             *node == stg_customers || *node == dim_customers,

@@ -408,6 +408,26 @@ pub enum ChangeJson {
         from_kind: Option<String>,
         to_kind: Option<String>,
     },
+    /// See [`Change::StructFieldAdded`].
+    StructFieldAdded {
+        node: String,
+        column: String,
+        field: String,
+    },
+    /// See [`Change::StructFieldRemoved`].
+    StructFieldRemoved {
+        node: String,
+        column: String,
+        field: String,
+    },
+    /// See [`Change::StructFieldTypeChanged`].
+    StructFieldTypeChanged {
+        node: String,
+        column: String,
+        field: String,
+        from_type: String,
+        to_type: String,
+    },
 }
 
 impl ChangeJson {
@@ -417,7 +437,10 @@ impl ChangeJson {
             ChangeJson::ColumnAdded { node, .. }
             | ChangeJson::ColumnRemoved { node, .. }
             | ChangeJson::ColumnTypeChanged { node, .. }
-            | ChangeJson::JoinChanged { node, .. } => node,
+            | ChangeJson::JoinChanged { node, .. }
+            | ChangeJson::StructFieldAdded { node, .. }
+            | ChangeJson::StructFieldRemoved { node, .. }
+            | ChangeJson::StructFieldTypeChanged { node, .. } => node,
         }
     }
 
@@ -443,6 +466,21 @@ impl ChangeJson {
                 from_kind.as_deref().unwrap_or("none"),
                 to_kind.as_deref().unwrap_or("none")
             ),
+            ChangeJson::StructFieldAdded { column, field, .. } => {
+                format!("+ struct field added: {column}.{field}")
+            }
+            ChangeJson::StructFieldRemoved { column, field, .. } => {
+                format!("- struct field removed: {column}.{field}")
+            }
+            ChangeJson::StructFieldTypeChanged {
+                column,
+                field,
+                from_type,
+                to_type,
+                ..
+            } => {
+                format!("~ struct field type changed: {column}.{field} ({from_type} -> {to_type})")
+            }
         }
     }
 
@@ -486,6 +524,37 @@ impl From<&Change> for ChangeJson {
                 position: *position,
                 from_kind: from_kind.map(join_kind_slug),
                 to_kind: to_kind.map(join_kind_slug),
+            },
+            Change::StructFieldAdded {
+                node,
+                column,
+                field,
+            } => ChangeJson::StructFieldAdded {
+                node: node.to_string(),
+                column: column.to_string(),
+                field: field.to_string(),
+            },
+            Change::StructFieldRemoved {
+                node,
+                column,
+                field,
+            } => ChangeJson::StructFieldRemoved {
+                node: node.to_string(),
+                column: column.to_string(),
+                field: field.to_string(),
+            },
+            Change::StructFieldTypeChanged {
+                node,
+                column,
+                field,
+                from_type,
+                to_type,
+            } => ChangeJson::StructFieldTypeChanged {
+                node: node.to_string(),
+                column: column.to_string(),
+                field: field.to_string(),
+                from_type: from_type.clone(),
+                to_type: to_type.clone(),
             },
         }
     }
@@ -553,6 +622,29 @@ pub enum FindingJson {
         node: String,
         column: String,
     },
+    /// See [`FindingDetail::StructFieldRemoved`].
+    StructFieldRemoved {
+        severity: SeverityJson,
+        node: String,
+        column: String,
+        field: String,
+    },
+    /// See [`FindingDetail::StructFieldAdded`].
+    StructFieldAdded {
+        severity: SeverityJson,
+        node: String,
+        column: String,
+        field: String,
+    },
+    /// See [`FindingDetail::StructFieldTypeNarrowed`].
+    StructFieldTypeNarrowed {
+        severity: SeverityJson,
+        node: String,
+        column: String,
+        field: String,
+        from_type: String,
+        to_type: String,
+    },
 }
 
 impl FindingJson {
@@ -561,7 +653,10 @@ impl FindingJson {
             FindingJson::ColumnRemovedWithActiveReferences { severity, .. }
             | FindingJson::ColumnTypeNarrowed { severity, .. }
             | FindingJson::JoinCardinalityLoosened { severity, .. }
-            | FindingJson::ColumnAdded { severity, .. } => *severity,
+            | FindingJson::ColumnAdded { severity, .. }
+            | FindingJson::StructFieldRemoved { severity, .. }
+            | FindingJson::StructFieldAdded { severity, .. }
+            | FindingJson::StructFieldTypeNarrowed { severity, .. } => *severity,
         }
     }
 
@@ -579,6 +674,9 @@ impl FindingJson {
             FindingJson::ColumnTypeNarrowed { .. } => "column-type-narrowed",
             FindingJson::JoinCardinalityLoosened { .. } => "join-cardinality-loosened",
             FindingJson::ColumnAdded { .. } => "column-added",
+            FindingJson::StructFieldRemoved { .. } => "struct-field-removed",
+            FindingJson::StructFieldAdded { .. } => "struct-field-added",
+            FindingJson::StructFieldTypeNarrowed { .. } => "struct-field-type-narrowed",
         }
     }
 
@@ -593,7 +691,10 @@ impl FindingJson {
             FindingJson::ColumnRemovedWithActiveReferences { reached, .. } => reached,
             FindingJson::ColumnTypeNarrowed { node, .. }
             | FindingJson::JoinCardinalityLoosened { node, .. }
-            | FindingJson::ColumnAdded { node, .. } => node,
+            | FindingJson::ColumnAdded { node, .. }
+            | FindingJson::StructFieldRemoved { node, .. }
+            | FindingJson::StructFieldAdded { node, .. }
+            | FindingJson::StructFieldTypeNarrowed { node, .. } => node,
         }
     }
 }
@@ -642,6 +743,40 @@ impl From<&Finding> for FindingJson {
                 severity,
                 node: node.to_string(),
                 column: column.to_string(),
+            },
+            FindingDetail::StructFieldRemoved {
+                node,
+                column,
+                field,
+            } => FindingJson::StructFieldRemoved {
+                severity,
+                node: node.to_string(),
+                column: column.to_string(),
+                field: field.to_string(),
+            },
+            FindingDetail::StructFieldAdded {
+                node,
+                column,
+                field,
+            } => FindingJson::StructFieldAdded {
+                severity,
+                node: node.to_string(),
+                column: column.to_string(),
+                field: field.to_string(),
+            },
+            FindingDetail::StructFieldTypeNarrowed {
+                node,
+                column,
+                field,
+                from_type,
+                to_type,
+            } => FindingJson::StructFieldTypeNarrowed {
+                severity,
+                node: node.to_string(),
+                column: column.to_string(),
+                field: field.to_string(),
+                from_type: from_type.clone(),
+                to_type: to_type.clone(),
             },
         }
     }
@@ -881,6 +1016,21 @@ fn describe_impact(finding: &FindingJson, node_term: &str) -> String {
         FindingJson::ColumnAdded { column, .. } => {
             format!("{column} added")
         }
+        FindingJson::StructFieldRemoved { column, field, .. } => {
+            format!("{field} removed from struct column {column}")
+        }
+        FindingJson::StructFieldAdded { column, field, .. } => {
+            format!("{field} added to struct column {column}")
+        }
+        FindingJson::StructFieldTypeNarrowed {
+            column,
+            field,
+            from_type,
+            to_type,
+            ..
+        } => {
+            format!("{column}.{field} type narrowed from {from_type} to {to_type}")
+        }
     }
 }
 
@@ -923,8 +1073,34 @@ mod tests {
             Finding {
                 severity: Severity::Pass,
                 detail: FindingDetail::ColumnAdded {
-                    node,
+                    node: node.clone(),
                     column: zhao_core::model::ColumnName::new("new_col"),
+                },
+            },
+            Finding {
+                severity: Severity::Error,
+                detail: FindingDetail::StructFieldRemoved {
+                    node: node.clone(),
+                    column: zhao_core::model::ColumnName::new("payload"),
+                    field: zhao_core::model::ColumnName::new("legacy_flag"),
+                },
+            },
+            Finding {
+                severity: Severity::Pass,
+                detail: FindingDetail::StructFieldAdded {
+                    node: node.clone(),
+                    column: zhao_core::model::ColumnName::new("payload"),
+                    field: zhao_core::model::ColumnName::new("email"),
+                },
+            },
+            Finding {
+                severity: Severity::Warn,
+                detail: FindingDetail::StructFieldTypeNarrowed {
+                    node,
+                    column: zhao_core::model::ColumnName::new("payload"),
+                    field: zhao_core::model::ColumnName::new("amount"),
+                    from_type: "bigint".to_string(),
+                    to_type: "int".to_string(),
                 },
             },
         ]
@@ -1833,5 +2009,175 @@ mod tests {
         let text = render_text(&report, &DbtVocabulary, false);
 
         assert!(!text.contains("Schema evolution:"), "{text}");
+    }
+
+    // -----------------------------------------------------------------
+    // Struct-internal field evolution (issue #53) -- full Change/Finding
+    // pipeline through Report/render_text, not a separate mechanism.
+    // -----------------------------------------------------------------
+
+    /// A struct field removal surfaces in both the "Changed" and
+    /// "Downstream impact" sections of the plain-text report, labeled
+    /// `BREAKING` with its Rule name -- the same shape
+    /// `column-removed-with-active-references` gets, just for a nested
+    /// field instead of a top-level column.
+    #[test]
+    fn render_text_reports_a_struct_field_removal_as_breaking() {
+        let changes = vec![Change::StructFieldRemoved {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("payload"),
+            field: zhao_core::model::ColumnName::new("legacy_flag"),
+        }];
+        let findings = vec![Finding {
+            severity: Severity::Error,
+            detail: FindingDetail::StructFieldRemoved {
+                node: NodeId::new("model.a"),
+                column: zhao_core::model::ColumnName::new("payload"),
+                field: zhao_core::model::ColumnName::new("legacy_flag"),
+            },
+        }];
+        let report = Report::new(&changes, &findings);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(
+            text.contains("- struct field removed: payload.legacy_flag"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Downstream impact:\n  model model.a:\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[BREAKING]") && text.contains("struct-field-removed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("legacy_flag removed from struct column payload"),
+            "{text}"
+        );
+        assert!(text.contains("1 breaking, 0 warning"), "{text}");
+    }
+
+    /// A struct field addition is `pass`-severity and never appears in
+    /// "Downstream impact" -- the same treatment `column-added` gets.
+    #[test]
+    fn render_text_reports_a_struct_field_addition_as_informational_only() {
+        let changes = vec![Change::StructFieldAdded {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("payload"),
+            field: zhao_core::model::ColumnName::new("email"),
+        }];
+        let findings = vec![Finding {
+            severity: Severity::Pass,
+            detail: FindingDetail::StructFieldAdded {
+                node: NodeId::new("model.a"),
+                column: zhao_core::model::ColumnName::new("payload"),
+                field: zhao_core::model::ColumnName::new("email"),
+            },
+        }];
+        let report = Report::new(&changes, &findings);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(
+            text.contains("+ struct field added: payload.email"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Downstream impact:"),
+            "a pass-severity struct field addition must not produce Downstream impact: {text}"
+        );
+        assert!(text.contains("0 breaking, 0 warning"), "{text}");
+    }
+
+    /// A struct field type narrowing is `warn`-severity, matching
+    /// `column-type-narrowed`'s own treatment.
+    #[test]
+    fn render_text_reports_a_struct_field_type_narrowing_as_a_warning() {
+        let changes = vec![Change::StructFieldTypeChanged {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("payload"),
+            field: zhao_core::model::ColumnName::new("amount"),
+            from_type: "bigint".to_string(),
+            to_type: "int".to_string(),
+        }];
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::StructFieldTypeNarrowed {
+                node: NodeId::new("model.a"),
+                column: zhao_core::model::ColumnName::new("payload"),
+                field: zhao_core::model::ColumnName::new("amount"),
+                from_type: "bigint".to_string(),
+                to_type: "int".to_string(),
+            },
+        }];
+        let report = Report::new(&changes, &findings);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(
+            text.contains("~ struct field type changed: payload.amount (bigint -> int)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[WARN]") && text.contains("struct-field-type-narrowed"),
+            "{text}"
+        );
+        assert!(text.contains("0 breaking, 1 warning"), "{text}");
+    }
+
+    /// The `--format json` payload carries the same struct-evolution
+    /// Change/Finding through `serde_json`, tagged the same way every
+    /// other Change/Finding variant already is -- not a separate,
+    /// parallel JSON shape.
+    #[test]
+    fn json_report_serializes_struct_field_changes_and_findings() {
+        let changes = vec![Change::StructFieldRemoved {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("payload"),
+            field: zhao_core::model::ColumnName::new("legacy_flag"),
+        }];
+        let findings = vec![Finding {
+            severity: Severity::Error,
+            detail: FindingDetail::StructFieldRemoved {
+                node: NodeId::new("model.a"),
+                column: zhao_core::model::ColumnName::new("payload"),
+                field: zhao_core::model::ColumnName::new("legacy_flag"),
+            },
+        }];
+        let report = Report::new(&changes, &findings);
+
+        let json: serde_json::Value =
+            serde_json::to_value(&report).expect("report should serialize");
+
+        assert_eq!(json["changes"][0]["type"], "struct_field_removed");
+        assert_eq!(json["changes"][0]["column"], "payload");
+        assert_eq!(json["changes"][0]["field"], "legacy_flag");
+        assert_eq!(json["findings"][0]["rule"], "struct-field-removed");
+        assert_eq!(json["findings"][0]["severity"], "error");
+        assert_eq!(json["findings"][0]["field"], "legacy_flag");
+    }
+
+    /// A struct-evolution Change on an `incremental` Node produces a
+    /// schema-evolution warning too, the same as any other schema
+    /// Change -- `Change::is_column_change` covers every non-`JoinChanged`
+    /// variant by construction, so this needs no dedicated wiring, but is
+    /// still worth pinning down as a regression guard.
+    #[test]
+    fn schema_evolution_warning_fires_for_a_struct_field_change_on_an_incremental_node() {
+        let current = project_with_nodes(vec![node_with_materialization(
+            "model.a",
+            Materialization::Incremental,
+        )]);
+        let changes = vec![Change::StructFieldRemoved {
+            node: NodeId::new("model.a"),
+            column: zhao_core::model::ColumnName::new("payload"),
+            field: zhao_core::model::ColumnName::new("legacy_flag"),
+        }];
+        let report = Report::new(&changes, &[]).with_schema_evolution_warnings(&current);
+
+        assert_eq!(report.schema_evolution_warnings.len(), 1);
+        assert_eq!(report.schema_evolution_warnings[0].node, "model.a");
     }
 }
