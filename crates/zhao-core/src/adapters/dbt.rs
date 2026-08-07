@@ -333,6 +333,30 @@ fn read_manifest(path: &Path) -> Result<RawManifest, DbtAdapterError> {
     })
 }
 
+/// Splits `dbt_command` into a program plus any leading prefix arguments,
+/// shell-word-style -- so a value like `"uv run dbt"`, or a custom wrapper
+/// a project's own tooling already uses instead of invoking `dbt`
+/// directly (e.g. `"dw some-flag"`), works as a genuine multi-word
+/// prefix rather than being mistaken for one literal executable named
+/// `"uv run dbt"`. Shared by [`run_dbt_subcommand`] and
+/// [`DbtQueryExecutor::run_operation`], the two places that actually spawn
+/// a `dbt`-shaped subprocess.
+fn split_dbt_command(dbt_command: &str) -> Result<(String, Vec<String>), DbtAdapterError> {
+    let mut parts =
+        shell_words::split(dbt_command).map_err(|source| DbtAdapterError::CommandNotFound {
+            command: dbt_command.to_string(),
+            source: std::io::Error::other(source.to_string()),
+        })?;
+    if parts.is_empty() {
+        return Err(DbtAdapterError::CommandNotFound {
+            command: dbt_command.to_string(),
+            source: std::io::Error::other("dbt-command resolved to an empty command"),
+        });
+    }
+    let program = parts.remove(0);
+    Ok((program, parts))
+}
+
 /// Runs `dbt_command <subcommand> <extra_args...>` in `project_dir`,
 /// shared by [`DbtAdapter::compile`] and [`DbtAdapter::deps`].
 fn run_dbt_subcommand(
@@ -341,7 +365,9 @@ fn run_dbt_subcommand(
     project_dir: &Path,
     extra_args: &[String],
 ) -> Result<std::process::Output, DbtAdapterError> {
-    std::process::Command::new(dbt_command)
+    let (program, prefix_args) = split_dbt_command(dbt_command)?;
+    std::process::Command::new(&program)
+        .args(&prefix_args)
         .arg(subcommand)
         .args(extra_args)
         .current_dir(project_dir)
@@ -1538,7 +1564,10 @@ impl DbtQueryExecutor<'_> {
         let args_json = serde_json::to_string(args)
             .map_err(|err| format!("could not encode macro args as JSON: {err}"))?;
 
-        let output = std::process::Command::new(self.dbt_command)
+        let (program, prefix_args) =
+            split_dbt_command(self.dbt_command).map_err(|err| err.to_string())?;
+        let output = std::process::Command::new(&program)
+            .args(&prefix_args)
             .arg("run-operation")
             .arg(RELATION_EXISTS_MACRO)
             .arg("--args")
@@ -2431,6 +2460,28 @@ mod tests {
         let recorded_args =
             fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
         assert_eq!(recorded_args.trim(), "deps");
+    }
+
+    /// A multi-word `dbt_command` (e.g. `"uv run dbt"`, or a custom
+    /// wrapper a project's own tooling already uses instead of invoking
+    /// `dbt` directly) works as a genuine prefix -- the wrapper's own
+    /// leading flags land before the subcommand, not swallowed into one
+    /// literal (nonexistent) executable name.
+    #[cfg(unix)]
+    #[test]
+    fn a_multi_word_dbt_command_is_shell_split_into_a_program_plus_prefix_args() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_dbt_command(stub_dir.path(), "echo \"$@\" > args.txt");
+        let dbt_command = format!("{} --wrapper-flag", dbt.to_str().expect("utf8 path"));
+
+        DbtAdapter
+            .deps(project_dir.path(), &dbt_command, &[])
+            .expect("deps should succeed");
+
+        let recorded_args =
+            fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
+        assert_eq!(recorded_args.trim(), "--wrapper-flag deps");
     }
 
     /// Same as `compile`'s equivalent (see issue #36): a successful

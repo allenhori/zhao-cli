@@ -42,8 +42,10 @@ pub enum BaselineError {
 /// project directory has a `packages.yml` or `dependencies.yml`, since
 /// `dbt compile` fails on any `ref()`/macro from an as-yet-uninstalled
 /// package -- exactly the state a freshly checked-out worktree is in the
-/// first time. `extra_args` (from `--dbt-arg`/`--dbt-args`) are appended
-/// verbatim to both the `dbt deps` and `dbt compile` invocations.
+/// first time. `dbt_command` (from `--dbt-command`/`zhao.yml`'s
+/// `dbt-command`, defaulting to `"dbt"`) is the executable/prefix both
+/// invocations use; `extra_args` (from `--dbt-arg`/`--dbt-args`) are
+/// appended verbatim to both the `dbt deps` and `dbt compile` invocations.
 ///
 /// Before the temporary worktree is torn down (it's removed the moment
 /// this function returns -- see [`git::Worktree`]'s own `Drop`), its
@@ -61,6 +63,7 @@ pub fn resolve(
     state_path: Option<&Path>,
     project_dir: &Path,
     against: &str,
+    dbt_command: &str,
     extra_args: &[String],
 ) -> Result<ParsedProject, BaselineError> {
     if let Some(path) = state_path {
@@ -92,14 +95,14 @@ pub fn resolve(
             "deps",
             &worktree_project_dir,
             project_dir,
-            DbtAdapter.deps(&worktree_project_dir, "dbt", extra_args),
+            DbtAdapter.deps(&worktree_project_dir, dbt_command, extra_args),
         )?;
     }
     crate::log::log_dbt_result(
         "compile",
         &worktree_project_dir,
         project_dir,
-        DbtAdapter.compile(&worktree_project_dir, "dbt", extra_args),
+        DbtAdapter.compile(&worktree_project_dir, dbt_command, extra_args),
     )?;
 
     let manifest_path = worktree_project_dir.join("target").join("manifest.json");

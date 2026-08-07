@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use zhao_core::adapters::TransformationToolAdapter;
 use zhao_core::adapters::dbt::DbtAdapter;
+use zhao_core::config::Config;
 use zhao_core::lineage::{ColumnLineageResult, Direction, LineageResult, trace, trace_column};
 
 use crate::cli::LineageArgs;
@@ -27,6 +28,15 @@ const EXIT_ERROR: u8 = 2;
 /// Runs `zhao lineage` and returns the process exit code.
 pub fn run(args: &LineageArgs) -> ExitCode {
     if args.compile {
+        // Same `dbt-command` config zhao's other subcommands honor (see
+        // `zhao_core::config::Config::dbt_command`) -- a project already
+        // using its own wrapper instead of invoking `dbt` directly
+        // shouldn't need `zhao lineage --compile` to be the one place
+        // that still hardcodes `"dbt"`.
+        let dbt_command = match Config::load_for_project(&args.project_dir) {
+            Ok(config) => config.dbt_command().unwrap_or("dbt").to_string(),
+            Err(err) => return fail(&err.to_string()),
+        };
         // `dbt_project_dir` and `real_project_dir` are the same path
         // here -- unlike `baseline::resolve`'s git-native Baseline
         // compile (which runs in a throwaway worktree), `--compile`
@@ -35,7 +45,7 @@ pub fn run(args: &LineageArgs) -> ExitCode {
             "compile",
             &args.project_dir,
             &args.project_dir,
-            DbtAdapter.compile(&args.project_dir, "dbt", &[]),
+            DbtAdapter.compile(&args.project_dir, &dbt_command, &[]),
         ) {
             return fail(&err.to_string());
         }

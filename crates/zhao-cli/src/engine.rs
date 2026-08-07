@@ -46,8 +46,21 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         check_current_manifest_freshness(&args.project_dir, &current_manifest)?;
     }
 
-    let dbt_passthrough_args = args.dbt_passthrough_args()?;
     let config = Config::load_for_project(&args.project_dir).map_err(|err| err.to_string())?;
+    // CLI `--dbt-arg`/`--dbt-args` wins outright when either is given
+    // (clap's `conflicts_with` already guarantees at most one CLI form);
+    // otherwise falls back to `zhao.yml`'s `dbt-args`, shell-word-split
+    // the same way the CLI's own `--dbt-args` string form is.
+    let dbt_passthrough_args = args.dbt_passthrough_args()?;
+    let dbt_passthrough_args = if dbt_passthrough_args.is_empty() {
+        match config.dbt_args() {
+            Some(raw) => shell_words::split(raw)
+                .map_err(|err| format!("zhao.yml dbt-args {raw:?}: {err}"))?,
+            None => Vec::new(),
+        }
+    } else {
+        dbt_passthrough_args
+    };
     // `--against` wins when explicitly passed; otherwise `zhao.yml`'s
     // `against`; otherwise zhao's own default. Resolved once, up front,
     // so both Baseline resolution and the staleness check (which must
@@ -57,10 +70,19 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         .clone()
         .or_else(|| config.against().map(str::to_string))
         .unwrap_or_else(|| "master".to_string());
+    // `--dbt-command` wins when explicitly passed; otherwise `zhao.yml`'s
+    // `dbt-command`; otherwise `"dbt"`, resolved via `PATH` -- the same
+    // precedence `against` already uses just above.
+    let dbt_command = args
+        .dbt_command
+        .clone()
+        .or_else(|| config.dbt_command().map(str::to_string))
+        .unwrap_or_else(|| "dbt".to_string());
     let baseline = crate::baseline::resolve(
         args.state.as_deref(),
         &args.project_dir,
         &against,
+        &dbt_command,
         &dbt_passthrough_args,
     )
     .map_err(|err| err.to_string())?;
@@ -86,7 +108,13 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         .with_schema_evolution_warnings(&current);
 
     if args.check_relations {
-        report = apply_check_relations(report, args, &current_manifest, &dbt_passthrough_args);
+        report = apply_check_relations(
+            report,
+            args,
+            &current_manifest,
+            &dbt_command,
+            &dbt_passthrough_args,
+        );
     }
 
     // `--purge-logs` wins when explicitly passed; otherwise `zhao.yml`'s
@@ -119,6 +147,7 @@ fn apply_check_relations(
     report: Report,
     args: &CheckArgs,
     current_manifest: &Path,
+    dbt_command: &str,
     dbt_passthrough_args: &[String],
 ) -> Report {
     let adapter_type = match DbtAdapter.adapter_type(current_manifest) {
@@ -155,7 +184,7 @@ fn apply_check_relations(
 
     let executor = DbtQueryExecutor {
         project_dir: &args.project_dir,
-        dbt_command: "dbt",
+        dbt_command,
         extra_args: dbt_passthrough_args,
     };
 
