@@ -154,8 +154,9 @@ without ever printing dbt's raw output to the terminal directly (which would oth
 ## `zhao update`
 
 Replaces the currently running `zhao` binary in place with a release fetched from
-[GitHub Releases](https://github.com/allenhori/zhao-cli/releases) — the one zhao command that
-makes a network call at all (see [What it doesn't do](../README.md#what-it-doesnt-do)).
+[GitHub Releases](https://github.com/allenhori/zhao-cli/releases) — the only zhao command that
+reaches the network at all, and only to download the binary itself; it never sends anything
+from your project (see [What it doesn't do](../README.md#what-it-doesnt-do)).
 
 ```bash
 zhao update              # the latest stable release

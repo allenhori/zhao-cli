@@ -69,7 +69,7 @@ fired. Full walkthrough: **[Getting started](docs/getting-started.md)**.
 | `zhao check` | The CI gate — diffs against a Baseline, fails on a breaking change. |
 | `zhao diff` | Same engine, always exits `0` — for local inspection during development. |
 | `zhao lineage` | What's upstream/downstream of a model or column, right now (no diff, no git). |
-| `zhao update` | Replaces the current binary with a release from GitHub Releases. The one command that makes a network call — see [What it doesn't do](#what-it-doesnt-do). |
+| `zhao update` | Replaces the current binary with a release from GitHub Releases. The only command that reaches the network at all — and only to download the binary itself, never to send anything from your project. See [What it doesn't do](#what-it-doesnt-do). |
 
 Full flag reference: **[docs/commands.md](docs/commands.md)**.
 
@@ -124,12 +124,26 @@ Full example and notes: **[docs/ci-integration.md](docs/ci-integration.md)**.
 
 ## What it doesn't do
 
-`zhao check`/`zhao diff`/`zhao lineage` never make a network call, never create a
-schema/table/artifact inside your warehouse, and never ask for a warehouse connection beyond
-what `dbt run` already needs (only for the fully optional `--check-relations` flag). They
-detect that a schema change needs manual evolution or a backfill; they never generate or apply
-that DDL for you. `zhao update` is the one deliberate exception — it fetches a release from
-GitHub Releases, and only runs when you explicitly invoke it.
+zhao never connects to, stores, or holds credentials for your warehouse or database. `zhao
+check`/`zhao diff`/`zhao lineage` read only the compiled `manifest.json` dbt itself already
+produced, entirely on your own machine or CI runner — no secret or token ever passes through
+zhao to get there. The one place a live connection is genuinely useful (`--check-relations`,
+fully optional) still doesn't change that: zhao never opens the connection itself, it hands
+the check to `dbt run-operation` and borrows whatever connection your own dbt profile already
+has.
+
+zhao never reads, collects, or stores your actual data — no row values, nothing about what's
+*in* your tables. It only derives structural metadata (schema, lineage, what changed), and
+that metadata stays on your own filesystem, under `target/zhao/`, unless you decide otherwise.
+Nothing is ever sent anywhere automatically: `zhao-cli` makes no network call of its own
+except `zhao update`, which only downloads a release binary — it doesn't send anything from
+your project. If you separately choose to use zhao-cloud, metadata only ever leaves your
+machine when you explicitly trigger that upload yourself — a command you run manually, or one
+you wrote into your own CI pipeline — never silently, and never as a side effect of
+`check`/`diff`/`lineage`.
+
+zhao also never generates or applies schema-evolution DDL for you: it detects that a change
+needs manual evolution or a backfill; the decision and the mechanism stay entirely yours.
 
 ## Status
 

@@ -10,9 +10,11 @@ it and running it against a real dbt project for the first time.
 - `dbt` itself installed and runnable, **only if** you want zhao to resolve a Baseline for
   you automatically (see [Baselines](#baselines) below). If you already have a compiled
   manifest from another point in history, you don't need `dbt` on your `PATH` at all.
-- Nothing else. zhao makes no network calls, needs no account, and never touches your
-  warehouse — the same connection `dbt run` already uses is the only one it will ever ask
-  for (and only for the fully optional `--check-relations` flag).
+- Nothing else. zhao never connects to your warehouse or holds credentials for it directly —
+  the fully optional `--check-relations` flag borrows your own dbt profile's already-configured
+  connection via `dbt run-operation`, so no secret ever passes through zhao itself. zhao makes
+  no network call of its own (`zhao update` is the one exception, and it only downloads a
+  release binary), needs no account, and never uploads anything on your behalf.
 
 ## Install
 

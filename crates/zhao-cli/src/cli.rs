@@ -29,8 +29,10 @@ pub enum Command {
     /// Baseline-vs-current diff. No `--state`, no git, no `dbt compile`.
     Lineage(LineageArgs),
     /// Replaces the current `zhao` binary with a release fetched from
-    /// GitHub Releases -- the one command that makes a network call
-    /// (see issue #28; every other command stays fully offline).
+    /// GitHub Releases -- the only command that reaches the network at
+    /// all, and only to download the binary itself; it never sends
+    /// anything from your project (see issue #28; every other command
+    /// stays fully offline).
     Update(UpdateArgs),
 }
 
