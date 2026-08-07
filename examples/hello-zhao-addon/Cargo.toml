@@ -1,0 +1,26 @@
+# An empty [workspace] table marks this as its own standalone workspace
+# root -- otherwise Cargo treats any nested manifest under a parent
+# workspace's directory tree as belonging to that workspace, which is
+# exactly what "not a workspace member" (see README.md) needs to avoid.
+[workspace]
+
+[package]
+name = "hello-zhao-addon"
+description = "Minimal reference implementation of the zhao-cli Addon contract (see README.md) -- a teaching example, not a real Addon."
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Deliberately NOT a member of the workspace in ../../Cargo.toml -- see
+# README.md's "Why this isn't a workspace member" section. Building this
+# on its own therefore needs its own Cargo.lock, generated the first
+# time `cargo build` runs here.
+
+[[bin]]
+name = "zhao-hello"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
