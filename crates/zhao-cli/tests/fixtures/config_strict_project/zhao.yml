@@ -1,1 +1,2 @@
 preset: strict
+tool: dbt

@@ -8,11 +8,10 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use zhao_core::adapters::TransformationToolAdapter;
-use zhao_core::adapters::dbt::DbtAdapter;
 use zhao_core::config::Config;
 use zhao_core::lineage::{ColumnLineageResult, Direction, LineageResult, trace, trace_column};
 
+use crate::adapter::ResolvedAdapter;
 use crate::cli::LineageArgs;
 
 /// Exit code for "ran successfully" -- `zhao lineage` is a query tool,
@@ -27,16 +26,28 @@ const EXIT_ERROR: u8 = 2;
 
 /// Runs `zhao lineage` and returns the process exit code.
 pub fn run(args: &LineageArgs) -> ExitCode {
+    // Loaded once, up front, regardless of `--compile`: both the
+    // `dbt-command` passthrough below and adapter auto-detection's
+    // `tool:` fallback come from the same `zhao.yml`.
+    let config = match Config::load_for_project(&args.project_dir) {
+        Ok(config) => config,
+        Err(err) => return fail(&err.to_string()),
+    };
+    // Auto-detected by project marker first, `zhao.yml`'s `tool:` key
+    // only consulted as a fallback -- see
+    // `crate::adapter::ResolvedAdapter::resolve`.
+    let adapter = match ResolvedAdapter::resolve(&args.project_dir, config.tool()) {
+        Ok(adapter) => adapter,
+        Err(err) => return fail(&err.to_string()),
+    };
+
     if args.compile {
         // Same `dbt-command` config zhao's other subcommands honor (see
         // `zhao_core::config::Config::dbt_command`) -- a project already
         // using its own wrapper instead of invoking `dbt` directly
         // shouldn't need `zhao lineage --compile` to be the one place
         // that still hardcodes `"dbt"`.
-        let dbt_command = match Config::load_for_project(&args.project_dir) {
-            Ok(config) => config.dbt_command().unwrap_or("dbt").to_string(),
-            Err(err) => return fail(&err.to_string()),
-        };
+        let dbt_command = config.dbt_command().unwrap_or("dbt").to_string();
         // `dbt_project_dir` and `real_project_dir` are the same path
         // here -- unlike `baseline::resolve`'s git-native Baseline
         // compile (which runs in a throwaway worktree), `--compile`
@@ -45,14 +56,14 @@ pub fn run(args: &LineageArgs) -> ExitCode {
             "compile",
             &args.project_dir,
             &args.project_dir,
-            DbtAdapter.compile(&args.project_dir, &dbt_command, &[]),
+            adapter.compile(&args.project_dir, &dbt_command, &[]),
         ) {
             return fail(&err.to_string());
         }
     }
 
     let manifest_path = args.project_dir.join("target").join("manifest.json");
-    let project = match DbtAdapter.parse(&manifest_path) {
+    let project = match adapter.parse(&manifest_path) {
         Ok(project) => project,
         Err(err) => return fail(&format!("{}: {err}", manifest_path.display())),
     };
@@ -63,14 +74,14 @@ pub fn run(args: &LineageArgs) -> ExitCode {
     // it behind a successful resolution). Same "unconditional
     // machine-readable output" precedent as `run-metadata.json`. See
     // issue #39.
-    if let Err(err) = write_full_lineage_json(&args.project_dir, &project) {
+    if let Err(err) = write_full_lineage_json(&args.project_dir, &project, &adapter) {
         return fail(&err);
     }
 
     let exit_code = if args.text {
-        run_text(args, &project)
+        run_text(args, &project, &adapter)
     } else {
-        run_html(args, &project)
+        run_html(args, &project, &adapter)
     };
 
     // `--purge-logs` wins when explicitly passed; otherwise `zhao.yml`'s
@@ -97,13 +108,14 @@ pub fn run(args: &LineageArgs) -> ExitCode {
 fn write_full_lineage_json(
     project_dir: &Path,
     project: &zhao_core::model::ParsedProject,
+    adapter: &ResolvedAdapter,
 ) -> Result<(), String> {
     let dir = project_dir.join("target").join("zhao");
     std::fs::create_dir_all(&dir)
         .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
 
     let path = dir.join("full_lineage.json");
-    let json = crate::lineage_html::graph_data_json(project, DbtAdapter.vocabulary());
+    let json = crate::lineage_html::graph_data_json(project, adapter.vocabulary());
     std::fs::write(&path, json).map_err(|err| format!("could not write {}: {err}", path.display()))
 }
 
@@ -150,7 +162,11 @@ fn default_html_path(
 /// export, at `--html`'s explicit path when given, else the computed
 /// default under `target/zhao/lineage_graphs/` (see
 /// [`default_html_path`]).
-fn run_html(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> ExitCode {
+fn run_html(
+    args: &LineageArgs,
+    project: &zhao_core::model::ParsedProject,
+    adapter: &ResolvedAdapter,
+) -> ExitCode {
     let parsed_target = args.parse_target();
 
     // `LineageError`'s own `Display` already gives a clear, actionable
@@ -195,7 +211,7 @@ fn run_html(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> Ex
 
     let html = crate::lineage_html::generate(
         project,
-        DbtAdapter.vocabulary(),
+        adapter.vocabulary(),
         initial_target,
         initial_column,
     );
@@ -218,7 +234,11 @@ fn run_html(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> Ex
 
 /// The `--text` path: prints the plain-text report, same as before HTML
 /// became the default.
-fn run_text(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> ExitCode {
+fn run_text(
+    args: &LineageArgs,
+    project: &zhao_core::model::ParsedProject,
+    adapter: &ResolvedAdapter,
+) -> ExitCode {
     let Some((target_name, target_column, direction)) = args.parse_target() else {
         return fail(
             "a target is required for --text output -- omit --text to generate a whole-project HTML graph instead",
@@ -233,11 +253,11 @@ fn run_text(args: &LineageArgs, project: &zhao_core::model::ParsedProject) -> Ex
     // re-derive it per variant here.
     let text = match target_column {
         Some(column) => match trace_column(project, target_name, package, column, direction) {
-            Ok(result) => render_column_text(&result, direction, DbtAdapter.vocabulary()),
+            Ok(result) => render_column_text(&result, direction, adapter.vocabulary()),
             Err(err) => return fail(&err.to_string()),
         },
         None => match trace(project, target_name, package, direction) {
-            Ok(result) => render_text(&result, target_name, direction, DbtAdapter.vocabulary()),
+            Ok(result) => render_text(&result, target_name, direction, adapter.vocabulary()),
             Err(err) => return fail(&err.to_string()),
         },
     };

@@ -20,7 +20,7 @@ pub fn run(args: &CheckArgs) -> ExitCode {
         Ok(output) => output,
         Err(message) => return fail(&message),
     };
-    if let Err(message) = print_report(&output.report, args) {
+    if let Err(message) = print_report(&output.report, &output.adapter, args) {
         return fail(&message);
     }
     write_run_metadata(&output, args);

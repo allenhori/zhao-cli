@@ -220,6 +220,7 @@ pub enum DbtAdapterError {
 
 impl TransformationToolAdapter for DbtAdapter {
     type Error = DbtAdapterError;
+    type CommandOutput = DbtCommandOutput;
 
     fn parse(&self, path: &Path) -> Result<ParsedProject, Self::Error> {
         Ok(build_parsed_project(&read_manifest(path)?))
@@ -228,32 +229,24 @@ impl TransformationToolAdapter for DbtAdapter {
     fn vocabulary(&self) -> &dyn AdapterVocabulary {
         &DbtVocabulary
     }
-}
 
-impl DbtAdapter {
     /// Runs `dbt compile` in `project_dir`, so its `target/manifest.json`
     /// reflects the project's current compiled state.
     ///
-    /// `dbt_command` is the executable to invoke -- ordinarily just
-    /// `"dbt"`, resolved via `PATH` -- exposed as a parameter (rather than
+    /// `command` is the executable to invoke -- ordinarily just `"dbt"`,
+    /// resolved via `PATH` -- exposed as a parameter (rather than
     /// hardcoded) so tests can point it at a stub script instead of
     /// depending on whether a real `dbt` happens to be installed wherever
     /// the tests run. `extra_args` are appended verbatim after `compile`
     /// (e.g. `--target`, `--vars`) -- zhao never interprets or validates
     /// these, dbt does.
-    ///
-    /// This is a plain method, not part of [`TransformationToolAdapter`]:
-    /// that trait's `parse` deliberately leaves "how the compiled output
-    /// got there" to the caller, and shelling out to `dbt compile` is
-    /// exactly the kind of dbt-specific concern this adapter's module (not
-    /// the trait) should own.
-    pub fn compile(
+    fn compile(
         &self,
         project_dir: &Path,
-        dbt_command: &str,
+        command: &str,
         extra_args: &[String],
     ) -> Result<DbtCommandOutput, DbtAdapterError> {
-        let output = run_dbt_subcommand(dbt_command, "compile", project_dir, extra_args)?;
+        let output = run_dbt_subcommand(command, "compile", project_dir, extra_args)?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
@@ -268,18 +261,18 @@ impl DbtAdapter {
 
     /// Runs `dbt deps` in `project_dir`, installing any package
     /// dependencies declared in `packages.yml` (or `dependencies.yml`)
-    /// before a subsequent [`DbtAdapter::compile`] -- needed the first
-    /// time a project is compiled somewhere its packages have never been
-    /// installed (e.g. a freshly checked-out git worktree), since `dbt
-    /// compile` fails if a `ref()`/macro from an unresolved package is
-    /// used. See [`DbtAdapter::compile`] for `dbt_command`/`extra_args`.
-    pub fn deps(
+    /// before a subsequent [`TransformationToolAdapter::compile`] -- needed
+    /// the first time a project is compiled somewhere its packages have
+    /// never been installed (e.g. a freshly checked-out git worktree),
+    /// since `dbt compile` fails if a `ref()`/macro from an unresolved
+    /// package is used. See [`Self::compile`] for `command`/`extra_args`.
+    fn deps(
         &self,
         project_dir: &Path,
-        dbt_command: &str,
+        command: &str,
         extra_args: &[String],
     ) -> Result<DbtCommandOutput, DbtAdapterError> {
-        let output = run_dbt_subcommand(dbt_command, "deps", project_dir, extra_args)?;
+        let output = run_dbt_subcommand(command, "deps", project_dir, extra_args)?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
@@ -292,6 +285,38 @@ impl DbtAdapter {
         Ok(DbtCommandOutput { stdout, stderr })
     }
 
+    /// Builds a [`DbtQueryExecutor`] bound to `project_dir`/`command`/
+    /// `extra_args`, for `--check-relations`'s live existence checks via
+    /// `dbt run-operation`.
+    fn query_executor<'a>(
+        &self,
+        project_dir: &'a Path,
+        command: &'a str,
+        extra_args: &'a [String],
+    ) -> Box<dyn QueryExecutor + 'a> {
+        Box::new(DbtQueryExecutor {
+            project_dir,
+            dbt_command: command,
+            extra_args,
+        })
+    }
+}
+
+impl super::AdapterDetector for DbtAdapter {
+    fn tool_name(&self) -> &'static str {
+        "dbt"
+    }
+
+    /// A dbt project always has a `dbt_project.yml` at its root -- the
+    /// real `dbt` CLI itself requires one to run at all, so this is the
+    /// same marker dbt's own bootstrapping already relies on, not a
+    /// zhao-invented convention.
+    fn detect(&self, project_dir: &Path) -> bool {
+        project_dir.join("dbt_project.yml").is_file()
+    }
+}
+
+impl DbtAdapter {
     /// Reads a compiled manifest's `metadata.adapter_type` -- dbt's own
     /// name for whichever warehouse it was compiled against (e.g.
     /// `"snowflake"`), the value

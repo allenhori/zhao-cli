@@ -110,6 +110,23 @@ itself:
 dbt-args: "--target ci"
 ```
 
+## `tool`
+
+Which Transformation Tool Adapter zhao should use to read your project. You almost never
+need this: zhao auto-detects it from your project directory (a `dbt_project.yml` marker means
+dbt, the only adapter zhao ships today) before ever consulting `zhao.yml` at all. `tool` is
+purely a fallback for the rare case auto-detection can't produce a single answer on its
+own — no marker matched, or (once a second adapter exists) more than one did:
+
+```yaml
+tool: dbt
+```
+
+It's deliberately **not** a general override — if auto-detection already found your project's
+adapter, `tool` is never even consulted, and it can't force zhao to use a different adapter
+than the one it actually detected. If neither auto-detection nor `tool` can resolve an
+adapter, `zhao` fails with a clear error naming what it checked.
+
 ## `log`
 
 Settings for the daily-rotating run log (`target/zhao/logs/<date>.log` -- see

@@ -8,13 +8,12 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
-use zhao_core::adapters::TransformationToolAdapter;
-use zhao_core::adapters::dbt::{DbtAdapter, DbtQueryExecutor};
 use zhao_core::adapters::warehouse;
 use zhao_core::config::Config;
 use zhao_core::diff::diff;
 use zhao_core::rules::evaluate;
 
+use crate::adapter::ResolvedAdapter;
 use crate::cli::{CheckArgs, OutputFormat};
 use crate::report::{DeferSettings, Report, render_text};
 
@@ -31,6 +30,11 @@ pub(crate) struct EngineOutput {
     /// else `zhao.yml`'s `log.retention_days`, else `None`) -- see
     /// [`purge_run_logs`] and issue #37.
     pub log_retention_days: Option<u32>,
+    /// The Transformation Tool Adapter resolved for this run -- carried
+    /// forward so [`print_report`] (called separately, after
+    /// [`build_report`] returns) can render with the right vocabulary
+    /// without re-resolving it.
+    pub adapter: ResolvedAdapter,
 }
 
 /// Runs the full engine pipeline -- Baseline resolution, diff, Rule
@@ -47,6 +51,11 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     }
 
     let config = Config::load_for_project(&args.project_dir).map_err(|err| err.to_string())?;
+    // Auto-detected by project marker first, `zhao.yml`'s `tool:` key
+    // only consulted as a fallback when detection alone can't produce a
+    // single answer -- see `crate::adapter::ResolvedAdapter::resolve`.
+    let adapter = ResolvedAdapter::resolve(&args.project_dir, config.tool())
+        .map_err(|err| err.to_string())?;
     // CLI `--dbt-arg`/`--dbt-args` wins outright when either is given
     // (clap's `conflicts_with` already guarantees at most one CLI form);
     // otherwise falls back to `zhao.yml`'s `dbt-args`, shell-word-split
@@ -79,6 +88,7 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         .or_else(|| config.dbt_command().map(str::to_string))
         .unwrap_or_else(|| "dbt".to_string());
     let baseline = crate::baseline::resolve(
+        &adapter,
         args.state.as_deref(),
         &args.project_dir,
         &against,
@@ -86,7 +96,7 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         &dbt_passthrough_args,
     )
     .map_err(|err| err.to_string())?;
-    let current = load_manifest(&current_manifest)?;
+    let current = load_manifest(&adapter, &current_manifest)?;
 
     let changes = diff(&baseline, &current);
     let findings = evaluate(&baseline, &changes, &config);
@@ -103,13 +113,14 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     };
     let mut report = Report::new(&changes, &findings)
         .with_staleness_warning(is_stale(&args.project_dir, &against))
-        .with_recommended_command(DbtAdapter.vocabulary())
-        .with_defer_plan(&current, DbtAdapter.vocabulary(), &defer_settings)
+        .with_recommended_command(adapter.vocabulary())
+        .with_defer_plan(&current, adapter.vocabulary(), &defer_settings)
         .with_schema_evolution_warnings(&current);
 
     if args.check_relations {
         report = apply_check_relations(
             report,
+            &adapter,
             args,
             &current_manifest,
             &dbt_command,
@@ -125,6 +136,7 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         report,
         current,
         log_retention_days,
+        adapter,
     })
 }
 
@@ -145,12 +157,13 @@ pub(crate) fn purge_run_logs(args: &CheckArgs, log_retention_days: Option<u32>) 
 /// itself failed" over a live-check problem.
 fn apply_check_relations(
     report: Report,
+    adapter: &ResolvedAdapter,
     args: &CheckArgs,
     current_manifest: &Path,
     dbt_command: &str,
     dbt_passthrough_args: &[String],
 ) -> Report {
-    let adapter_type = match DbtAdapter.adapter_type(current_manifest) {
+    let adapter_type = match adapter.adapter_type(current_manifest) {
         Ok(Some(adapter_type)) => adapter_type,
         Ok(None) => {
             eprintln!(
@@ -171,7 +184,7 @@ fn apply_check_relations(
         );
         return report;
     };
-    let relation_identities = match DbtAdapter.relation_identities(current_manifest) {
+    let relation_identities = match adapter.relation_identities(current_manifest) {
         Ok(identities) => identities,
         Err(err) => {
             eprintln!(
@@ -182,15 +195,11 @@ fn apply_check_relations(
         }
     };
 
-    let executor = DbtQueryExecutor {
-        project_dir: &args.project_dir,
-        dbt_command,
-        extra_args: dbt_passthrough_args,
-    };
+    let executor = adapter.query_executor(&args.project_dir, dbt_command, dbt_passthrough_args);
 
     report.with_live_relation_checks(|node_id| {
         let relation = relation_identities.get(node_id)?;
-        match warehouse_adapter.relation_exists(relation, &executor) {
+        match warehouse_adapter.relation_exists(relation, executor.as_ref()) {
             Ok(exists) => Some(exists),
             Err(err) => {
                 eprintln!("warning: --check-relations: could not check {node_id}: {err}");
@@ -221,7 +230,11 @@ pub(crate) fn write_run_metadata(output: &EngineOutput, args: &CheckArgs) {
 
 /// Prints `report` in `args.format` -- JSON or the color-aware text
 /// report, per `args.no_color` and environment auto-detection.
-pub(crate) fn print_report(report: &Report, args: &CheckArgs) -> Result<(), String> {
+pub(crate) fn print_report(
+    report: &Report,
+    adapter: &ResolvedAdapter,
+    args: &CheckArgs,
+) -> Result<(), String> {
     // Built up first, then both printed and mirrored to the daily run
     // log (issue #35) -- a literal mirror of what actually went to
     // stdout, so it matches `println!`'s trailing newline in the JSON
@@ -235,7 +248,7 @@ pub(crate) fn print_report(report: &Report, args: &CheckArgs) -> Result<(), Stri
             format!("{json}\n")
         }
         OutputFormat::Text => {
-            let text = render_text(report, DbtAdapter.vocabulary(), use_color(args.no_color));
+            let text = render_text(report, adapter.vocabulary(), use_color(args.no_color));
             print!("{text}");
             text
         }
@@ -307,8 +320,11 @@ fn use_color_decision(
     github_actions_env_set || stdout_is_tty
 }
 
-fn load_manifest(path: &Path) -> Result<zhao_core::model::ParsedProject, String> {
-    DbtAdapter
+fn load_manifest(
+    adapter: &ResolvedAdapter,
+    path: &Path,
+) -> Result<zhao_core::model::ParsedProject, String> {
+    adapter
         .parse(path)
         .map_err(|err| format!("{path}: {err}", path = path.display()))
 }

@@ -16,6 +16,27 @@ fn fixture(name: &str) -> std::path::PathBuf {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(name)
 }
 
+/// Writes the marker file adapter auto-detection looks for
+/// (`dbt_project.yml`) into `dir`, with its mtime pinned to the Unix
+/// epoch -- far older than any manifest a test copies in afterward, so
+/// it can never trip the unrelated current-manifest-freshness check.
+/// Pinning matters specifically because `std::fs::copy` (used below to
+/// bring in a real fixture manifest) can preserve the *source* file's
+/// original mtime on some platforms/filesystems (e.g. an APFS
+/// `clonefile` copy) rather than stamping "now" -- writing the marker
+/// first isn't reliably enough on its own to guarantee it looks older.
+fn write_dbt_project_marker(dir: &std::path::Path) {
+    let path = dir.join("dbt_project.yml");
+    std::fs::write(&path, "name: fixture\nversion: '1.0.0'\n")
+        .expect("should write dbt_project.yml marker");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("should reopen dbt_project.yml")
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)
+        .expect("should set an old mtime on dbt_project.yml");
+}
+
 /// Acceptance criterion: a bare target shows both upstream and downstream.
 #[test]
 fn bare_target_shows_both_upstream_and_downstream() {
@@ -252,6 +273,7 @@ fn an_empty_package_flag_produces_unknown_target_not_a_silent_fallback() {
 fn a_model_with_no_connections_produces_a_clear_nothing_found_result_not_an_error() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     std::fs::create_dir_all(dir.path().join("target")).expect("should create target dir");
+    write_dbt_project_marker(dir.path());
     std::fs::write(
         dir.path().join("target").join("manifest.json"),
         r#"{
@@ -596,6 +618,7 @@ fn default_mode_with_no_target_writes_full_lineage_html() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -633,6 +656,7 @@ fn default_mode_with_a_bare_target_uses_the_partial_lineage_filename() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -669,6 +693,7 @@ fn default_mode_with_a_plus_prefix_target_uses_the_upstream_only_filename() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -705,6 +730,7 @@ fn default_mode_with_a_plus_suffix_target_uses_the_downstream_only_filename() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -742,6 +768,7 @@ fn default_mode_with_a_column_target_uses_the_column_filename() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -779,6 +806,7 @@ fn default_mode_with_a_plus_prefix_column_target_uses_the_column_upstream_only_f
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("rules_project")
             .join("target")
@@ -815,6 +843,7 @@ fn default_mode_with_a_package_flag_prepends_the_package_to_the_filename() {
     let dir = tempfile::tempdir().expect("should create temp dir");
     let project_dir = dir.path();
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture("ambiguous_package_project")
             .join("target")
@@ -874,6 +903,7 @@ fn an_explicit_html_path_overrides_the_computed_default() {
 
 fn copy_manifest_into(project_dir: &std::path::Path, source_fixture: &str) {
     std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    write_dbt_project_marker(project_dir);
     std::fs::copy(
         fixture(source_fixture).join("target").join("manifest.json"),
         project_dir.join("target").join("manifest.json"),

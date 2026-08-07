@@ -5,6 +5,7 @@
 //! is delegated to `zhao-core`. See `ARCHITECTURE.md` at the repository
 //! root for the intended command surface as it's implemented.
 
+mod adapter;
 mod addon;
 mod baseline;
 mod check;
