@@ -11,3 +11,9 @@
 # can't just be a blanket */target/ ignore) -- every zhao check/zhao diff
 # run writes one, including test runs against fixture projects.
 **/target/zhao/
+
+# examples/hello-zhao-addon/ is its own separate Cargo workspace (see its
+# own README's "Why this isn't a workspace member") -- its build output
+# needs its own ignore entry since the /target rule above only anchors to
+# the repo root.
+examples/hello-zhao-addon/target

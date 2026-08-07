@@ -73,6 +73,19 @@ fired. Full walkthrough: **[Getting started](docs/getting-started.md)**.
 
 Full flag reference: **[docs/commands.md](docs/commands.md)**.
 
+## Addons
+
+`zhao <name>` falls through to a `zhao-<name>` binary on `PATH` when `<name>` isn't one of the
+built-ins above — the same convention `git` uses for `git <custom-command>`. `zhao-cli` has no
+compiled-in knowledge of any specific Addon; it only knows the naming convention and forwards
+arguments, exit code, and output verbatim.
+
+[`zhao-dbt-plan`](https://github.com/allenhori/zhao-dbt-plan) (a dbt microbatch cascading
+time-window planner, AGPLv3, separate repo) is the first real Addon. See
+[`examples/hello-zhao-addon/`](examples/hello-zhao-addon/) for a minimal reference
+implementation of the Addon contract if you want to build your own — its `README.md` is a
+walkthrough of the whole discovery/input/output contract.
+
 ## See it, don't just read about it
 
 `zhao lineage` exports an interactive, self-contained lineage graph by default — click a model
