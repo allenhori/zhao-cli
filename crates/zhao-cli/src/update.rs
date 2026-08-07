@@ -1,10 +1,12 @@
 //! `zhao update`: replaces the current binary with a release archive
-//! fetched from GitHub Releases (see issue #28) -- the one command that
-//! makes a network call at all. Every other zhao command stays fully
-//! offline, per the README's "What it doesn't do" section, which this
-//! command is the deliberate, explicit exception to: it only runs when
-//! a user or the Cloud Agent (per ADR 0009) explicitly invokes it,
-//! never as a side effect of `check`/`diff`/`lineage`.
+//! fetched from GitHub Releases (see issue #28) -- the only command that
+//! reaches the network at all, and only to download the release binary
+//! itself; it never sends anything from a user's project. Every other
+//! zhao command stays fully offline, per the README's "What it doesn't
+//! do" section, which this command is the deliberate, explicit exception
+//! to: it only runs when a user or the Cloud Agent (per ADR 0009)
+//! explicitly invokes it, never as a side effect of
+//! `check`/`diff`/`lineage`.
 //!
 //! Kept deliberately simple: updates by release tag, not a semver-range
 //! resolver. No arguments installs the latest stable release; `--nightly`
