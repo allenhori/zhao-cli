@@ -5,7 +5,7 @@ members = ["crates/zhao-core", "crates/zhao-cli"]
 # Shared package metadata. Individual crates opt in with `field.workspace = true`
 # so there's a single place to bump the version, change the license, etc.
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
