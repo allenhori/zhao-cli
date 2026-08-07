@@ -265,6 +265,17 @@ pub struct CheckArgs {
     /// purging happens at all -- the default is "keep everything."
     #[arg(long = "purge-logs")]
     pub purge_logs: Option<u32>,
+
+    /// Skips the check that the current project's compiled manifest
+    /// (`<project-dir>/target/manifest.json`) is newer than its own dbt
+    /// source files. Without this flag, zhao refuses to run against a
+    /// stale manifest -- e.g. one left over from a different branch after
+    /// a checkout, with `dbt compile` never rerun -- since diffing against
+    /// it would silently produce an incorrect report. Not recommended;
+    /// exists for cases like a manually supplied test fixture with no
+    /// real dbt project alongside it.
+    #[arg(long = "allow-stale-manifest")]
+    pub allow_stale_manifest: bool,
 }
 
 impl CheckArgs {

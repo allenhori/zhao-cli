@@ -39,6 +39,13 @@ pub(crate) struct EngineOutput {
 pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     let current_manifest = args.project_dir.join("target").join("manifest.json");
 
+    // Checked before Baseline resolution (which compiles a whole
+    // temporary git worktree -- not cheap) so a stale current manifest
+    // fails fast rather than after that work is already done.
+    if !args.allow_stale_manifest {
+        check_current_manifest_freshness(&args.project_dir, &current_manifest)?;
+    }
+
     let dbt_passthrough_args = args.dbt_passthrough_args()?;
     let config = Config::load_for_project(&args.project_dir).map_err(|err| err.to_string())?;
     // `--against` wins when explicitly passed; otherwise `zhao.yml`'s
@@ -277,9 +284,205 @@ fn load_manifest(path: &Path) -> Result<zhao_core::model::ParsedProject, String>
         .map_err(|err| format!("{path}: {err}", path = path.display()))
 }
 
+/// Root-level files that feed `dbt compile`/`dbt parse` directly, checked
+/// for staleness alongside [`DBT_SOURCE_DIRS`].
+const DBT_SOURCE_ROOT_FILES: &[&str] = &["dbt_project.yml", "packages.yml", "dependencies.yml"];
+
+/// Conventional dbt source directories -- everything under these feeds
+/// compilation (model/seed/snapshot/macro/test SQL, schema YAML, seed
+/// CSVs). Deliberately not "every file under `project_dir`": that would
+/// also flag unrelated edits (README, `zhao.yml`, CI config) as requiring
+/// a recompile, which they don't.
+const DBT_SOURCE_DIRS: &[&str] = &[
+    "models",
+    "macros",
+    "seeds",
+    "snapshots",
+    "analyses",
+    "tests",
+];
+
+/// Refuses to proceed if `manifest_path` predates any of `project_dir`'s
+/// own dbt source files -- the exact bug pattern of checking out a
+/// different branch (or pulling new commits) without rerunning `dbt
+/// compile`, which otherwise leaves `zhao check`/`zhao diff` silently
+/// diffing against a manifest compiled from a different project state
+/// entirely. See issue tracker for the report this was written from.
+///
+/// A no-op (never flags staleness) when `project_dir` has no dbt source
+/// files to compare against at all -- e.g. a manifest-only test fixture
+/// with no real dbt project checked out alongside it -- since there's
+/// nothing to compare. Also a no-op if either mtime can't be read (best
+/// effort, same precedent as [`is_stale`]'s git-based staleness check);
+/// a genuinely missing/unreadable manifest still surfaces its own clear
+/// error from [`load_manifest`] right after this check runs.
+fn check_current_manifest_freshness(
+    project_dir: &Path,
+    manifest_path: &Path,
+) -> Result<(), String> {
+    let Some(newest_source) = newest_dbt_source_mtime(project_dir) else {
+        return Ok(());
+    };
+    let Ok(manifest_mtime) = std::fs::metadata(manifest_path).and_then(|m| m.modified()) else {
+        return Ok(());
+    };
+    if newest_source > manifest_mtime {
+        return Err(format!(
+            "{manifest} looks stale: a dbt source file under {project_dir} was modified more \
+             recently than the compiled manifest. This usually means the manifest was compiled \
+             from a different branch or an older commit -- run `dbt compile` in {project_dir} \
+             and try again. Pass --allow-stale-manifest to skip this check (not recommended).",
+            manifest = manifest_path.display(),
+            project_dir = project_dir.display(),
+        ));
+    }
+    Ok(())
+}
+
+/// The newest modification time among `project_dir`'s dbt source-of-truth
+/// input files ([`DBT_SOURCE_ROOT_FILES`] plus everything under
+/// [`DBT_SOURCE_DIRS`]). `None` if none of those exist at all.
+fn newest_dbt_source_mtime(project_dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut consider = |path: &Path| {
+        if let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) {
+            if newest.is_none_or(|current| modified > current) {
+                newest = Some(modified);
+            }
+        }
+    };
+
+    for file_name in DBT_SOURCE_ROOT_FILES {
+        consider(&project_dir.join(file_name));
+    }
+    for dir_name in DBT_SOURCE_DIRS {
+        walk_mtimes(&project_dir.join(dir_name), &mut consider);
+    }
+
+    newest
+}
+
+/// Recursively visits every regular file under `dir`, calling `consider`
+/// on each. Silently does nothing if `dir` doesn't exist or can't be
+/// read (a project simply not using that conventional dbt subdirectory
+/// is the common case, not an error).
+fn walk_mtimes(dir: &Path, consider: &mut dyn FnMut(&Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_mtimes(&path, consider);
+        } else {
+            consider(&path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set_mtime(path: &Path, seconds_since_epoch: u64) {
+        let time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds_since_epoch);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("file should be openable for writing")
+            .set_modified(time)
+            .expect("mtime should be settable");
+    }
+
+    #[test]
+    fn no_dbt_project_present_is_never_flagged_stale() {
+        // Matches the shape of existing test fixtures: a manifest-only
+        // directory with no real dbt project (models/, dbt_project.yml,
+        // ...) checked out alongside it -- there's nothing to compare
+        // staleness against, so this must never fail.
+        let dir = tempfile::tempdir().expect("tempdir should be creatable");
+        std::fs::create_dir_all(dir.path().join("target")).expect("target dir should be creatable");
+        let manifest = dir.path().join("target").join("manifest.json");
+        std::fs::write(&manifest, "{}").expect("manifest should be writable");
+
+        assert!(check_current_manifest_freshness(dir.path(), &manifest).is_ok());
+    }
+
+    #[test]
+    fn a_model_file_newer_than_the_manifest_is_flagged_stale() {
+        let dir = tempfile::tempdir().expect("tempdir should be creatable");
+        std::fs::create_dir_all(dir.path().join("target")).expect("target dir should be creatable");
+        let manifest = dir.path().join("target").join("manifest.json");
+        std::fs::write(&manifest, "{}").expect("manifest should be writable");
+        set_mtime(&manifest, 1_000);
+
+        std::fs::create_dir_all(dir.path().join("models")).expect("models dir should be creatable");
+        let model = dir.path().join("models").join("foo.sql");
+        std::fs::write(&model, "select 1").expect("model should be writable");
+        set_mtime(&model, 2_000);
+
+        let err = check_current_manifest_freshness(dir.path(), &manifest)
+            .expect_err("a newer model file should be flagged stale");
+        assert!(err.contains("looks stale"), "{err}");
+        assert!(err.contains("--allow-stale-manifest"), "{err}");
+    }
+
+    #[test]
+    fn a_changed_dbt_project_yml_alone_is_flagged_stale() {
+        let dir = tempfile::tempdir().expect("tempdir should be creatable");
+        std::fs::create_dir_all(dir.path().join("target")).expect("target dir should be creatable");
+        let manifest = dir.path().join("target").join("manifest.json");
+        std::fs::write(&manifest, "{}").expect("manifest should be writable");
+        set_mtime(&manifest, 1_000);
+
+        let dbt_project = dir.path().join("dbt_project.yml");
+        std::fs::write(&dbt_project, "name: fixture").expect("dbt_project.yml should be writable");
+        set_mtime(&dbt_project, 2_000);
+
+        assert!(check_current_manifest_freshness(dir.path(), &manifest).is_err());
+    }
+
+    #[test]
+    fn a_manifest_newer_than_every_source_file_is_not_flagged_stale() {
+        let dir = tempfile::tempdir().expect("tempdir should be creatable");
+        std::fs::create_dir_all(dir.path().join("models")).expect("models dir should be creatable");
+        let model = dir.path().join("models").join("foo.sql");
+        std::fs::write(&model, "select 1").expect("model should be writable");
+        set_mtime(&model, 1_000);
+
+        std::fs::create_dir_all(dir.path().join("target")).expect("target dir should be creatable");
+        let manifest = dir.path().join("target").join("manifest.json");
+        std::fs::write(&manifest, "{}").expect("manifest should be writable");
+        set_mtime(&manifest, 2_000);
+
+        assert!(check_current_manifest_freshness(dir.path(), &manifest).is_ok());
+    }
+
+    #[test]
+    fn an_unrelated_file_outside_dbt_source_conventions_is_ignored() {
+        // Editing zhao.yml, README, or CI config shouldn't demand a
+        // recompile -- only actual dbt compile inputs should. A real dbt
+        // source tree is present here too (older than the manifest), so
+        // this specifically proves zhao.yml is excluded, not just that
+        // there was nothing to compare against.
+        let dir = tempfile::tempdir().expect("tempdir should be creatable");
+        std::fs::create_dir_all(dir.path().join("models")).expect("models dir should be creatable");
+        let model = dir.path().join("models").join("foo.sql");
+        std::fs::write(&model, "select 1").expect("model should be writable");
+        set_mtime(&model, 500);
+
+        std::fs::create_dir_all(dir.path().join("target")).expect("target dir should be creatable");
+        let manifest = dir.path().join("target").join("manifest.json");
+        std::fs::write(&manifest, "{}").expect("manifest should be writable");
+        set_mtime(&manifest, 1_000);
+
+        let unrelated = dir.path().join("zhao.yml");
+        std::fs::write(&unrelated, "preset: strict").expect("zhao.yml should be writable");
+        set_mtime(&unrelated, 2_000);
+
+        assert!(check_current_manifest_freshness(dir.path(), &manifest).is_ok());
+    }
 
     #[test]
     fn no_color_flag_wins_over_everything_else() {

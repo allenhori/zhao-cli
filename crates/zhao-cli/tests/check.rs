@@ -2023,3 +2023,144 @@ mod staleness_warning {
         assert_eq!(parsed["findings"][0]["severity"], "error");
     }
 }
+
+/// Integration coverage for the current-manifest freshness check (engine.rs
+/// `check_current_manifest_freshness`): a real dbt project directory, not
+/// just a manifest-only fixture, since the check is a no-op without dbt
+/// source files present to compare against.
+mod stale_current_manifest {
+    use super::*;
+
+    /// A tempdir shaped like a minimal real dbt project: `target/manifest.json`
+    /// copied from the `clean_project` fixture, plus a `dbt_project.yml` whose
+    /// mtime is controlled independently -- so staleness can be deliberately
+    /// induced or avoided without depending on git checkout mtime ordering.
+    struct TestProject {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    fn set_mtime(path: &std::path::Path, seconds_since_epoch: u64) {
+        let time =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds_since_epoch);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("file should be openable for writing")
+            .set_modified(time)
+            .expect("mtime should be settable");
+    }
+
+    fn project_with_dbt_project_yml_mtime(
+        manifest_seconds: u64,
+        dbt_project_seconds: u64,
+    ) -> TestProject {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = dir.path().to_path_buf();
+
+        std::fs::create_dir_all(path.join("target")).expect("should create target dir");
+        std::fs::copy(
+            fixture("clean_project")
+                .join("target")
+                .join("manifest.json"),
+            path.join("target").join("manifest.json"),
+        )
+        .expect("should copy fixture manifest");
+        set_mtime(&path.join("target").join("manifest.json"), manifest_seconds);
+
+        std::fs::write(
+            path.join("dbt_project.yml"),
+            "name: fixture\nversion: '1.0.0'\n",
+        )
+        .expect("should write dbt_project.yml");
+        set_mtime(&path.join("dbt_project.yml"), dbt_project_seconds);
+
+        TestProject { _dir: dir, path }
+    }
+
+    #[test]
+    fn a_stale_manifest_fails_with_a_clear_error_by_default() {
+        // dbt_project.yml modified after the manifest was compiled --
+        // exactly the "checked out a different branch, forgot to
+        // recompile" bug pattern.
+        let project = project_with_dbt_project_yml_mtime(1_000, 2_000);
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .arg("check")
+            .arg("--state")
+            .arg(fixture("diff_baseline_manifest_clean.json"))
+            .arg("--project-dir")
+            .arg(&project.path)
+            .output()
+            .expect("command should run");
+
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("looks stale"), "{stderr}");
+        assert!(stderr.contains("dbt compile"), "{stderr}");
+        assert!(stderr.contains("--allow-stale-manifest"), "{stderr}");
+    }
+
+    #[test]
+    fn a_fresh_manifest_is_not_flagged() {
+        // Manifest compiled after dbt_project.yml's last change -- the
+        // normal, healthy case.
+        let project = project_with_dbt_project_yml_mtime(2_000, 1_000);
+
+        Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .arg("check")
+            .arg("--state")
+            .arg(fixture("diff_baseline_manifest_clean.json"))
+            .arg("--project-dir")
+            .arg(&project.path)
+            .arg("--format")
+            .arg("json")
+            .assert()
+            .code(0)
+            .stdout(predicate::str::contains("\"findings\": []"));
+    }
+
+    #[test]
+    fn allow_stale_manifest_bypasses_the_check() {
+        let project = project_with_dbt_project_yml_mtime(1_000, 2_000);
+
+        Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .arg("check")
+            .arg("--state")
+            .arg(fixture("diff_baseline_manifest_clean.json"))
+            .arg("--project-dir")
+            .arg(&project.path)
+            .arg("--allow-stale-manifest")
+            .arg("--format")
+            .arg("json")
+            .assert()
+            .code(0)
+            .stdout(predicate::str::contains("\"findings\": []"));
+    }
+
+    #[test]
+    fn zhao_diff_is_also_gated_by_the_same_check() {
+        let project = project_with_dbt_project_yml_mtime(1_000, 2_000);
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .arg("diff")
+            .arg("--state")
+            .arg(fixture("diff_baseline_manifest_clean.json"))
+            .arg("--project-dir")
+            .arg(&project.path)
+            .output()
+            .expect("command should run");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "zhao diff shares engine.rs::build_report with zhao check, so it must be gated too"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("looks stale"), "{stderr}");
+    }
+}

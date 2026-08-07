@@ -17,7 +17,7 @@ zhao check [OPTIONS]
 | Flag | Default | What it does |
 |---|---|---|
 | `--state <path>` | — | Use an already-compiled `manifest.json` as the Baseline instead of resolving one via git. |
-| `--project-dir <dir>` | `.` | The dbt project to check. Its current state is read from `<dir>/target/manifest.json`. |
+| `--project-dir <dir>` | `.` | The dbt project to check. Its current state is read from `<dir>/target/manifest.json` — run `dbt compile` in the project first; zhao refuses to run against a stale one (see `--allow-stale-manifest` below). |
 | `--against <ref>` | `master` | The branch to find a merge-base against, for git-native Baseline resolution. Ignored when `--state` is given. Overrides `zhao.yml`'s `against` when given — see [Configuring `zhao.yml`](configuration.md#against). |
 | `--format <text\|json>` | `text` | `json` is the machine-readable shape everything else in this table also applies to — build a PR-comment bot or dashboard on top of it without scraping text. |
 | `--no-color` | — | Disables ANSI color in text output (auto-detected otherwise; no effect on `--format json`). |
@@ -26,9 +26,11 @@ zhao check [OPTIONS]
 | `--check-relations` | — | Opt-in: actually checks whether each flagged incremental model exists in your configured target (same connection `dbt run` already needs), turning the conditional schema-evolution note into a definitive one. |
 | `--defer-target <name>` | — | A human-readable label (e.g. `"prod"`) for the target the `--defer` plan defers to. Shown next to the generated command; not passed to dbt itself. Overrides `zhao.yml`'s `defer.target`. |
 | `--defer-state <path>` | — | A compiled manifest path to defer to — when set, the report includes a ready-to-run `dbt build --select ... --defer --state <path>` command. Overrides `zhao.yml`'s `defer.state`. |
+| `--allow-stale-manifest` | — | Skips the check that `<project-dir>/target/manifest.json` is newer than the project's own dbt source files (`dbt_project.yml`, `packages.yml`/`dependencies.yml`, and everything under `models/`, `macros/`, `seeds/`, `snapshots/`, `analyses/`, `tests/`). Without this flag, a stale manifest — e.g. checked out on a different branch, or pulled without rerunning `dbt compile` — fails fast (exit `2`) instead of silently producing an incorrect diff. Not recommended; exists for cases like a hand-supplied test fixture with no real dbt project alongside it. |
 
 **Exit codes**: `0` nothing breaking; `1` a `BREAKING` finding fired; `2` zhao itself
-couldn't run (bad path, unparsable manifest, `dbt` not invokable, merge-base not found, ...).
+couldn't run (bad path, unparsable manifest, stale manifest, `dbt` not invokable, merge-base
+not found, ...).
 
 ### Report sections (text output)
 
