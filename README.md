@@ -4,10 +4,10 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Named for the character Empress Wu Zetian invented for herself: 明 (sun and moon) over 空
-(sky) — "illuminating everything below." **A free, offline, deterministic breaking-change
-gate for dbt.** zhao reads your dbt project's compiled SQL and tells a reviewer exactly what
-a pull request changed and which downstream models it actually reaches — before anyone has
-to trace the DAG by hand.
+(sky) — "illuminating everything below." **A free, deterministic breaking-change gate for
+dbt.** zhao reads your dbt project's compiled SQL and tells a reviewer exactly what a pull
+request changed and which downstream models it actually reaches — before anyone has to trace
+the DAG by hand.
 
 ```
 Changed:
@@ -34,9 +34,12 @@ reliably does across a DAG of any real size.
 zhao parses the SQL itself and computes *real* column-level lineage between two states of
 your project, classifies each change against a fixed Rule catalog (column removed with an
 active reference, type narrowed, join loosened, column added), and reports the exact models
-each change actually reaches — never the whole DAG, never a guess. The whole thing runs
-fully offline: no LLM, no network call, no account, nothing installed in your warehouse
-beyond what `dbt run` already needs.
+each change actually reaches — never the whole DAG, never a guess. The analysis itself is
+entirely local: no LLM, no account, and it never reads or sends your actual data — nothing
+installed in your warehouse beyond what `dbt run` already needs. The one place a network call
+happens is resolving a git-native Baseline (`dbt compile`/`dbt deps`, the same as running
+`dbt` yourself) — skip that entirely by passing `--state` with an already-compiled manifest,
+for a genuinely zero-network-call run.
 
 ## Install
 
@@ -158,9 +161,14 @@ has.
 zhao never reads, collects, or stores your actual data — no row values, nothing about what's
 *in* your tables. It only derives structural metadata (schema, lineage, what changed), and
 that metadata stays on your own filesystem, under `target/zhao/`, unless you decide otherwise.
-Nothing is ever sent anywhere automatically: `zhao-cli` makes no network call of its own
-except `zhao update`, which only downloads a release binary — it doesn't send anything from
-your project. Nothing about your project ever leaves your machine as a side effect of
+Nothing is ever sent anywhere automatically: `zhao-cli` itself makes no network call of its
+own except `zhao update`, which only downloads a release binary — it doesn't send anything
+from your project. The one exception worth naming plainly: resolving a git-native Baseline
+(the default `zhao check --against <ref>`, without `--state`) runs `dbt compile`/`dbt deps` as
+a subprocess — the same commands you'd run yourself, and exactly as network-dependent as they
+already are for you (package downloads, and often a live warehouse connection depending on
+your adapter). Pass `--state` with an already-compiled manifest to skip that path entirely.
+Nothing about your project is ever sent to zhao or any third party as a side effect of
 `check`/`diff`/`lineage` — the metadata they write stays under `target/zhao/`, yours to do
 whatever you want with, including nothing at all.
 
