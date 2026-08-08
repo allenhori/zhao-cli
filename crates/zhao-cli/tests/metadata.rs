@@ -124,7 +124,7 @@ fn run_metadata_changes_and_findings_match_the_stdout_json_output_exactly() {
         "changes",
         "findings",
         "staleness_warning",
-        "recommended_command",
+        "impacted_models",
     ] {
         assert_eq!(
             stdout_json.get(field),
@@ -197,7 +197,7 @@ fn run_metadata_json_field_set_is_exactly_this_and_nothing_else() {
         "changes",
         "findings",
         "staleness_warning",
-        "recommended_command",
+        "impacted_models",
         "defer_plan",
         "schema_evolution_warnings",
         "lineage_edges",
@@ -233,7 +233,7 @@ fn run_metadata_json_field_set_is_exactly_this_and_nothing_else() {
     .collect();
 
     // A subset, not an exact match: some fields (`staleness_warning`,
-    // `recommended_command`, `column` on a `LineageEdgeJson`, ...) are
+    // `column` on a `LineageEdgeJson`, ...) are
     // conditionally present and this one fixture/scenario won't
     // necessarily surface all of them. What matters is that nothing
     // *outside* the allowlist ever appears.

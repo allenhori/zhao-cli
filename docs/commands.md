@@ -23,7 +23,7 @@ zhao check [OPTIONS]
 | `--no-color` | — | Disables ANSI color in text output (auto-detected otherwise; no effect on `--format json`). |
 | `--dbt-arg <arg>` | — | Appends one extra argument to every internal `dbt deps`/`dbt compile` call (git-native Baseline resolution only). Repeatable, e.g. `--dbt-arg --target --dbt-arg ci`. Mutually exclusive with `--dbt-args`. |
 | `--dbt-args "<string>"` | — | Same, but as one shell-word-style string to split, e.g. `--dbt-args "--target ci --vars '{\"key\": \"value\"}'"`. Mutually exclusive with `--dbt-arg`. |
-| `--dbt-command "<cmd>"` | `dbt` | The executable/prefix for every internal `dbt` call zhao makes itself. Shell-word-split, so a wrapper's own leading flags work too (e.g. `"uv run dbt"`, or a custom in-house wrapper like `"dw some-flag"`). Overrides `zhao.yml`'s `dbt-command` when given — see [Configuring `zhao.yml`](configuration.md#dbt-commanddbt-args). |
+| `--dbt-command "<cmd>"` | `dbt` | The executable/prefix for every internal `dbt` call zhao makes itself. Shell-word-split, so a wrapper's own leading flags work too (e.g. `"uv run dbt"`, or a custom in-house wrapper like `"myshell custom-flag"`). Overrides `zhao.yml`'s `dbt-command` when given — see [Configuring `zhao.yml`](configuration.md#dbt-commanddbt-args). |
 | `--check-relations` | — | Opt-in: actually checks whether each flagged incremental model exists in your configured target (same connection `dbt run` already needs), turning the conditional schema-evolution note into a definitive one. |
 | `--defer-target <name>` | — | A human-readable label (e.g. `"prod"`) for the target the `--defer` plan defers to. Shown next to the generated command; not passed to dbt itself. Overrides `zhao.yml`'s `defer.target`. |
 | `--defer-state <path>` | — | A compiled manifest path to defer to — when set, the report includes a ready-to-run `dbt build --select ... --defer --state <path>` command. Overrides `zhao.yml`'s `defer.state`. |
@@ -40,9 +40,16 @@ not found, ...).
 2. **Downstream impact** — every model actually *reached* by a change (never the whole
    downstream cone), each labeled `[BREAKING]` or `[WARN]` with the specific reference and
    the Rule that fired.
-3. **Summary** — a one-line count, plus (if applicable) a ready-to-copy
-   `dbt build --select <impacted models>` command and a `Defer plan:` section (see
-   [Configuring `defer`](configuration.md#defer)).
+3. **Summary** — a one-line count, plus (if applicable) an `Impacted models:` list and a
+   `Defer plan:` section (see [Configuring `defer`](configuration.md#defer)).
+
+`Impacted models` is deliberately just the list of model names, not a constructed command —
+zhao has no way to know whether your CI actually invokes `dbt build`, `dbt run`, or a custom
+wrapper, so it never assumes one. Build your own command from the list, e.g.
+`dbt build --select $(echo "$names" | tr ',' ' ')`, or (more robustly, avoiding any shell
+word-splitting concerns) pull the same list straight from `--format json`'s `impacted_models`
+array — a real JSON array of strings, ready for a script to consume directly without any
+text-parsing at all.
 
 A **Schema evolution** section appears whenever a schema-changing change (column
 added/removed/type-changed) lands on a model materialized `incremental` — phrased
