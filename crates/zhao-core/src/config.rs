@@ -169,7 +169,7 @@ impl Config {
     /// The executable/prefix to invoke for every `dbt` subprocess call
     /// zhao itself makes (`compile`, `deps`, live relation checks, ...),
     /// if `zhao.yml` sets one -- e.g. `"uv run dbt"`, or a custom wrapper
-    /// like `"dw some-flag"` a project's own tooling already uses instead
+    /// like `"myshell custom-flag"` a project's own tooling already uses instead
     /// of invoking `dbt` directly. `None` if it doesn't -- callers fall
     /// back to `"dbt"`, resolved via `PATH`, the same as zhao's v1
     /// default. Shell-word-split by the caller, not here (see
@@ -958,13 +958,13 @@ mod tests {
             .expect("should write root config");
         fs::write(
             repo.project_dir.join("zhao.yml"),
-            "dbt-command: \"dw some-flag\"\n",
+            "dbt-command: \"myshell custom-flag\"\n",
         )
         .expect("should write project-local config");
 
         let config = Config::load_for_project(&repo.project_dir).expect("should parse");
 
-        assert_eq!(config.dbt_command(), Some("dw some-flag"));
+        assert_eq!(config.dbt_command(), Some("myshell custom-flag"));
     }
 
     #[test]

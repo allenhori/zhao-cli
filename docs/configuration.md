@@ -22,8 +22,8 @@ not shown in Downstream impact unless something else made the model impactful):
 | `join-cardinality-loosened` | `warn` | A join's cardinality loosened (`INNER` → `LEFT`/`FULL`) — potential row-count/duplication regression. |
 | `column-added` | `pass` | A column was added. Informational by default — nothing downstream could already depend on a column that didn't exist. |
 | `struct-field-removed` | `error` | A field was removed from a `STRUCT`-typed column's internal shape, where that shape was statically knowable (an explicit `CAST(... AS STRUCT<...>)` or `STRUCT(...)`/`named_struct(...)` constructor in the compiled SQL) in both the Baseline and current state. |
-| `struct-field-added` | `pass` | A field was added to a `STRUCT`-typed column's internal shape, under the same "shape known on both sides" condition as `struct-field-removed`. |
-| `struct-field-type-narrowed` | `warn` | A field within a `STRUCT`-typed column's internal shape narrowed its documented type — the same integer-width narrowing `column-type-narrowed` detects, one level deeper. |
+| `struct-field-added` | `error` | A field was added to a `STRUCT`-typed column's internal shape, under the same "shape known on both sides" condition as `struct-field-removed`. Deliberately stricter than `column-added`'s `pass` — confirmed against a real Databricks workspace that this breaks an incremental `MERGE` without manual intervention, unlike a new top-level column. |
+| `struct-field-type-narrowed` | `error` | A field within a `STRUCT`-typed column's internal shape narrowed its documented type — the same integer-width narrowing `column-type-narrowed` detects, one level deeper. Deliberately stricter than `column-type-narrowed`'s `warn` — struct-internal changes are easy to miss in a PR diff, and carry the same schema-mismatch risk as `struct-field-added`. |
 
 ## Presets
 
@@ -93,12 +93,13 @@ subprocess call it makes itself (`dbt deps`/`dbt compile` for git-native Baselin
 ```yaml
 dbt-command: dbt          # zhao's own default -- resolved via PATH
 dbt-command: uv run dbt   # a project that only ever invokes dbt through uv
-dbt-command: dw some-flag # a custom in-house wrapper, with its own leading flag
+dbt-command: myshell custom-flag # a custom in-house wrapper, with its own leading flag
 ```
 
-Shell-word-split, so a multi-word value works as a genuine prefix — `dw some-flag` runs as
-`dw some-flag deps`/`dw some-flag compile`/etc, not as one literal (nonexistent) executable
-named `"dw some-flag"`. Assumes you know what your own wrapper does with any flags placed
+Shell-word-split, so a multi-word value works as a genuine prefix — `myshell custom-flag` runs
+as `myshell custom-flag deps`/`myshell custom-flag compile`/etc, not as one literal
+(nonexistent) executable named `"myshell custom-flag"`. Assumes you know what your own wrapper
+does with any flags placed
 ahead of the subcommand; zhao never interprets them. The CLI `--dbt-command` flag overrides
 this when given; with neither set, zhao falls back to `"dbt"`.
 

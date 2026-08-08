@@ -113,7 +113,7 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
     };
     let mut report = Report::new(&changes, &findings)
         .with_staleness_warning(is_stale(&args.project_dir, &against))
-        .with_recommended_command(adapter.vocabulary())
+        .with_impacted_models(adapter.vocabulary())
         .with_defer_plan(&current, adapter.vocabulary(), &defer_settings)
         .with_schema_evolution_warnings(&current);
 

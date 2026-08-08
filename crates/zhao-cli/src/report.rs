@@ -31,17 +31,20 @@ pub struct Report {
     /// Preset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub staleness_warning: Option<String>,
-    /// A ready-to-run command (in the adapter's own selector syntax)
-    /// recommending exactly which Nodes named in `findings`' Downstream
-    /// impact to validate. `None` when there's nothing to validate: either
-    /// no impactful (non-`pass`-severity) Finding fired at all, or this
-    /// report was built without [`Report::with_recommended_command`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recommended_command: Option<String>,
-    /// The computed dbt `--defer` plan: which Nodes need building (the
-    /// same set `recommended_command` selects) and which of their
-    /// upstream dependencies can be deferred to an existing state
-    /// instead. `None` under the same conditions as `recommended_command`.
+    /// Exactly which Nodes named in `findings`' Downstream impact need
+    /// validating, in the adapter's own display names (e.g. dbt's bare
+    /// model name) -- deliberately just the list, not a constructed
+    /// command: zhao has no way to know whether a project's CI actually
+    /// invokes `dbt build`, `dbt run`, or some custom wrapper, so it never
+    /// assumes one. Always present, `[]` when there's nothing to
+    /// validate (either no impactful non-`pass`-severity Finding fired at
+    /// all, or this report was built without
+    /// [`Report::with_impacted_models`]).
+    pub impacted_models: Vec<String>,
+    /// The computed `--defer` plan: which Nodes need building (the same
+    /// set `impacted_models` names) and which of their upstream
+    /// dependencies can be deferred to an existing state instead. `None`
+    /// under the same conditions as an empty `impacted_models`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defer_plan: Option<DeferPlanJson>,
     /// One entry per schema-changing Change (column added/removed/type
@@ -50,27 +53,26 @@ pub struct Report {
     /// possibility, never a fact: zhao has no live connection and cannot
     /// know whether the Node actually exists yet in any given target
     /// environment. Always serialized, even as `[]` -- unlike
-    /// `recommended_command`/`defer_plan` (which are only ever computed on
-    /// request and use `Option` to distinguish "not computed" from
-    /// "computed, found nothing"), this is unconditionally computed
-    /// whenever a `ParsedProject` is available, so there's no "not
-    /// computed" state for a consumer to need to distinguish in the first
-    /// place.
+    /// `defer_plan` (only ever computed on request, using `Option` to
+    /// distinguish "not computed" from "computed, found nothing"), this
+    /// is unconditionally computed whenever a `ParsedProject` is
+    /// available, so there's no "not computed" state for a consumer to
+    /// need to distinguish in the first place.
     pub schema_evolution_warnings: Vec<SchemaEvolutionWarningJson>,
 }
 
 impl Report {
     /// Builds a [`Report`] from the engine's own `Change`/`Finding` output.
-    /// No staleness warning, recommended command, or defer plan is set --
+    /// No staleness warning, impacted-models list, or defer plan is set --
     /// chain [`Report::with_staleness_warning`]/
-    /// [`Report::with_recommended_command`]/[`Report::with_defer_plan`] to
+    /// [`Report::with_impacted_models`]/[`Report::with_defer_plan`] to
     /// add them.
     pub fn new(changes: &[Change], findings: &[Finding]) -> Self {
         Self {
             changes: changes.iter().map(ChangeJson::from).collect(),
             findings: findings.iter().map(FindingJson::from).collect(),
             staleness_warning: None,
-            recommended_command: None,
+            impacted_models: Vec::new(),
             defer_plan: None,
             schema_evolution_warnings: Vec::new(),
         }
@@ -79,10 +81,10 @@ impl Report {
     /// The exact set of Nodes named in the Downstream impact section --
     /// every non-`pass` Finding's [`FindingJson::impacted_node`],
     /// deduplicated, in first-seen order. Shared by
-    /// [`Report::with_recommended_command`] and
-    /// [`Report::with_defer_plan`], which both need precisely this set:
-    /// the former to name it in the adapter's selector syntax, the latter
-    /// as the `--defer` plan's "build" set.
+    /// [`Report::with_impacted_models`] and [`Report::with_defer_plan`],
+    /// which both need precisely this set: the former to name it in the
+    /// adapter's own display names, the latter as the `--defer` plan's
+    /// "build" set.
     fn impacted_node_ids(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut node_ids = Vec::new();
@@ -108,11 +110,11 @@ impl Report {
         self
     }
 
-    /// Sets this report's recommended validation command: the exact set
-    /// of Nodes named in the Downstream impact section (every non-`pass`
-    /// Finding's [`FindingJson::impacted_node`], deduplicated), handed to
-    /// `vocabulary` as zhao's own `NodeId` strings to render in the
-    /// adapter's own selector syntax.
+    /// Sets this report's impacted-models list: the exact set of Nodes
+    /// named in the Downstream impact section (every non-`pass` Finding's
+    /// [`FindingJson::impacted_node`], deduplicated), rendered through
+    /// `vocabulary` into the adapter's own display names -- e.g. dbt's
+    /// bare model name, not zhao's internal `NodeId` string.
     ///
     /// Deliberately does *not* look a Node up by ID first (an earlier
     /// version of this method did, resolving each ID against a
@@ -122,30 +124,33 @@ impl Report {
     /// `Node` in the current state to look up at all, even though it's
     /// still correctly named in the Downstream impact section from its ID
     /// string alone -- looking it up first would silently drop it from
-    /// this command, undermining the "matches Downstream impact exactly"
+    /// this list, undermining the "matches Downstream impact exactly"
     /// contract. `vocabulary` is expected to derive its own name straight
     /// from the ID string instead (e.g. dbt's `unique_id` shape already
     /// contains the bare model name).
-    pub fn with_recommended_command(mut self, vocabulary: &dyn AdapterVocabulary) -> Self {
-        self.recommended_command =
-            vocabulary.recommended_validation_command(&self.impacted_node_ids());
+    pub fn with_impacted_models(mut self, vocabulary: &dyn AdapterVocabulary) -> Self {
+        self.impacted_models = self
+            .impacted_node_ids()
+            .iter()
+            .map(|id| vocabulary.node_display_name(id))
+            .collect();
         self
     }
 
     /// Sets this report's `--defer` plan: `build` is the same impacted-Node
-    /// set [`Report::with_recommended_command`] selects; `defer` is every
+    /// set [`Report::with_impacted_models`] names; `defer` is every
     /// Node those Nodes depend on (directly or transitively, through
     /// `current`'s Lineage Edges) that isn't itself in `build` -- Nodes a
     /// CI job building only the impacted set should treat as already
-    /// available (via `dbt ... --defer --state <path>`) rather than
-    /// rebuild from scratch. Pure computation: this method never connects
-    /// to a warehouse or provisions anything.
+    /// available (via a `--defer`-style flag, in whatever build tool
+    /// actually runs this) rather than rebuild from scratch. Pure
+    /// computation: this method never connects to a warehouse or
+    /// provisions anything.
     ///
     /// `settings` (from `zhao.yml`'s `defer.target`/`defer.state`, with
     /// any `--defer-target`/`--defer-state` CLI override already applied
-    /// by the caller) additionally produces a ready-to-run command on the
-    /// plan when a state path is configured -- see
-    /// [`DeferSettings`]/[`DeferPlanJson::command`]. Pass
+    /// by the caller) additionally surfaces the configured state path on
+    /// the plan -- see [`DeferSettings`]/[`DeferPlanJson::state`]. Pass
     /// [`DeferSettings::default`] when neither is configured; the plan's
     /// `build`/`defer` lists are computed the same either way.
     ///
@@ -271,27 +276,29 @@ pub struct DeferSettings {
 #[derive(Debug, Serialize)]
 pub struct DeferPlanJson {
     /// Nodes that need to be built: the same set named in Downstream
-    /// impact / the recommended command's selector.
+    /// impact / `impacted_models`.
     pub build: Vec<String>,
     /// Nodes `build`'s Nodes depend on (directly or transitively) that
     /// aren't themselves in `build` -- these should be deferred to an
-    /// existing state (`dbt ... --defer --state <path>`) rather than
-    /// rebuilt.
+    /// existing state (a `--defer`-style flag, in whatever build tool
+    /// actually runs this) rather than rebuilt.
     pub defer: Vec<String>,
     /// The human-readable label for the target the plan defers to (from
     /// [`DeferSettings::target`]), if configured -- present independently
-    /// of `command` (a target name alone, with no state path, still
-    /// documents intent even though no command can be generated for it).
+    /// of `state` (a target name alone, with no state path, still
+    /// documents intent even though there's no path to defer to yet).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
-    /// A ready-to-run `dbt ... --defer --state <path>` command building
-    /// exactly `build`, deferring everything else to the configured
-    /// state. `None` when no state path is configured (via
-    /// `zhao.yml`'s `defer.state` or `--defer-state`) -- the plan's
-    /// `build`/`defer` lists are still always present regardless, since
-    /// they're useful on their own even without a command to run.
+    /// The configured path to defer to (from `zhao.yml`'s `defer.state`
+    /// or `--defer-state`), if any -- the raw path only, never a
+    /// constructed command: zhao has no way to know whether a project's
+    /// CI actually invokes `dbt build`, `dbt run`, or some custom
+    /// wrapper, so it never assumes one. `None` when no state path is
+    /// configured -- the plan's `build`/`defer` lists are still always
+    /// present regardless, since they're useful on their own even
+    /// without a state to defer to.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
+    pub state: Option<String>,
 }
 
 impl DeferPlanJson {
@@ -302,8 +309,8 @@ impl DeferPlanJson {
     /// source in the first place, so there's nothing to defer for one.
     /// The graph walk itself works in zhao's own `NodeId` strings; both
     /// `build` and `defer` are rendered through `vocabulary` at the end,
-    /// same as [`Report::with_recommended_command`], so a `--defer` plan
-    /// names Nodes the same way the recommended command does rather than
+    /// same as [`Report::with_impacted_models`], so a `--defer` plan
+    /// names Nodes the same way `impacted_models` does rather than
     /// mixing zhao's internal IDs with the adapter's own names.
     fn compute(
         current: &ParsedProject,
@@ -343,24 +350,11 @@ impl DeferPlanJson {
             .map(|id| vocabulary.node_display_name(id))
             .collect();
 
-        // `state` is an arbitrary filesystem path (not one of dbt's own
-        // node-name tokens, which can't contain shell-special characters),
-        // so it's quoted -- a path containing spaces is common enough
-        // that an unquoted command here would be silently wrong if a user
-        // copy-pastes it into a shell.
-        let command = settings.state.as_deref().map(|state| {
-            format!(
-                "dbt build --select {} --defer --state {}",
-                build_names.join(" "),
-                shell_words::quote(state)
-            )
-        });
-
         Self {
             build: build_names,
             defer: defer_names,
             target: settings.target.clone(),
-            command,
+            state: settings.state.clone(),
         }
     }
 }
@@ -914,8 +908,11 @@ pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary, use_colo
          changed, {breaking} breaking, {warning} warning\n"
     ));
 
-    if let Some(command) = &report.recommended_command {
-        out.push_str(&format!("\nRecommended: {command}\n"));
+    if !report.impacted_models.is_empty() {
+        out.push_str(&format!(
+            "\nImpacted models: {}\n",
+            report.impacted_models.join(", ")
+        ));
     }
 
     if let Some(plan) = &report.defer_plan {
@@ -932,8 +929,8 @@ pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary, use_colo
         if let Some(target) = &plan.target {
             out.push_str(&format!("  Target: {target}\n"));
         }
-        if let Some(command) = &plan.command {
-            out.push_str(&format!("  Command: {command}\n"));
+        if let Some(state) = &plan.state {
+            out.push_str(&format!("  State: {state}\n"));
         }
     }
 
@@ -1295,7 +1292,7 @@ mod tests {
     /// deduplicated (both Findings below share `stg_customers` as their
     /// impacted Node).
     #[test]
-    fn with_recommended_command_includes_exactly_the_downstream_impact_nodes() {
+    fn with_impacted_models_includes_exactly_the_downstream_impact_nodes() {
         let findings = vec![
             Finding {
                 severity: Severity::Error,
@@ -1323,11 +1320,11 @@ mod tests {
                 },
             },
         ];
-        let report = Report::new(&[], &findings).with_recommended_command(&DbtVocabulary);
+        let report = Report::new(&[], &findings).with_impacted_models(&DbtVocabulary);
 
         assert_eq!(
-            report.recommended_command.as_deref(),
-            Some("dbt build --select dim_customers stg_customers"),
+            report.impacted_models,
+            vec!["dim_customers".to_string(), "stg_customers".to_string()],
             "should include dim_customers (via the reached Finding) and stg_customers \
              (via the type-narrowed Finding on itself) exactly once each, and never \
              stg_orders (only a pass-severity Finding, not Downstream impact)"
@@ -1337,12 +1334,12 @@ mod tests {
     /// Regression test for the bug an earlier version of this method had:
     /// a Node reached only via the Baseline (e.g. one that no longer
     /// exists in the current state at all, for
-    /// `ColumnRemovedWithActiveReferences`) must still be named in the
-    /// recommended command -- this method no longer looks Nodes up
+    /// `ColumnRemovedWithActiveReferences`) must still be named in
+    /// `impacted_models` -- this method no longer looks Nodes up
     /// against a `ParsedProject` at all, precisely so there's nothing to
     /// fail to resolve.
     #[test]
-    fn with_recommended_command_includes_a_node_that_no_longer_exists_anywhere_but_its_id() {
+    fn with_impacted_models_includes_a_node_that_no_longer_exists_anywhere_but_its_id() {
         let findings = vec![Finding {
             severity: Severity::Error,
             detail: FindingDetail::ColumnRemovedWithActiveReferences {
@@ -1352,24 +1349,24 @@ mod tests {
                 reached_column: zhao_core::model::ColumnName::new("a_id"),
             },
         }];
-        let report = Report::new(&[], &findings).with_recommended_command(&DbtVocabulary);
+        let report = Report::new(&[], &findings).with_impacted_models(&DbtVocabulary);
 
         assert_eq!(
-            report.recommended_command.as_deref(),
-            Some("dbt build --select deleted_downstream_model"),
+            report.impacted_models,
+            vec!["deleted_downstream_model".to_string()],
         );
     }
 
-    /// Acceptance criterion 2: a run with zero impacted Nodes produces no
-    /// recommended command.
+    /// Acceptance criterion 2: a run with zero impacted Nodes produces an
+    /// empty impacted-models list.
     #[test]
-    fn with_recommended_command_is_none_when_nothing_is_impactful() {
+    fn with_impacted_models_is_empty_when_nothing_is_impactful() {
         // No Findings at all.
-        let report = Report::new(&[], &[]).with_recommended_command(&DbtVocabulary);
-        assert_eq!(report.recommended_command, None);
+        let report = Report::new(&[], &[]).with_impacted_models(&DbtVocabulary);
+        assert_eq!(report.impacted_models, Vec::<String>::new());
 
         // A Finding exists, but it's pass-severity -- not Downstream
-        // impact, so still nothing to recommend.
+        // impact, so still nothing impacted.
         let findings = vec![Finding {
             severity: Severity::Pass,
             detail: FindingDetail::ColumnAdded {
@@ -1377,14 +1374,14 @@ mod tests {
                 column: zhao_core::model::ColumnName::new("new_col"),
             },
         }];
-        let report = Report::new(&[], &findings).with_recommended_command(&DbtVocabulary);
-        assert_eq!(report.recommended_command, None);
+        let report = Report::new(&[], &findings).with_impacted_models(&DbtVocabulary);
+        assert_eq!(report.impacted_models, Vec::<String>::new());
     }
 
-    /// `render_text` appends the recommended command as a final line when
+    /// `render_text` appends the impacted-models line as a final line when
     /// present, and omits it entirely when absent.
     #[test]
-    fn render_text_appends_the_recommended_command_when_present() {
+    fn render_text_appends_the_impacted_models_line_when_present() {
         let findings = vec![Finding {
             severity: Severity::Error,
             detail: FindingDetail::ColumnRemovedWithActiveReferences {
@@ -1395,24 +1392,21 @@ mod tests {
             },
         }];
         let report = Report::new(&[], &findings)
-            .with_recommended_command(&DbtVocabulary)
+            .with_impacted_models(&DbtVocabulary)
             .with_staleness_warning(false);
 
         let text = render_text(&report, &DbtVocabulary, false);
 
-        assert!(
-            text.contains("Recommended: dbt build --select stg_customers"),
-            "{text}"
-        );
+        assert!(text.contains("Impacted models: stg_customers"), "{text}");
     }
 
     #[test]
-    fn render_text_omits_the_recommended_command_line_when_absent() {
+    fn render_text_omits_the_impacted_models_line_when_absent() {
         let report = Report::new(&[], &[]);
 
         let text = render_text(&report, &DbtVocabulary, false);
 
-        assert!(!text.contains("Recommended:"), "{text}");
+        assert!(!text.contains("Impacted models:"), "{text}");
     }
 
     /// A minimal `ParsedProject` with one Node per `(id, name)` pair and
@@ -1619,7 +1613,7 @@ mod tests {
     /// A configured `defer.state` produces a ready-to-run command naming
     /// exactly the build set and the configured state path.
     #[test]
-    fn defer_settings_with_a_state_path_produce_a_ready_to_run_command() {
+    fn defer_settings_with_a_state_path_surface_it_on_the_plan() {
         let current = project_with_edges(vec![node_edge(
             "model.zhao_dbt_test.stg_orders",
             "model.zhao_dbt_test.dim_customers",
@@ -1642,26 +1636,20 @@ mod tests {
 
         let plan = report.defer_plan.as_ref().expect("plan should be present");
         assert_eq!(plan.target.as_deref(), Some("prod"));
-        assert_eq!(
-            plan.command.as_deref(),
-            Some("dbt build --select dim_customers --defer --state artifacts/prod/manifest.json")
-        );
+        assert_eq!(plan.state.as_deref(), Some("artifacts/prod/manifest.json"));
 
         let text = render_text(&report, &DbtVocabulary, false);
         assert!(text.contains("Target: prod"), "{text}");
         assert!(
-            text.contains(
-                "Command: dbt build --select dim_customers --defer --state artifacts/prod/manifest.json"
-            ),
+            text.contains("State: artifacts/prod/manifest.json"),
             "{text}"
         );
     }
 
     /// A `defer.target` with no `defer.state` still labels the plan (for
-    /// documentation purposes), but produces no command at all -- dbt's
-    /// `--defer` mechanism has nothing to function without a state path.
+    /// documentation purposes), but surfaces no state path at all.
     #[test]
-    fn defer_settings_with_only_a_target_produce_no_command() {
+    fn defer_settings_with_only_a_target_produce_no_state() {
         let current = project_with_edges(Vec::new());
         let findings = vec![Finding {
             severity: Severity::Warn,
@@ -1681,15 +1669,14 @@ mod tests {
 
         let plan = report.defer_plan.expect("plan should be present");
         assert_eq!(plan.target.as_deref(), Some("prod"));
-        assert!(plan.command.is_none());
+        assert!(plan.state.is_none());
     }
 
     /// The symmetric case: `state` configured with no `target` still
-    /// produces a full command (dbt's `--defer` only needs the state
-    /// path to function), just with no human-readable label alongside
-    /// it.
+    /// surfaces the state path, just with no human-readable label
+    /// alongside it.
     #[test]
-    fn defer_settings_with_only_a_state_produce_a_command_but_no_target() {
+    fn defer_settings_with_only_a_state_surface_it_with_no_target() {
         let current = project_with_edges(Vec::new());
         let findings = vec![Finding {
             severity: Severity::Warn,
@@ -1709,21 +1696,18 @@ mod tests {
 
         let plan = report.defer_plan.as_ref().expect("plan should be present");
         assert!(plan.target.is_none());
-        assert_eq!(
-            plan.command.as_deref(),
-            Some("dbt build --select dim_customers --defer --state artifacts/prod/manifest.json")
-        );
+        assert_eq!(plan.state.as_deref(), Some("artifacts/prod/manifest.json"));
 
         let text = render_text(&report, &DbtVocabulary, false);
         assert!(!text.contains("Target:"), "{text}");
-        assert!(text.contains("Command:"), "{text}");
+        assert!(text.contains("State:"), "{text}");
     }
 
-    /// A state path containing a space is quoted in the generated
-    /// command -- an unquoted path would silently misbehave if a user
-    /// copy-pastes the command into a shell.
+    /// The state path is surfaced completely raw/verbatim, even one
+    /// containing spaces or other shell-special characters -- there's no
+    /// command being constructed here for it to need quoting into.
     #[test]
-    fn a_state_path_containing_a_space_is_quoted_in_the_generated_command() {
+    fn a_state_path_with_spaces_is_surfaced_verbatim() {
         let current = project_with_edges(Vec::new());
         let findings = vec![Finding {
             severity: Severity::Warn,
@@ -1743,18 +1727,16 @@ mod tests {
 
         let plan = report.defer_plan.expect("plan should be present");
         assert_eq!(
-            plan.command.as_deref(),
-            Some(
-                "dbt build --select dim_customers --defer --state 'artifacts/My Manifests/prod/manifest.json'"
-            )
+            plan.state.as_deref(),
+            Some("artifacts/My Manifests/prod/manifest.json")
         );
     }
 
     /// Default (unconfigured) `DeferSettings` produce neither a target
-    /// label nor a command -- the plan's build/defer lists alone, exactly
-    /// as before this feature existed.
+    /// label nor a state path -- the plan's build/defer lists alone,
+    /// exactly as before this feature existed.
     #[test]
-    fn default_defer_settings_produce_neither_target_nor_command() {
+    fn default_defer_settings_produce_neither_target_nor_state() {
         let current = project_with_edges(Vec::new());
         let findings = vec![Finding {
             severity: Severity::Warn,
@@ -1773,7 +1755,7 @@ mod tests {
 
         let plan = report.defer_plan.expect("plan should be present");
         assert!(plan.target.is_none());
-        assert!(plan.command.is_none());
+        assert!(plan.state.is_none());
     }
 
     /// Acceptance criterion 1: a schema-changing Change on an incremental

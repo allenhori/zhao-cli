@@ -69,18 +69,34 @@ pub enum RuleId {
     /// tracked at that granularity (a nested field access always
     /// collapses to its base column, see the dbt adapter's module-level
     /// "Known limitations" doc comment), so this fires unconditionally on
-    /// every detected removal rather than only a referenced one. Default
-    /// `error`, the same tier `ColumnRemovedWithActiveReferences` uses.
+    /// every detected removal rather than only a referenced one. `error`
+    /// by default.
     StructFieldRemoved,
     /// A field was added to a `STRUCT`-typed column's internal shape.
-    /// Informational by default, the same as [`RuleId::ColumnAdded`] one
-    /// level up.
+    /// `error` by default -- deliberately *not* the same tier as
+    /// [`RuleId::ColumnAdded`] (`pass`) one level up, even though neither
+    /// can break a *reference* to something that didn't exist before:
+    /// unlike a new top-level column (which most warehouses accept via
+    /// plain schema evolution), adding a field to an existing `STRUCT`
+    /// column breaks an incremental `MERGE`/`INSERT` on an
+    /// already-materialized table without manual intervention on at
+    /// least Databricks/Delta Lake -- confirmed against a real Databricks
+    /// workspace, not just documentation: `[DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION]
+    /// Cannot cast struct<a:string,b:string> to struct<a:string>. All
+    /// nested columns must match.` A team that's confirmed their own
+    /// warehouse/materialization combination tolerates this can still
+    /// relax it to `warn`/`pass` via `zhao.yml`.
     StructFieldAdded,
     /// A field within a `STRUCT`-typed column's internal shape narrowed
     /// its documented type (the same narrow, integer-width-only
     /// comparison [`RuleId::ColumnTypeNarrowed`] uses -- see the
-    /// module-level "Known limitations" doc comment). `warn` by default,
-    /// the same tier `ColumnTypeNarrowed` uses.
+    /// module-level "Known limitations" doc comment). `error` by
+    /// default -- deliberately stricter than [`RuleId::ColumnTypeNarrowed`]'s
+    /// `warn`: struct-internal changes are easy to miss in a PR diff
+    /// (nested inside a column, not a new/removed top-level column), and
+    /// the same schema-mismatch risk [`RuleId::StructFieldAdded`]'s doc
+    /// comment describes applies here too. Relax to `warn`/`pass` via
+    /// `zhao.yml` if a team has confirmed it's safe for their own setup.
     StructFieldTypeNarrowed,
 }
 
@@ -93,8 +109,8 @@ impl RuleId {
             RuleId::JoinCardinalityLoosened => Severity::Warn,
             RuleId::ColumnAdded => Severity::Pass,
             RuleId::StructFieldRemoved => Severity::Error,
-            RuleId::StructFieldAdded => Severity::Pass,
-            RuleId::StructFieldTypeNarrowed => Severity::Warn,
+            RuleId::StructFieldAdded => Severity::Error,
+            RuleId::StructFieldTypeNarrowed => Severity::Error,
         }
     }
 
@@ -839,10 +855,14 @@ mod tests {
         );
     }
 
-    /// Acceptance criterion (b): a struct field being added is detected as
-    /// non-breaking/pass, matching `column-added`'s own precedent.
+    /// Acceptance criterion (b): a struct field being added fires at
+    /// `error`, deliberately stricter than `column-added`'s `pass` --
+    /// confirmed against a real Databricks workspace that this genuinely
+    /// breaks an incremental `MERGE` without manual intervention, unlike
+    /// a new top-level column (see [`RuleId::StructFieldAdded`]'s doc
+    /// comment).
     #[test]
-    fn struct_field_added_fires_as_pass_severity() {
+    fn struct_field_added_fires_as_error_severity() {
         let changes = vec![Change::StructFieldAdded {
             node: node_id("model.a"),
             column: column("payload"),
@@ -852,7 +872,7 @@ mod tests {
         assert_eq!(
             evaluate(&empty_project(), &changes, &Config::default()),
             vec![Finding {
-                severity: Severity::Pass,
+                severity: Severity::Error,
                 detail: FindingDetail::StructFieldAdded {
                     node: node_id("model.a"),
                     column: column("payload"),
@@ -862,6 +882,10 @@ mod tests {
         );
     }
 
+    /// `error` by default -- deliberately stricter than
+    /// `column-type-narrowed`'s `warn`, since struct-internal changes are
+    /// easy to miss in a PR diff (see [`RuleId::StructFieldTypeNarrowed`]'s
+    /// doc comment).
     #[test]
     fn struct_field_type_narrowed_fires_on_a_recognized_narrowing() {
         let changes = vec![Change::StructFieldTypeChanged {
@@ -875,7 +899,7 @@ mod tests {
         assert_eq!(
             evaluate(&empty_project(), &changes, &Config::default()),
             vec![Finding {
-                severity: Severity::Warn,
+                severity: Severity::Error,
                 detail: FindingDetail::StructFieldTypeNarrowed {
                     node: node_id("model.a"),
                     column: column("payload"),
@@ -985,18 +1009,10 @@ mod tests {
         assert!(rules.contains(&RuleId::StructFieldAdded));
         assert!(rules.contains(&RuleId::StructFieldTypeNarrowed));
 
+        // All three fire at `error` by default -- struct-internal changes
+        // are stricter across the board than their top-level counterparts
+        // (see each `RuleId` variant's own doc comment for why).
         let severities: Vec<Severity> = findings.iter().map(|f| f.severity).collect();
-        assert_eq!(
-            severities.iter().filter(|s| **s == Severity::Error).count(),
-            1
-        );
-        assert_eq!(
-            severities.iter().filter(|s| **s == Severity::Warn).count(),
-            1
-        );
-        assert_eq!(
-            severities.iter().filter(|s| **s == Severity::Pass).count(),
-            1
-        );
+        assert!(severities.iter().all(|s| *s == Severity::Error));
     }
 }

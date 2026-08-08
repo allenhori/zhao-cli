@@ -70,7 +70,7 @@ Downstream impact:
 
 Summary: 2 model(s) changed, 3 column(s) changed, 1 breaking, 1 warning
 
-Recommended: dbt build --select stg_customers dim_customers
+Impacted models: stg_customers, dim_customers
 ```
 
 Three things happened here that a plain text diff of the SQL never gives you:
@@ -80,8 +80,9 @@ Three things happened here that a plain text diff of the SQL never gives you:
 2. **Downstream impact** — exactly which models are actually reached by each change, each
    labeled `BREAKING` or `WARN`, with the specific reference that makes it so. Nothing
    downstream of the change is silently swept in; nothing unrelated is silently omitted.
-3. A ready-to-copy `dbt build --select ...` command scoped to exactly the impacted models —
-   so validating the fix doesn't mean rebuilding your whole project.
+3. A plain list of exactly the impacted models — build your own `dbt build --select ...` (or
+   whatever your CI actually invokes) scoped to that list, so validating the fix doesn't mean
+   rebuilding your whole project.
 
 `zhao check` exits non-zero exactly when something `BREAKING` fired — wire it straight into
 CI (see [CI integration](ci-integration.md)).

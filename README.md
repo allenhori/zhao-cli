@@ -13,9 +13,9 @@ Downstream impact:
   model model.jaffle_shop.dim_customers:
     [BREAKING] last_name removed from model model.jaffle_shop.stg_customers breaks reference via last_name (column-removed-with-active-references)
 
-Summary: 1 model(s) changed, 1 column(s) changed, 1 breaking
+Summary: 1 model(s) changed, 1 column(s) changed, 1 breaking, 0 warning
 
-Recommended: dbt build --select dim_customers
+Impacted models: dim_customers
 ```
 
 ## Why
@@ -150,10 +150,9 @@ zhao never reads, collects, or stores your actual data — no row values, nothin
 that metadata stays on your own filesystem, under `target/zhao/`, unless you decide otherwise.
 Nothing is ever sent anywhere automatically: `zhao-cli` makes no network call of its own
 except `zhao update`, which only downloads a release binary — it doesn't send anything from
-your project. If you separately choose to use zhao-cloud, metadata only ever leaves your
-machine when you explicitly trigger that upload yourself — a command you run manually, or one
-you wrote into your own CI pipeline — never silently, and never as a side effect of
-`check`/`diff`/`lineage`.
+your project. Nothing about your project ever leaves your machine as a side effect of
+`check`/`diff`/`lineage` — the metadata they write stays under `target/zhao/`, yours to do
+whatever you want with, including nothing at all.
 
 zhao also never generates or applies schema-evolution DDL for you: it detects that a change
 needs manual evolution or a backfill; the decision and the mechanism stay entirely yours.

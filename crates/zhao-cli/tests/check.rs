@@ -238,7 +238,7 @@ fn no_color_flag_produces_byte_for_byte_plain_text() {
              \n\
              Summary: 2 model(s) changed, 4 column(s) changed, 1 breaking, 1 warning\n\
              \n\
-             Recommended: dbt build --select stg_customers dim_customers\n\
+             Impacted models: stg_customers, dim_customers\n\
              \n\
              Defer plan:\n\
              \x20 Build: stg_customers, dim_customers\n\
@@ -398,10 +398,10 @@ fn exits_zero_when_nothing_breaking_is_found() {
         .stdout(predicate::str::contains("\"findings\": []"));
 }
 
-/// Acceptance criterion 1: the generated selector's set of Nodes exactly
-/// matches the Nodes named in the Downstream impact section.
+/// Acceptance criterion 1: the impacted-models list exactly matches the
+/// Nodes named in the Downstream impact section.
 #[test]
-fn recommended_command_matches_the_downstream_impact_nodes() {
+fn impacted_models_matches_the_downstream_impact_nodes() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("check")
@@ -414,15 +414,16 @@ fn recommended_command_matches_the_downstream_impact_nodes() {
         .assert()
         .code(1)
         .stdout(predicate::str::contains(
-            "\"recommended_command\": \"dbt build --select stg_customers dim_customers\"",
+            "\"impacted_models\": [\n    \"stg_customers\",\n    \"dim_customers\"\n  ]",
         ));
 }
 
-/// Acceptance criterion 2: a run with zero impacted Nodes produces no
-/// recommended command -- covers both "zero Changes at all" and "a Change
-/// exists but its only Finding is pass-severity" (not Downstream impact).
+/// Acceptance criterion 2: a run with zero impacted Nodes still surfaces
+/// `impacted_models`, but empty -- covers both "zero Changes at all" and
+/// "a Change exists but its only Finding is pass-severity" (not
+/// Downstream impact).
 #[test]
-fn no_recommended_command_when_nothing_is_impactful() {
+fn impacted_models_is_empty_when_nothing_is_impactful() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("check")
@@ -434,7 +435,7 @@ fn no_recommended_command_when_nothing_is_impactful() {
         .arg("json")
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("recommended_command").not());
+        .stdout(predicate::str::contains("\"impacted_models\": []"));
 
     Command::cargo_bin("zhao")
         .expect("binary should build")
@@ -447,7 +448,7 @@ fn no_recommended_command_when_nothing_is_impactful() {
         .arg("json")
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("recommended_command").not());
+        .stdout(predicate::str::contains("\"impacted_models\": []"));
 }
 
 /// Acceptance criterion 1: given a fixture project and a Change reaching a
@@ -506,10 +507,10 @@ fn defer_plan_appears_in_human_readable_output() {
 
 /// `--defer-target`/`--defer-state` (no `zhao.yml` involved -- the
 /// config-cascading behavior itself is covered at the `zhao_core::config`
-/// unit level) produce a ready-to-run `--defer --state <path>` command on
-/// the plan, in both output formats.
+/// unit level) surface the configured state path on the plan, in both
+/// output formats.
 #[test]
-fn defer_target_and_state_flags_produce_a_ready_to_run_command() {
+fn defer_target_and_state_flags_surface_the_state_path() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("check")
@@ -526,12 +527,12 @@ fn defer_target_and_state_flags_produce_a_ready_to_run_command() {
         .code(1)
         .stdout(
             predicate::str::contains("Target: prod").and(predicate::str::contains(
-                "Command: dbt build --select stg_customers dim_customers --defer --state artifacts/prod/manifest.json",
+                "State: artifacts/prod/manifest.json",
             )),
         );
 }
 
-/// The same flags in `--format json` land on the `defer_plan.command`/
+/// The same flags in `--format json` land on the `defer_plan.state`/
 /// `defer_plan.target` keys.
 #[test]
 fn defer_target_and_state_flags_appear_in_json_output() {
@@ -552,16 +553,16 @@ fn defer_target_and_state_flags_appear_in_json_output() {
         .code(1)
         .stdout(
             predicate::str::contains("\"target\": \"prod\"").and(predicate::str::contains(
-                "\"command\": \"dbt build --select stg_customers dim_customers --defer --state artifacts/prod/manifest.json\"",
+                "\"state\": \"artifacts/prod/manifest.json\"",
             )),
         );
 }
 
 /// Without either flag (and no `zhao.yml` `defer:` section in this
-/// fixture), the plan carries neither a target label nor a command --
+/// fixture), the plan carries neither a target label nor a state path --
 /// exactly the pre-existing behavior.
 #[test]
-fn no_defer_flags_produce_no_target_or_command() {
+fn no_defer_flags_produce_no_target_or_state() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("check")
@@ -575,13 +576,13 @@ fn no_defer_flags_produce_no_target_or_command() {
         .stdout(
             predicate::str::contains("Defer plan:\n")
                 .and(predicate::str::contains("Target:").not())
-                .and(predicate::str::contains("Command:").not()),
+                .and(predicate::str::contains("State:").not()),
         );
 }
 
 /// `zhao.yml`'s own `defer:` section (with no CLI flag given) surfaces
 /// its configured target/state, proving the config path itself -- not
-/// just the CLI-flag path -- reaches the generated command.
+/// just the CLI-flag path -- reaches the plan.
 #[test]
 fn zhao_yml_defer_config_surfaces_without_any_cli_flag() {
     Command::cargo_bin("zhao")
@@ -596,14 +597,14 @@ fn zhao_yml_defer_config_surfaces_without_any_cli_flag() {
         .code(1)
         .stdout(
             predicate::str::contains("Target: staging").and(predicate::str::contains(
-                "Command: dbt build --select stg_customers dim_customers --defer --state artifacts/staging/manifest.json",
+                "State: artifacts/staging/manifest.json",
             )),
         );
 }
 
 /// A `--defer-target`/`--defer-state` CLI flag overrides a *conflicting*
-/// `zhao.yml` `defer:` value -- not just producing a command when
-/// `zhao.yml` has none at all (`defer_target_and_state_flags_produce_a_ready_to_run_command`
+/// `zhao.yml` `defer:` value -- not just producing a state path when
+/// `zhao.yml` has none at all (`defer_target_and_state_flags_surface_the_state_path`
 /// already covers that weaker case).
 #[test]
 fn defer_flags_override_a_conflicting_zhao_yml_defer_config() {
@@ -624,7 +625,7 @@ fn defer_flags_override_a_conflicting_zhao_yml_defer_config() {
         .stdout(
             predicate::str::contains("Target: prod")
                 .and(predicate::str::contains(
-                    "Command: dbt build --select stg_customers dim_customers --defer --state artifacts/prod/manifest.json",
+                    "State: artifacts/prod/manifest.json",
                 ))
                 .and(predicate::str::contains("staging").not())
                 .and(predicate::str::contains("artifacts/staging").not()),
@@ -633,7 +634,7 @@ fn defer_flags_override_a_conflicting_zhao_yml_defer_config() {
 
 /// A run with zero impacted Nodes produces no defer plan (nothing to
 /// build, so no plan makes sense) -- mirrors
-/// `no_recommended_command_when_nothing_is_impactful`.
+/// `impacted_models_is_empty_when_nothing_is_impactful`.
 #[test]
 fn no_defer_plan_when_nothing_is_impactful() {
     Command::cargo_bin("zhao")

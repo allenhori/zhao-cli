@@ -112,17 +112,6 @@ impl AdapterVocabulary for DbtVocabulary {
         "source"
     }
 
-    fn recommended_validation_command(&self, node_ids: &[String]) -> Option<String> {
-        if node_ids.is_empty() {
-            return None;
-        }
-        let names: Vec<String> = node_ids
-            .iter()
-            .map(|id| self.node_display_name(id))
-            .collect();
-        Some(format!("dbt build --select {}", names.join(" ")))
-    }
-
     fn node_display_name(&self, node_id: &str) -> String {
         // A dbt `unique_id` is always shaped `<resource_type>.<package>.<name>`
         // (dbt itself constructs it that way; model names can't contain
@@ -377,7 +366,7 @@ fn read_manifest(path: &Path) -> Result<RawManifest, DbtAdapterError> {
 /// Splits `dbt_command` into a program plus any leading prefix arguments,
 /// shell-word-style -- so a value like `"uv run dbt"`, or a custom wrapper
 /// a project's own tooling already uses instead of invoking `dbt`
-/// directly (e.g. `"dw some-flag"`), works as a genuine multi-word
+/// directly (e.g. `"myshell custom-flag"`), works as a genuine multi-word
 /// prefix rather than being mistaken for one literal executable named
 /// `"uv run dbt"`. Shared by [`run_dbt_subcommand`] and
 /// [`DbtQueryExecutor::run_operation`], the two places that actually spawn
@@ -3004,37 +2993,6 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
 
         let result = executor.run_macro("some_other_macro", &HashMap::new());
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn recommended_validation_command_derives_bare_names_from_unique_ids() {
-        let command = DbtVocabulary.recommended_validation_command(&[
-            "model.zhao_dbt_test.stg_customers".to_string(),
-            "model.zhao_dbt_test.dim_customers".to_string(),
-        ]);
-
-        assert_eq!(
-            command.as_deref(),
-            Some("dbt build --select stg_customers dim_customers")
-        );
-    }
-
-    /// The Node's own bare name is derivable straight from its `NodeId`
-    /// string -- no lookup against a real `Node` needed -- so even an ID
-    /// with no corresponding `Node` anywhere (e.g. one that only ever
-    /// existed in a Baseline that's since been deleted) still produces a
-    /// sensible, selectable name.
-    #[test]
-    fn recommended_validation_command_works_without_a_real_node_to_look_up() {
-        let command = DbtVocabulary
-            .recommended_validation_command(&["model.zhao_dbt_test.long_gone".to_string()]);
-
-        assert_eq!(command.as_deref(), Some("dbt build --select long_gone"));
-    }
-
-    #[test]
-    fn recommended_validation_command_is_none_for_an_empty_list() {
-        assert_eq!(DbtVocabulary.recommended_validation_command(&[]), None);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Writes `target/zhao/run-metadata.json`: the full Change/Rule/Lineage
 //! Edge breakdown for a `zhao check`/`zhao diff` run, as a standalone
-//! artifact any consumer (a future zhao-cloud, a hand-rolled dashboard, a
-//! curious engineer with `jq`) can read without re-running zhao itself.
+//! artifact any consumer (a hand-rolled dashboard, a curious engineer
+//! with `jq`, some other tooling entirely) can read without re-running
+//! zhao itself.
 //!
 //! Deliberately minimal and self-contained: no raw row data, no
 //! connection strings or credentials, no cloud service/API/endpoint
@@ -28,7 +29,7 @@ use crate::report::Report;
 pub struct RunMetadata<'a> {
     /// Every field a `--format json` run of `zhao check`/`zhao diff`
     /// would print: `changes`, `findings`, `staleness_warning` (if any),
-    /// `recommended_command` (if any). Borrowed, not owned, so building
+    /// `impacted_models`. Borrowed, not owned, so building
     /// this doesn't require giving up the caller's own copy of `report`
     /// (e.g. still needed afterward to compute an exit code).
     #[serde(flatten)]

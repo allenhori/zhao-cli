@@ -114,24 +114,17 @@ pub trait AdapterVocabulary {
     /// This tool's word for an [`crate::model::Origin`] (e.g. "source" for dbt).
     fn origin_term(&self) -> &'static str;
 
-    /// A ready-to-run command, in this tool's own selector syntax,
-    /// recommending exactly which Nodes to validate -- `node_ids` are
-    /// zhao's own qualified `NodeId` strings (e.g. a dbt model's
-    /// `unique_id`, `model.<package>.<name>`); this tool derives its own
-    /// selectable name for each from that string itself, rather than
-    /// requiring a caller to look up a full `Node` first -- a Node
-    /// reached only via the Baseline (e.g. one deleted entirely in the
-    /// current state) may have no corresponding `Node` to look up at all,
-    /// but its ID string is still enough to name it. `None` if `node_ids`
-    /// is empty: there's nothing to recommend validating.
-    fn recommended_validation_command(&self, node_ids: &[String]) -> Option<String>;
-
     /// Derives this tool's own selectable/display name for a single Node
-    /// from its zhao `NodeId` string -- the same name
-    /// [`AdapterVocabulary::recommended_validation_command`] uses for each
-    /// Node it names, exposed separately so a caller building its own
-    /// Node list (e.g. a `--defer` plan's build/defer sets) can render
-    /// them the same way, without needing a full `Node` to look up either.
+    /// from its zhao `NodeId` string (e.g. a dbt model's `unique_id`,
+    /// `model.<package>.<name>`, becomes just the bare model name) --
+    /// rather than requiring a caller to look up a full `Node` first: a
+    /// Node reached only via the Baseline (e.g. one deleted entirely in
+    /// the current state) may have no corresponding `Node` to look up at
+    /// all, but its ID string is still enough to name it. Used to build
+    /// the impacted-models list and a `--defer` plan's build/defer sets --
+    /// deliberately just names, never a constructed command: zhao has no
+    /// way to know whether a project's CI actually invokes `dbt build`,
+    /// `dbt run`, or some custom wrapper, so it never assumes one.
     fn node_display_name(&self, node_id: &str) -> String;
 }
 

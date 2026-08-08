@@ -227,7 +227,7 @@ pub struct CheckArgs {
     /// ordinarily just `"dbt"`, resolved via `PATH`. Accepts a multi-word
     /// prefix (shell-word-split, same as `--dbt-args`), so a project
     /// already using its own wrapper instead of invoking `dbt` directly
-    /// (e.g. `"uv run dbt"`, or a custom wrapper like `"dw some-flag"`)
+    /// (e.g. `"uv run dbt"`, or a custom wrapper like `"myshell custom-flag"`)
     /// can point zhao at that instead. Overrides `zhao.yml`'s
     /// `dbt-command` when given; with neither set, defaults to `"dbt"`.
     #[arg(long = "dbt-command", allow_hyphen_values = true)]
