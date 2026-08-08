@@ -1,8 +1,10 @@
 # zhao (曌)
 
-**A free, offline, deterministic breaking-change gate for dbt.** zhao reads your dbt
-project's compiled SQL and tells a reviewer exactly what a pull request changed and which
-downstream models it actually reaches — before anyone has to trace the DAG by hand.
+Named for the character Empress Wu Zetian invented for herself: 明 (sun and moon) over 空
+(sky) — "illuminating everything below." **A free, offline, deterministic breaking-change
+gate for dbt.** zhao reads your dbt project's compiled SQL and tells a reviewer exactly what
+a pull request changed and which downstream models it actually reaches — before anyone has
+to trace the DAG by hand.
 
 ```
 Changed:
