@@ -37,8 +37,10 @@ fn copy_zhao_binary_to_a_fresh_temp_file() -> tempfile::TempPath {
 
 /// Acceptance criterion: `zhao update <version>` pins to that exact
 /// release, actually replacing the binary on disk. Pinned to a real,
-/// permanent tag (`v0.1.0`) rather than "latest," so this test's
-/// expectations don't drift as new stable releases are cut.
+/// permanent tag (`v0.2.0` -- the oldest release still published;
+/// everything before it was deleted in a pre-launch cleanup) rather
+/// than "latest," so this test's expectations don't drift as new
+/// stable releases are cut.
 #[test]
 fn update_to_a_pinned_version_replaces_the_binary() {
     let temp_copy = copy_zhao_binary_to_a_fresh_temp_file();
@@ -46,10 +48,10 @@ fn update_to_a_pinned_version_replaces_the_binary() {
 
     let status = std::process::Command::new(&temp_copy)
         .arg("update")
-        .arg("v0.1.0")
+        .arg("v0.2.0")
         .status()
         .expect("command should run");
-    assert!(status.success(), "zhao update v0.1.0 should succeed");
+    assert!(status.success(), "zhao update v0.2.0 should succeed");
 
     let after = std::fs::read(&temp_copy).expect("should read the post-update binary");
     assert_ne!(

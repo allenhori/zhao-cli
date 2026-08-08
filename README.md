@@ -101,8 +101,11 @@ offline in one HTML file.
 
 ![Clicking a model, expanding columns, then tracing a calculated column's real upstream source](docs/assets/lineage-demo.gif)
 
-**[Open the live demo](docs/assets/lineage-demo.html)** to try it yourself. More in
-**[docs/lineage-html.md](docs/lineage-html.md)**.
+**[Open the live demo](https://htmlpreview.github.io/?https://github.com/allenhori/zhao-cli/blob/master/docs/assets/lineage-demo.html)**
+to try it yourself (rendered via [htmlpreview.github.io](https://github.com/htmlpreview/htmlpreview.github.com),
+since GitHub shows raw HTML as source rather than rendering it — the
+[file itself](docs/assets/lineage-demo.html) is also there to download and open locally). More
+in **[docs/lineage-html.md](docs/lineage-html.md)**.
 
 ## Configuration
 
