@@ -1,5 +1,8 @@
 # zhao (曌)
 
+[![Crates.io](https://img.shields.io/crates/v/zhao-cli.svg)](https://crates.io/crates/zhao-cli)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 Named for the character Empress Wu Zetian invented for herself: 明 (sun and moon) over 空
 (sky) — "illuminating everything below." **A free, offline, deterministic breaking-change
 gate for dbt.** zhao reads your dbt project's compiled SQL and tells a reviewer exactly what
@@ -44,7 +47,9 @@ curl -fsSL https://raw.githubusercontent.com/allenhori/zhao-cli/master/scripts/i
 Downloads the right pre-built binary for your platform from the
 [releases page](https://github.com/allenhori/zhao-cli/releases) — no Rust toolchain needed.
 Windows: grab `zhao-x86_64-pc-windows-msvc.zip` from the same page. Rust users:
-`cargo install --git https://github.com/allenhori/zhao-cli`.
+`cargo install zhao-cli` (via [crates.io](https://crates.io/crates/zhao-cli)), or
+`cargo install --git https://github.com/allenhori/zhao-cli` to build directly off `master`
+instead of the last tagged release.
 
 Two release channels: a tagged **stable** release (`v0.1.0`, ...) for anything you depend
 on, and a rolling **nightly** build off `master`, always available at the
