@@ -60,6 +60,32 @@ impl ResolvedAdapter {
         }
     }
 
+    /// See [`DbtAdapter::catalog_available`].
+    ///
+    /// Deliberately *not* part of [`TransformationToolAdapter`] itself,
+    /// same "not generalized to a hypothetical second adapter yet"
+    /// reasoning as [`Self::adapter_type`] below.
+    pub fn catalog_available(&self, manifest_path: &Path) -> bool {
+        match self {
+            ResolvedAdapter::Dbt(adapter) => adapter.catalog_available(manifest_path),
+        }
+    }
+
+    /// See [`DbtAdapter::parse_for_comparison`] -- used by `zhao check`/
+    /// `zhao diff`'s Baseline-vs-current comparison path (`engine.rs`/
+    /// `baseline.rs`) instead of plain [`Self::parse`], so catalog-backed
+    /// wildcard expansion can be forced off symmetrically on both sides
+    /// when they don't agree on `catalog.json` availability.
+    pub fn parse_for_comparison(
+        &self,
+        path: &Path,
+        use_catalog: bool,
+    ) -> Result<ParsedProject, DbtAdapterError> {
+        match self {
+            ResolvedAdapter::Dbt(adapter) => adapter.parse_for_comparison(path, use_catalog),
+        }
+    }
+
     /// See [`TransformationToolAdapter::compile`].
     pub fn compile(
         &self,

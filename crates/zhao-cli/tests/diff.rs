@@ -169,3 +169,33 @@ fn diff_supports_human_readable_output() {
                 .and(predicate::str::contains("Summary:")),
         );
 }
+
+/// Regression test: a Baseline (here, an explicit `--state` manifest with
+/// no sibling `catalog.json` -- the same shape a real git-native Baseline
+/// almost always has, since it's compiled in a throwaway worktree that
+/// never runs `dbt docs generate`) must never be diffed against a current
+/// state that *does* have a `catalog.json`. Both fixtures define an
+/// identical model whose only projection is `SELECT * FROM <source>` --
+/// if catalog-backed wildcard expansion applied to just the current side,
+/// it would get real columns (`id`, `amount`) while the Baseline stayed
+/// at zero, producing two spurious `column_added` Changes on every run.
+/// With catalog usage suppressed symmetrically, both sides resolve to
+/// zero columns for this model and the diff is empty.
+#[test]
+fn a_catalog_only_available_on_the_current_side_never_produces_spurious_column_added() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("diff")
+        .arg("--state")
+        .arg(fixture("catalog_asymmetry_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("catalog_asymmetry_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(0)
+        .stdout(
+            predicate::str::contains("\"changes\": []")
+                .and(predicate::str::contains("\"column_added\"").not()),
+        );
+}
