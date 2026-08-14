@@ -27,8 +27,8 @@
 //! schema), so a wildcard that would need to enumerate an Origin's columns
 //! can't be expanded from the manifest alone -- only identity ("this
 //! column, whatever it's called, passes through unchanged") relationships
-//! to an Origin are tracked, unless a sibling `catalog.json` is also
-//! available (see [`read_catalog`]).
+//! to an Origin are tracked, unless a sibling `catalog.json` (read by this
+//! adapter's private `read_catalog`) is also available.
 //!
 //! A calculated column (a function call, `CAST`, arithmetic, `CASE`, or one
 //! of `EXTRACT`/`CEIL`/`FLOOR`/`POSITION`/`SUBSTRING`/`TRIM`/`OVERLAY` --
