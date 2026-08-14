@@ -78,11 +78,15 @@
 //! explicitly, and records that shape on
 //! [`crate::model::Column::struct_fields`]. One level deep only (a
 //! nested field that's itself a `STRUCT`, an array-of-structs' element
-//! shape, and a map's value-type evolution are all out of scope), and
-//! *not* propagated across a CTE hop, a rename, or a wildcard expansion
-//! the way lineage `sources` are -- only a column's own immediate SQL in
-//! the model actually being resolved ever produces a shape; see
-//! `ResolvedColumn::struct_fields`'s doc comment (also private).
+//! shape, and a map's value-type evolution are all out of scope). A
+//! shape *is* propagated forward across a CTE hop or a plain
+//! passthrough/rename within the same model (`propagate_struct_shape`),
+//! the same way lineage `sources` already are -- but not through a
+//! wildcard expansion, since a wildcard's only ever working from an
+//! upstream Node's/Origin's bare column *names*, never full `Column`
+//! detail (see `expand_wildcard_of`). See
+//! `ResolvedColumn::struct_fields`'s doc comment (also private) for
+//! exactly what does and doesn't carry a shape forward.
 
 use super::warehouse::{QueryExecutor, RELATION_EXISTS_MACRO, RelationIdentity};
 use super::{AdapterVocabulary, TransformationToolAdapter};
@@ -918,19 +922,24 @@ struct ResolvedColumn {
     name: String,
     sources: Vec<(Upstream, String)>,
     expression: Option<String>,
-    /// This column's `STRUCT` internal field shape, when its *immediate*
-    /// defining expression is a `CAST(... AS STRUCT<...>)` or a
-    /// `STRUCT(...)`/`named_struct(...)` constructor that names every
-    /// field explicitly -- see [`extract_struct_shape`]. `None` otherwise,
-    /// including for a plain passthrough/rename of an upstream struct
-    /// column: unlike `sources` (which carries forward through a CTE hop
-    /// via [`source_of`]), this is deliberately *not* propagated across
-    /// CTE hops or wildcard expansion -- only a column's own immediate
-    /// SQL in *this* model ever produces a shape, matching the "knowable
-    /// from the compiled SQL" scope this feature was built for (see
-    /// [`Column::struct_fields`]'s doc comment). A struct column that's
-    /// merely renamed or passed through, even from an upstream CTE that
-    /// itself had an explicit shape, stays `None` here.
+    /// This column's `STRUCT` internal field shape. Set when either:
+    /// - this column's own *immediate* defining expression is a
+    ///   `CAST(... AS STRUCT<...>)` or a `STRUCT(...)`/`named_struct(...)`
+    ///   constructor that names every field explicitly -- see
+    ///   [`extract_struct_shape`]; or
+    /// - it's a plain (optionally qualified) passthrough/rename of a
+    ///   single already-resolved `Known` column that itself has a shape --
+    ///   see [`propagate_struct_shape`], which carries this forward the
+    ///   same way `sources` already carries lineage forward across a CTE
+    ///   hop (via [`source_of`]).
+    ///
+    /// `None` otherwise -- a calculated expression with no explicit struct
+    /// constructor, a struct-field access one level in (`payload.user_id`
+    /// doesn't carry `payload`'s own shape), a rename sourced from a
+    /// `Passthrough`/`Opaque`/`AmbiguousAlias` relation (an Origin's or an
+    /// unresolved relation's real shape is never known), or a wildcard
+    /// expansion (see [`expand_wildcard_of`], which only ever has bare
+    /// column *names* to work with, never full `Column` detail).
     struct_fields: Option<Vec<StructField>>,
 }
 
@@ -1529,13 +1538,65 @@ fn resolve_expr_column(
         other => other.to_string(),
     });
 
-    let struct_fields = extract_struct_shape(expr);
+    // A column's own immediate defining expression (`extract_struct_shape`)
+    // takes priority when it states a shape explicitly; otherwise, a plain
+    // passthrough/rename of an upstream struct column
+    // (`propagate_struct_shape`) carries that upstream column's
+    // already-resolved shape forward -- the same way `sources` already
+    // carries lineage forward across a CTE hop (see `source_of`) -- so a
+    // struct's field shape now survives a rename or a CTE hop within the
+    // same model, not just its own defining SQL.
+    let struct_fields =
+        extract_struct_shape(expr).or_else(|| propagate_struct_shape(expr, from_scope));
 
     ResolvedColumn {
         name,
         sources,
         expression,
         struct_fields,
+    }
+}
+
+/// Carries a struct-typed column's already-resolved field shape forward
+/// across a plain passthrough/rename -- `expr` is a bare (optionally
+/// qualified) identifier referencing a single already-resolved `Known`
+/// column that itself has a shape (from that column's own immediate
+/// defining expression *or*, transitively, from an earlier hop of this
+/// same propagation -- since a `Known` relation's `struct_fields` is
+/// itself whatever this function already produced for it). Deliberately
+/// narrower than `collect_expr_sources`'s own identifier resolution: only
+/// an unqualified reference against a single relation in scope, or a
+/// 2-part qualified reference (`alias.column`), is attempted -- a struct
+/// shape is a single, specific fact about one column, not something
+/// several ambiguous candidates could plausibly share the way a
+/// calculated column's several *sources* can, so this stays conservative
+/// rather than reusing `resolve_unqualified`/`resolve_qualified`'s
+/// broader (dotted-prefix, multi-source) matching. `None` for anything
+/// else -- a calculated expression, a struct-field access one level in
+/// (`payload.user_id` doesn't carry `payload`'s own shape), a
+/// `Passthrough`/`Opaque`/`AmbiguousAlias` relation, or a column with no
+/// recorded shape at all.
+fn propagate_struct_shape(
+    expr: &Expr,
+    from_scope: &HashMap<String, LocalSchema>,
+) -> Option<Vec<StructField>> {
+    let struct_fields_on = |schema: &LocalSchema, column: &str| match schema {
+        LocalSchema::Known(cols) => cols
+            .iter()
+            .find(|c| c.name == column)
+            .and_then(|c| c.struct_fields.clone()),
+        _ => None,
+    };
+
+    match expr {
+        Expr::Identifier(ident) if from_scope.len() == 1 => {
+            struct_fields_on(from_scope.values().next()?, &ident.value)
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let schema = from_scope.get(&parts[0].value)?;
+            struct_fields_on(schema, &parts[1].value)
+        }
+        _ => None,
     }
 }
 
@@ -2637,6 +2698,73 @@ mod tests {
             }
             other => panic!("expected Known([x]) with an unresolved source, got {other:?}"),
         }
+    }
+
+    /// End-to-end through [`build_parsed_project`] and
+    /// [`crate::diff::diff`]/[`crate::rules::evaluate`]: a struct-internal
+    /// field added between two versions of a model is now correctly
+    /// classified as a breaking change (`RuleId::StructFieldAdded`), even
+    /// though the struct column itself is only ever *renamed* in this
+    /// model's own outermost `SELECT` -- its real shape is defined two CTE
+    /// hops earlier. Before struct-shape propagation, that column's
+    /// `struct_fields` would have been `None` in both the Baseline and
+    /// current state, so this change would have gone entirely undetected.
+    #[test]
+    fn a_struct_field_added_behind_a_cte_hop_is_classified_as_a_breaking_change() {
+        let manifest_json = |fields: &str| {
+            format!(
+                r#"{{
+                    "nodes": {{
+                        "model.p.m": {{
+                            "unique_id": "model.p.m",
+                            "resource_type": "model",
+                            "name": "m",
+                            "database": "db",
+                            "schema": "s",
+                            "alias": "m",
+                            "depends_on": {{"nodes": ["source.p.raw.t"]}},
+                            "compiled_code": "with base as (select cast(x.payload as struct<{fields}>) as payload from \"db\".\"raw\".\"t\" as x) select b.payload as renamed_payload from base as b"
+                        }}
+                    }},
+                    "sources": {{
+                        "source.p.raw.t": {{
+                            "unique_id": "source.p.raw.t",
+                            "name": "t",
+                            "database": "db",
+                            "schema": "raw",
+                            "identifier": "t"
+                        }}
+                    }}
+                }}"#
+            )
+        };
+
+        let baseline_manifest: RawManifest =
+            serde_json::from_str(&manifest_json("user_id int64")).expect("should parse");
+        let current_manifest: RawManifest =
+            serde_json::from_str(&manifest_json("user_id int64, email string"))
+                .expect("should parse");
+
+        let baseline = build_parsed_project(&baseline_manifest, &CatalogSchemas::new());
+        let current = build_parsed_project(&current_manifest, &CatalogSchemas::new());
+
+        let changes = crate::diff::diff(&baseline, &current);
+        let findings =
+            crate::rules::evaluate(&baseline, &changes, &crate::config::Config::default());
+
+        let node_id = NodeId::new("model.p.m");
+        let expected = crate::rules::Finding {
+            severity: crate::rules::Severity::Error,
+            detail: crate::rules::FindingDetail::StructFieldAdded {
+                node: node_id,
+                column: ColumnName::new("renamed_payload"),
+                field: ColumnName::new("email"),
+            },
+        };
+        assert!(
+            findings.contains(&expected),
+            "expected a StructFieldAdded finding for renamed_payload.email, got {findings:?}"
+        );
     }
 
     /// End-to-end through [`build_parsed_project`] (not just
@@ -4278,6 +4406,56 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
                 );
             }
             other => panic!("expected Known([payload with no struct shape]), got {other:?}"),
+        }
+    }
+
+    /// Unlike a rename sourced from a base table (above, where the real
+    /// shape is genuinely never known), a rename sourced from an earlier
+    /// CTE that itself had an explicit struct shape now carries that
+    /// shape forward -- the same way a scalar column's `sources` already
+    /// carry forward across a CTE hop.
+    #[test]
+    fn a_struct_shape_propagates_forward_across_a_cte_hop() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"with base as (
+                select cast(x.payload as struct<user_id int64, name string>) as payload
+                from "db"."s"."t" as x
+            )
+            select b.payload as renamed_payload from base as b"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "renamed_payload");
+                assert_eq!(
+                    cols[0].struct_fields,
+                    Some(vec![
+                        struct_field("user_id", Some("INT64")),
+                        struct_field("name", Some("STRING")),
+                    ]),
+                    "expected the CTE's own explicit struct shape to survive both the CTE hop \
+                     and the rename"
+                );
+            }
+            other => panic!(
+                "expected Known([renamed_payload carrying base.payload's struct shape]), got \
+                 {other:?}"
+            ),
         }
     }
 
