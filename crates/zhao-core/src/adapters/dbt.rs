@@ -225,13 +225,14 @@ impl TransformationToolAdapter for DbtAdapter {
     type CommandOutput = DbtCommandOutput;
 
     fn parse(&self, path: &Path) -> Result<ParsedProject, Self::Error> {
-        let manifest = read_manifest(path)?;
-        // A sibling `catalog.json` (see `read_catalog`) is entirely
-        // optional -- absent, unreadable, or unparseable all silently
-        // degrade to the same `CatalogSchemas::new()` empty map, which
-        // makes every catalog-backed lookup below a no-op, never an error.
-        let catalog = read_catalog(path);
-        Ok(build_parsed_project(&manifest, &catalog))
+        // Unconditionally uses a sibling `catalog.json` when one's
+        // available (see `read_catalog`) -- absent, unreadable, or
+        // unparseable all silently degrade to an empty catalog, which
+        // makes every catalog-backed lookup a no-op, never an error. A
+        // two-sided comparison (`zhao check`/`zhao diff`) must not call
+        // this directly -- see `Self::parse_for_comparison`, which this
+        // just delegates to with catalog usage always on.
+        self.parse_for_comparison(path, true)
     }
 
     fn vocabulary(&self) -> &dyn AdapterVocabulary {
@@ -365,6 +366,62 @@ impl DbtAdapter {
                 ))
             })
             .collect())
+    }
+
+    /// Whether a sibling `catalog.json` next to `manifest_path` is both
+    /// present and would actually contribute at least one relation's real
+    /// column list -- the same "usable" bar this adapter's private
+    /// `read_catalog` itself applies (a missing, unreadable, unparseable,
+    /// or entirely-empty `catalog.json` all count as unavailable here).
+    /// Exposed so a
+    /// two-sided comparison (see [`Self::parse_for_comparison`]) can
+    /// check both sides' availability *before* deciding whether either
+    /// side actually parses with catalog-backed wildcard expansion turned
+    /// on.
+    pub fn catalog_available(&self, manifest_path: &Path) -> bool {
+        !read_catalog(manifest_path).is_empty()
+    }
+
+    /// Like [`TransformationToolAdapter::parse`], but with catalog-backed
+    /// wildcard expansion forced off when `use_catalog` is `false` --
+    /// regardless of whether a real `catalog.json` happens to be sitting
+    /// next to `path`.
+    ///
+    /// This exists for `zhao check`/`zhao diff`'s Baseline-vs-current
+    /// comparison specifically: a Baseline is compiled in a throwaway git
+    /// worktree that only ever runs `dbt compile`, never `dbt docs
+    /// generate`, so it essentially never has a `catalog.json` -- while
+    /// the current state, read straight from the real project's own
+    /// `target/`, picks up whatever `catalog.json` a user's `dbt docs
+    /// generate` run (for any *other* reason) happened to leave there. If
+    /// each side's `parse` were left free to independently decide its own
+    /// catalog usage, a model reading `SELECT *` from a source would get
+    /// real, catalog-expanded columns on the current side and zero
+    /// columns on the Baseline side -- reported as a false-positive
+    /// column addition on *every single run*, for as long as that
+    /// `catalog.json` exists. A diff must never be asymmetric in what
+    /// information it had available on each side, so the caller (see
+    /// `zhao-cli`'s `engine.rs`/`baseline.rs`) checks
+    /// [`Self::catalog_available`] on *both* sides first and only passes
+    /// `use_catalog: true` here when both agree; otherwise both sides
+    /// call this with `false`, falling back to today's plain `Opaque`
+    /// wildcard behavior symmetrically.
+    ///
+    /// `zhao lineage` (a standalone, one-sided query with no comparison
+    /// to keep symmetric) is unaffected -- it still calls plain `parse`,
+    /// which always uses a real `catalog.json` when one is available.
+    pub fn parse_for_comparison(
+        &self,
+        path: &Path,
+        use_catalog: bool,
+    ) -> Result<ParsedProject, DbtAdapterError> {
+        let manifest = read_manifest(path)?;
+        let catalog = if use_catalog {
+            read_catalog(path)
+        } else {
+            CatalogSchemas::new()
+        };
+        Ok(build_parsed_project(&manifest, &catalog))
     }
 }
 
@@ -1487,7 +1544,16 @@ fn expand_wildcard_of(
             )
         }
         LocalSchema::Passthrough(upstream @ Upstream::Origin(id)) => {
-            let cols = catalog.get(id.as_str())?;
+            // An *absent* key already falls back to `Opaque` via `?`
+            // below -- but a key that's *present* with an empty columns
+            // list is just as unusable (a real relation never has zero
+            // columns; an empty entry means catalog.json didn't actually
+            // introspect this relation's columns, not that it genuinely
+            // has none) and must fall back the same way, not be treated
+            // as "known: zero columns." Same guard
+            // `merge_set_operation_arms` already applies to its own
+            // `expand_wildcard_of` results.
+            let cols = catalog.get(id.as_str()).filter(|cols| !cols.is_empty())?;
             Some(
                 cols.iter()
                     .map(|name| ResolvedColumn {
@@ -2167,11 +2233,18 @@ fn resolve_path_on_schema(
 /// whose upstream isn't covered by `catalog`). Used only to disambiguate
 /// an [`LocalSchema::AmbiguousAlias`]'s candidates -- a `Known` schema
 /// answers from its own already-resolved column list; a `Passthrough`
-/// (Node or Origin alike) answers from `catalog` alone, since at this
-/// point in resolution a `Passthrough` Node's own compiled-SQL-derived
-/// column list isn't in scope here (only `resolved_schemas` has that, and
-/// threading it this deep isn't needed when `catalog.json` already covers
-/// the same ground for exactly this purpose).
+/// (Node or Origin alike) answers from `catalog` alone.
+///
+/// Known, deliberately accepted gap: a `Passthrough(Node)` candidate
+/// whose real columns are *already* resolved via `resolved_schemas`
+/// (e.g. the ambiguous alias is a sibling model already fully known from
+/// the manifest, not just from `catalog.json`) still can't be
+/// disambiguated unless `catalog.json` *also* happens to cover it --
+/// `resolved_schemas` isn't threaded this deep (through
+/// `resolve_unqualified`/`resolve_qualified`/`resolve_path_on_schema`)
+/// purely to widen this one narrow case. Never produces a *wrong*
+/// answer, only a more conservative "stays unresolved" one than
+/// theoretically possible.
 fn column_exists_on(schema: &LocalSchema, column: &str, catalog: &CatalogSchemas) -> Option<bool> {
     let upstream_id = match schema {
         LocalSchema::Known(cols) => return Some(cols.iter().any(|c| c.name == column)),
@@ -2673,6 +2746,33 @@ mod tests {
         );
     }
 
+    /// Regression test: a catalog.json entry that's *present* for a
+    /// source but lists zero columns must fall back to `Opaque`, the same
+    /// as an entirely-absent entry -- not `Known([])`, which would
+    /// silently misrepresent "catalog.json didn't actually introspect
+    /// this relation's real columns" as "this relation genuinely has no
+    /// columns."
+    #[test]
+    fn a_wildcard_from_a_source_falls_back_to_opaque_when_the_catalog_entry_is_empty() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert("origin.s.t".to_string(), Vec::new());
+
+        let query = parse_query(r#"select * from "db"."s"."t""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas, &catalog);
+
+        assert!(
+            expand_wildcard_of(&schema, &resolved_schemas, &catalog).is_none(),
+            "expected an empty-but-present catalog entry to still mean the wildcard can't be \
+             expanded, got {schema:?}"
+        );
+    }
+
     /// Two ambiguously-aliased relations (a duplicate `FROM` alias) still
     /// resolve a qualified column reference deterministically when
     /// `catalog.json` shows the column exists on only one of them.
@@ -2889,6 +2989,108 @@ mod tests {
             });
             assert!(has_edge, "expected an identity edge for {column}");
         }
+    }
+
+    /// [`DbtAdapter::parse_for_comparison`] with `use_catalog: false`
+    /// forces `Opaque`-style wildcard behavior even when a real,
+    /// non-empty `catalog.json` is sitting right there -- the whole point
+    /// being to let a caller suppress catalog usage on demand for a
+    /// two-sided comparison, regardless of what's actually on disk. See
+    /// [`DbtAdapter::catalog_available`] for the presence check callers
+    /// use to decide.
+    #[test]
+    fn parse_for_comparison_suppresses_catalog_expansion_when_told_to() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{
+                "nodes": {
+                    "model.p.m": {
+                        "unique_id": "model.p.m",
+                        "resource_type": "model",
+                        "name": "m",
+                        "database": "db",
+                        "schema": "s",
+                        "alias": "m",
+                        "depends_on": {"nodes": ["source.p.raw.t"]},
+                        "compiled_code": "select * from \"db\".\"raw\".\"t\""
+                    }
+                },
+                "sources": {
+                    "source.p.raw.t": {
+                        "unique_id": "source.p.raw.t",
+                        "name": "t",
+                        "database": "db",
+                        "schema": "raw",
+                        "identifier": "t"
+                    }
+                }
+            }"#,
+        )
+        .expect("should write stub manifest.json");
+        std::fs::write(
+            dir.path().join("catalog.json"),
+            r#"{
+                "sources": {
+                    "source.p.raw.t": {
+                        "columns": {
+                            "id": {"name": "id", "index": 1}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("should write stub catalog.json");
+
+        assert!(
+            DbtAdapter.catalog_available(&manifest_path),
+            "expected the stub catalog.json to count as available"
+        );
+
+        let suppressed = DbtAdapter
+            .parse_for_comparison(&manifest_path, false)
+            .expect("should parse");
+        let model = suppressed
+            .nodes
+            .iter()
+            .find(|n| n.name == "m")
+            .expect("model m should exist");
+        assert!(
+            model.columns.is_empty(),
+            "expected use_catalog: false to suppress catalog-backed expansion even though a \
+             real catalog.json exists, got {:?}",
+            model.columns
+        );
+
+        let allowed = DbtAdapter
+            .parse_for_comparison(&manifest_path, true)
+            .expect("should parse");
+        let model = allowed
+            .nodes
+            .iter()
+            .find(|n| n.name == "m")
+            .expect("model m should exist");
+        assert_eq!(
+            model
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id"],
+            "expected use_catalog: true to expand normally"
+        );
+    }
+
+    /// [`DbtAdapter::catalog_available`] is `false` for a project with no
+    /// `catalog.json` at all -- the common case for a Baseline compiled
+    /// in a throwaway worktree that never runs `dbt docs generate`.
+    #[test]
+    fn catalog_available_is_false_with_no_catalog_json() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+
+        assert!(!DbtAdapter.catalog_available(&manifest_path));
     }
 
     /// [`read_catalog`] is fully optional: no sibling `catalog.json` at
