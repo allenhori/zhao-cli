@@ -1334,11 +1334,6 @@ fn resolve_from(
         }
     }
 
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (alias, _) in &collected {
-        *counts.entry(alias.clone()).or_insert(0) += 1;
-    }
-
     // A duplicate alias (two unaliased relations that happen to share a
     // trailing name, or a base table shadowing an earlier CTE) means we
     // can no longer trust which relation a later *unqualified* reference
@@ -1394,7 +1389,10 @@ fn collect_table_factor(
         return;
     }
 
-    if let TableFactor::Table { name, alias, .. } = factor {
+    if let TableFactor::Table {
+        name, alias, args, ..
+    } = factor
+    {
         let parts: Vec<String> = name
             .0
             .iter()
@@ -1405,7 +1403,19 @@ fn collect_table_factor(
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| parts.last().cloned().unwrap_or_default());
 
-        let resolved = if parts.len() == 3 {
+        // `args: Some(..)` means this is actually a table-valued function
+        // call (`generate_series(1, 10) AS g`), not a plain table/CTE
+        // reference -- sqlparser folds that shape into `TableFactor::Table`
+        // rather than giving it its own variant in every case. A TVF's
+        // name lives in a different SQL namespace than a table/CTE name,
+        // so it must never be looked up against `scope`/`known_relations`
+        // (a TVF that happens to share its bare name with an in-scope CTE
+        // is legal SQL, and must not silently resolve to that CTE) --
+        // stays `Opaque` unconditionally, the same "not attempted" outcome
+        // as `TableFactor::TableFunction` below.
+        let resolved = if args.is_some() {
+            LocalSchema::Opaque
+        } else if parts.len() == 3 {
             let qualified = (parts[0].clone(), parts[1].clone(), parts[2].clone());
             match known_relations.get(&qualified) {
                 Some(upstream) => LocalSchema::Passthrough(upstream.clone()),
@@ -1421,11 +1431,12 @@ fn collect_table_factor(
 
         collected.push((effective_alias, resolved));
     }
-    // A table-valued function in FROM (`TableFactor::TableFunction`, or a
-    // `TableFactor::Table` whose `args` is `Some(..)`): not attempted, see
-    // module-level "Known limitations" doc comment. Simply not pushed into
-    // `collected` -- its alias never enters `from_scope`, so any reference
-    // to it resolves the same way any other unrecognized name would.
+    // A table-valued function represented as `TableFactor::TableFunction`
+    // (rather than `TableFactor::Table` with `args: Some(..)`, handled
+    // above): not attempted, see module-level "Known limitations" doc
+    // comment. Simply not pushed into `collected` -- its alias never
+    // enters `from_scope`, so any reference to it resolves the same way
+    // any other unrecognized name would.
 }
 
 /// Expands a bare `SELECT *` mixed with other projections, or where
@@ -2564,6 +2575,42 @@ mod tests {
             matches!(schema, LocalSchema::Opaque),
             "expected Opaque for a table-valued function in FROM, got {schema:?}"
         );
+    }
+
+    /// Regression test: a table-valued function call in `FROM` whose bare
+    /// name happens to collide with an in-scope CTE's name (a legal SQL
+    /// namespace collision -- a TVF call and a table/CTE reference are
+    /// distinguished by the presence of `(...)`, not by name) must not
+    /// silently resolve to that CTE's schema.
+    #[test]
+    fn a_table_valued_function_sharing_a_ctes_name_does_not_resolve_to_that_cte() {
+        let known_relations = HashMap::new();
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            "with generate_series as (select id from t) \
+             select g.id from generate_series(1, 10) as g",
+        )
+        .expect("should parse");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert!(
+                    cols[0].sources.is_empty(),
+                    "a table-valued function call must never resolve as though it were a \
+                     reference to a same-named CTE, got {:?}",
+                    cols[0].sources
+                );
+            }
+            other => panic!("expected Known([id]) with an unresolved source, got {other:?}"),
+        }
     }
 
     /// `SELECT *` reading directly from a source resolves correctly when a
