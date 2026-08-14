@@ -31,7 +31,10 @@ pub enum BaselineError {
     Dbt(#[from] DbtAdapterError),
 }
 
-/// Resolves the Baseline `zhao check` diffs the current project against.
+/// Resolves the Baseline `zhao check` diffs the current project against,
+/// alongside whether catalog-backed wildcard expansion (see
+/// [`crate::adapter::ResolvedAdapter::parse_for_comparison`]) actually
+/// got used for it.
 ///
 /// `adapter` is the already-resolved Transformation Tool Adapter (see
 /// `crate::adapter::ResolvedAdapter`) -- every `parse`/`compile`/`deps`
@@ -64,6 +67,24 @@ pub enum BaselineError {
 /// command" precedent `target/zhao/run-metadata.json` already follows.
 /// Only meaningful for this git-native path -- `--state <path>` returns
 /// above, before anything is compiled, so there's nothing to capture.
+///
+/// `current_catalog_available` -- whether the *current* state's own
+/// `target/catalog.json` is present and usable (see
+/// `ResolvedAdapter::catalog_available`, checked by the caller against
+/// `<project_dir>/target/manifest.json` before this function is even
+/// called) -- decides, together with this Baseline's own catalog
+/// availability (checked here, against wherever this Baseline actually
+/// parses from), whether the returned [`ParsedProject`] uses
+/// catalog-backed wildcard expansion at all: only when *both* sides have
+/// one. A git-native Baseline is compiled in a throwaway worktree that
+/// never runs `dbt docs generate`, so it essentially always lacks a
+/// `catalog.json` -- meaning this almost always resolves to `false`
+/// regardless of the current state, and both sides fall back to today's
+/// plain `Opaque` wildcard behavior symmetrically. See
+/// `ResolvedAdapter::parse_for_comparison`'s doc comment for why this
+/// matters: an asymmetric catalog would otherwise manufacture a
+/// spurious `ColumnAdded` finding for every `SELECT *`-from-a-source
+/// column, on every single run.
 pub fn resolve(
     adapter: &ResolvedAdapter,
     state_path: Option<&Path>,
@@ -71,14 +92,17 @@ pub fn resolve(
     against: &str,
     dbt_command: &str,
     extra_args: &[String],
-) -> Result<ParsedProject, BaselineError> {
+    current_catalog_available: bool,
+) -> Result<(ParsedProject, bool), BaselineError> {
     if let Some(path) = state_path {
-        return adapter
-            .parse(path)
+        let use_catalog = current_catalog_available && adapter.catalog_available(path);
+        let project = adapter
+            .parse_for_comparison(path, use_catalog)
             .map_err(|source| BaselineError::Manifest {
                 path: path.display().to_string(),
                 source,
-            });
+            })?;
+        return Ok((project, use_catalog));
     }
 
     let repo_root = git::repo_root(project_dir)?;
@@ -113,7 +137,9 @@ pub fn resolve(
 
     let manifest_path = worktree_project_dir.join("target").join("manifest.json");
     capture_baseline_manifest(&manifest_path, project_dir);
-    Ok(adapter.parse(&manifest_path)?)
+    let use_catalog = current_catalog_available && adapter.catalog_available(&manifest_path);
+    let project = adapter.parse_for_comparison(&manifest_path, use_catalog)?;
+    Ok((project, use_catalog))
 }
 
 /// Routes a `dbt compile`/`dbt deps` subcommand's captured stdout/stderr

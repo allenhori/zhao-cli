@@ -12,17 +12,23 @@
 //!
 //! Column-level resolution handles the common shape of dbt-compiled SQL:
 //! a chain of CTEs feeding a final `SELECT`, `SELECT *` passthrough, plain
-//! and qualified column references, and simple aliasing. It deliberately
-//! does not attempt to resolve columns through `UNION`/`UNION ALL`, inline
-//! subqueries in a `FROM` clause (as opposed to CTEs), or window functions --
-//! those cases fall back to an unresolved (but still node-level-tracked)
-//! dependency rather than a guessed column mapping. Getting a column
-//! mapping wrong silently would be worse than not having one. Likewise, an
-//! Origin's real columns are never known (dbt's manifest doesn't carry a
-//! source's actual schema), so a wildcard that would need to enumerate an
-//! Origin's columns can't be expanded -- only identity ("this column,
-//! whatever it's called, passes through unchanged") relationships to an
-//! Origin are tracked.
+//! and qualified column references, and simple aliasing. It also resolves
+//! `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` (each arm resolved
+//! independently, then merged column-by-column -- see
+//! `merge_set_operation_arms`) and an inline subquery directly in a `FROM`
+//! clause (resolved as a nested scope, the same machinery a `WITH`-defined
+//! CTE already uses -- see `resolve_query_in_scope`). It deliberately does
+//! not attempt to resolve columns through a table-valued function in
+//! `FROM` or a window function -- those cases fall back to an unresolved
+//! (but still node-level-tracked) dependency rather than a guessed column
+//! mapping. Getting a column mapping wrong silently would be worse than
+//! not having one. Likewise, an Origin's real columns are never known from
+//! `manifest.json` alone (dbt's manifest doesn't carry a source's actual
+//! schema), so a wildcard that would need to enumerate an Origin's columns
+//! can't be expanded from the manifest alone -- only identity ("this
+//! column, whatever it's called, passes through unchanged") relationships
+//! to an Origin are tracked, unless a sibling `catalog.json` (read by this
+//! adapter's private `read_catalog`) is also available.
 //!
 //! A calculated column (a function call, `CAST`, arithmetic, `CASE`, or one
 //! of `EXTRACT`/`CEIL`/`FLOOR`/`POSITION`/`SUBSTRING`/`TRIM`/`OVERLAY` --
@@ -72,11 +78,15 @@
 //! explicitly, and records that shape on
 //! [`crate::model::Column::struct_fields`]. One level deep only (a
 //! nested field that's itself a `STRUCT`, an array-of-structs' element
-//! shape, and a map's value-type evolution are all out of scope), and
-//! *not* propagated across a CTE hop, a rename, or a wildcard expansion
-//! the way lineage `sources` are -- only a column's own immediate SQL in
-//! the model actually being resolved ever produces a shape; see
-//! `ResolvedColumn::struct_fields`'s doc comment (also private).
+//! shape, and a map's value-type evolution are all out of scope). A
+//! shape *is* propagated forward across a CTE hop or a plain
+//! passthrough/rename within the same model (`propagate_struct_shape`),
+//! the same way lineage `sources` already are -- but not through a
+//! wildcard expansion, since a wildcard's only ever working from an
+//! upstream Node's/Origin's bare column *names*, never full `Column`
+//! detail (see `expand_wildcard_of`). See
+//! `ResolvedColumn::struct_fields`'s doc comment (also private) for
+//! exactly what does and doesn't carry a shape forward.
 
 use super::warehouse::{QueryExecutor, RELATION_EXISTS_MACRO, RelationIdentity};
 use super::{AdapterVocabulary, TransformationToolAdapter};
@@ -89,7 +99,10 @@ use sqlparser::ast::{
     AccessExpr, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select,
     SelectItem, SetExpr, Statement, Subscript, TableFactor, TableWithJoins, Value,
 };
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{
+    BigQueryDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect, MySqlDialect,
+    PostgreSqlDialect, RedshiftSqlDialect, SnowflakeDialect, SparkSqlDialect,
+};
 use sqlparser::parser::Parser as SqlParser;
 use std::collections::HashMap;
 use std::fs;
@@ -212,7 +225,14 @@ impl TransformationToolAdapter for DbtAdapter {
     type CommandOutput = DbtCommandOutput;
 
     fn parse(&self, path: &Path) -> Result<ParsedProject, Self::Error> {
-        Ok(build_parsed_project(&read_manifest(path)?))
+        // Unconditionally uses a sibling `catalog.json` when one's
+        // available (see `read_catalog`) -- absent, unreadable, or
+        // unparseable all silently degrade to an empty catalog, which
+        // makes every catalog-backed lookup a no-op, never an error. A
+        // two-sided comparison (`zhao check`/`zhao diff`) must not call
+        // this directly -- see `Self::parse_for_comparison`, which this
+        // just delegates to with catalog usage always on.
+        self.parse_for_comparison(path, true)
     }
 
     fn vocabulary(&self) -> &dyn AdapterVocabulary {
@@ -347,6 +367,62 @@ impl DbtAdapter {
             })
             .collect())
     }
+
+    /// Whether a sibling `catalog.json` next to `manifest_path` is both
+    /// present and would actually contribute at least one relation's real
+    /// column list -- the same "usable" bar this adapter's private
+    /// `read_catalog` itself applies (a missing, unreadable, unparseable,
+    /// or entirely-empty `catalog.json` all count as unavailable here).
+    /// Exposed so a
+    /// two-sided comparison (see [`Self::parse_for_comparison`]) can
+    /// check both sides' availability *before* deciding whether either
+    /// side actually parses with catalog-backed wildcard expansion turned
+    /// on.
+    pub fn catalog_available(&self, manifest_path: &Path) -> bool {
+        !read_catalog(manifest_path).is_empty()
+    }
+
+    /// Like [`TransformationToolAdapter::parse`], but with catalog-backed
+    /// wildcard expansion forced off when `use_catalog` is `false` --
+    /// regardless of whether a real `catalog.json` happens to be sitting
+    /// next to `path`.
+    ///
+    /// This exists for `zhao check`/`zhao diff`'s Baseline-vs-current
+    /// comparison specifically: a Baseline is compiled in a throwaway git
+    /// worktree that only ever runs `dbt compile`, never `dbt docs
+    /// generate`, so it essentially never has a `catalog.json` -- while
+    /// the current state, read straight from the real project's own
+    /// `target/`, picks up whatever `catalog.json` a user's `dbt docs
+    /// generate` run (for any *other* reason) happened to leave there. If
+    /// each side's `parse` were left free to independently decide its own
+    /// catalog usage, a model reading `SELECT *` from a source would get
+    /// real, catalog-expanded columns on the current side and zero
+    /// columns on the Baseline side -- reported as a false-positive
+    /// column addition on *every single run*, for as long as that
+    /// `catalog.json` exists. A diff must never be asymmetric in what
+    /// information it had available on each side, so the caller (see
+    /// `zhao-cli`'s `engine.rs`/`baseline.rs`) checks
+    /// [`Self::catalog_available`] on *both* sides first and only passes
+    /// `use_catalog: true` here when both agree; otherwise both sides
+    /// call this with `false`, falling back to today's plain `Opaque`
+    /// wildcard behavior symmetrically.
+    ///
+    /// `zhao lineage` (a standalone, one-sided query with no comparison
+    /// to keep symmetric) is unaffected -- it still calls plain `parse`,
+    /// which always uses a real `catalog.json` when one is available.
+    pub fn parse_for_comparison(
+        &self,
+        path: &Path,
+        use_catalog: bool,
+    ) -> Result<ParsedProject, DbtAdapterError> {
+        let manifest = read_manifest(path)?;
+        let catalog = if use_catalog {
+            read_catalog(path)
+        } else {
+            CatalogSchemas::new()
+        };
+        Ok(build_parsed_project(&manifest, &catalog))
+    }
 }
 
 /// Reads and parses a manifest at `path` -- the shared first step of
@@ -361,6 +437,108 @@ fn read_manifest(path: &Path) -> Result<RawManifest, DbtAdapterError> {
         path: path.display().to_string(),
         source,
     })
+}
+
+/// Every model's or source's real column names, as introspected from the
+/// warehouse and recorded in dbt's `catalog.json` artifact (produced by
+/// `dbt docs generate`, not `dbt compile` -- so it's a genuinely optional,
+/// separately-generated file), keyed by `unique_id` -- the same key
+/// `manifest.json`'s own `nodes`/`sources` maps use, and so directly
+/// comparable to an [`Upstream::Node`]'s or [`Upstream::Origin`]'s own id.
+/// Column order matches the warehouse's own column ordering (`catalog.json`
+/// records each column's `index`; see [`RawCatalogColumn`]).
+///
+/// Unlike `manifest.json`, whose columns are only ever whatever a project's
+/// `schema.yml` happens to document (see the module-level doc comment),
+/// `catalog.json`'s columns are the real, complete output schema -- which
+/// is what makes it useful for expanding a `SELECT *` read directly from a
+/// source (an Origin's real columns are otherwise never knowable at all)
+/// and for disambiguating an otherwise-ambiguous duplicate `FROM` alias
+/// (see [`LocalSchema::AmbiguousAlias`]).
+type CatalogSchemas = HashMap<String, Vec<String>>;
+
+/// Reads and parses a sibling `catalog.json` next to the manifest at
+/// `manifest_path` (dbt always writes both to the same `target/`
+/// directory), producing an empty [`CatalogSchemas`] -- exactly as if no
+/// catalog-backed resolution were available at all -- for any reason it
+/// can't: no sibling directory, the file doesn't exist, it can't be read,
+/// or its contents aren't valid `catalog.json` JSON. This is deliberately
+/// infallible (unlike [`read_manifest`]): a `catalog.json` is optional
+/// bonus detail a project may never have generated (it takes a live
+/// warehouse connection and a separate `dbt docs generate` run, unlike
+/// `manifest.json` which every `dbt compile` already produces), so its
+/// absence must never surface as an adapter error, only as today's
+/// existing `Opaque`/unexpanded-wildcard behavior.
+fn read_catalog(manifest_path: &Path) -> CatalogSchemas {
+    let Some(dir) = manifest_path.parent() else {
+        return CatalogSchemas::new();
+    };
+    let Ok(raw) = fs::read_to_string(dir.join("catalog.json")) else {
+        return CatalogSchemas::new();
+    };
+    let Ok(catalog) = serde_json::from_str::<RawCatalog>(&raw) else {
+        return CatalogSchemas::new();
+    };
+    build_catalog_schemas(&catalog)
+}
+
+/// Flattens a parsed [`RawCatalog`]'s `nodes` and `sources` maps (both
+/// keyed by `unique_id`, identically shaped) into one [`CatalogSchemas`],
+/// each relation's columns ordered by `catalog.json`'s own recorded
+/// `index`.
+fn build_catalog_schemas(catalog: &RawCatalog) -> CatalogSchemas {
+    catalog
+        .nodes
+        .iter()
+        .chain(catalog.sources.iter())
+        .map(|(unique_id, relation)| {
+            let mut columns: Vec<(i64, String)> = relation
+                .columns
+                .iter()
+                .map(|(key, column)| {
+                    let name = column.name.clone().unwrap_or_else(|| key.clone());
+                    (column.index.unwrap_or(i64::MAX), name)
+                })
+                .collect();
+            columns.sort_by_key(|(index, _)| *index);
+            (
+                unique_id.clone(),
+                columns.into_iter().map(|(_, name)| name).collect(),
+            )
+        })
+        .collect()
+}
+
+/// `catalog.json`'s top-level shape: `nodes` (models) and `sources`, each
+/// keyed by the same `unique_id` `manifest.json` itself uses.
+#[derive(Debug, Default, Deserialize)]
+struct RawCatalog {
+    #[serde(default)]
+    nodes: HashMap<String, RawCatalogRelation>,
+    #[serde(default)]
+    sources: HashMap<String, RawCatalogRelation>,
+}
+
+/// A single relation's entry in `catalog.json` -- only its real,
+/// warehouse-introspected column list is consulted.
+#[derive(Debug, Default, Deserialize)]
+struct RawCatalogRelation {
+    #[serde(default)]
+    columns: HashMap<String, RawCatalogColumn>,
+}
+
+/// A single column's entry in `catalog.json`. The map key it's stored
+/// under (in [`RawCatalogRelation::columns`]) is usually the column's own
+/// name, but dbt sometimes normalizes that key's casing per-warehouse
+/// (e.g. Snowflake's uppercased keys) -- `name` is the column's real,
+/// un-normalized name as dbt itself records it, preferred over the map key
+/// whenever present.
+#[derive(Debug, Default, Deserialize)]
+struct RawCatalogColumn {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    index: Option<i64>,
 }
 
 /// Splits `dbt_command` into a program plus any leading prefix arguments,
@@ -535,7 +713,7 @@ type QualifiedName = (String, String, String);
 // Orchestration: manifest -> ParsedProject
 // ---------------------------------------------------------------------
 
-fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
+fn build_parsed_project(manifest: &RawManifest, catalog: &CatalogSchemas) -> ParsedProject {
     // Only "model" entries missing a usable qualified name are skipped
     // (rather than failing the whole manifest) -- see the doc comment on
     // `RawNode`'s `database`/`schema`/`alias` fields for why those are
@@ -583,6 +761,12 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
     // upstream's already-resolved column list to expand.
     let ordered = topological_order(&models);
 
+    // Every model in one manifest was compiled against the same target,
+    // so one dialect (picked once, from the manifest's own
+    // `metadata.adapter_type`) applies to every model's `compiled_code` --
+    // see `resolve_sql_dialect`.
+    let dialect = resolve_sql_dialect(manifest.metadata.adapter_type.as_deref());
+
     let mut nodes = Vec::with_capacity(ordered.len());
     let mut edges = Vec::new();
     let mut resolved_schemas: HashMap<NodeId, Vec<ColumnName>> = HashMap::new();
@@ -590,60 +774,57 @@ fn build_parsed_project(manifest: &RawManifest) -> ParsedProject {
     for model in ordered {
         let node_id = NodeId::new(model.unique_id.clone());
 
-        let parsed_query = model.compiled_code.as_deref().and_then(parse_query);
+        let parsed_query = model
+            .compiled_code
+            .as_deref()
+            .and_then(|sql| parse_query_with_dialect(sql, dialect.as_ref()));
         let local_schema = parsed_query
             .as_ref()
-            .map(|query| resolve_query(query, &known_relations, &resolved_schemas))
+            .map(|query| resolve_query(query, &known_relations, &resolved_schemas, catalog))
             .unwrap_or(LocalSchema::Opaque);
         let joins = parsed_query.as_ref().map(extract_joins).unwrap_or_default();
 
-        let columns: Vec<ColumnName> = match &local_schema {
-            LocalSchema::Known(cols) => cols
-                .iter()
-                .map(|c| ColumnName::new(c.name.clone()))
-                .collect(),
-            LocalSchema::Passthrough(Upstream::Node(upstream_id)) => resolved_schemas
-                .get(upstream_id)
-                .cloned()
-                .unwrap_or_default(),
-            // An Origin's real columns are never known -- see module docs.
-            LocalSchema::Passthrough(Upstream::Origin(_)) | LocalSchema::Opaque => Vec::new(),
-        };
+        // A pure passthrough (`SELECT * FROM <one thing>`, propagated
+        // unchanged by `resolve_select`) is expanded into a concrete
+        // column list the same way any other wildcard is: always possible
+        // for an upstream Node (its real columns are already resolved);
+        // for an upstream Origin, only when a `catalog.json` covers it
+        // (see `expand_wildcard_of`/`read_catalog`) -- absent that, an
+        // Origin's real columns still aren't known, same as before
+        // catalog-backed resolution existed. `Known` expands to exactly
+        // its own already-resolved column list; `Opaque`/`AmbiguousAlias`
+        // never expand.
+        let expanded = expand_wildcard_of(&local_schema, &resolved_schemas, catalog);
+
+        let columns: Vec<ColumnName> = expanded
+            .as_ref()
+            .map(|cols| {
+                cols.iter()
+                    .map(|c| ColumnName::new(c.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Column-level edges, from whatever was resolved. A calculated
         // column can carry more than one source (see the module-level
         // "Known limitations" doc comment) -- one edge per referenced
-        // upstream column.
-        match &local_schema {
-            LocalSchema::Known(cols) => {
-                for col in cols {
-                    for (upstream, upstream_col) in &col.sources {
-                        edges.push(LineageEdge {
-                            upstream: upstream.clone(),
-                            downstream: node_id.clone(),
-                            column: Some(ColumnLineage {
-                                upstream_column: ColumnName::new(upstream_col.clone()),
-                                downstream_column: ColumnName::new(col.name.clone()),
-                            }),
-                        });
-                    }
-                }
-            }
-            LocalSchema::Passthrough(Upstream::Node(upstream_id)) => {
-                // A pure `SELECT * FROM <upstream node>`: every column
-                // passes through unchanged, one edge per column.
-                for column in &columns {
+        // upstream column. `Known` and `Passthrough` (Node or, now,
+        // catalog-covered Origin) both flow through `expanded` uniformly;
+        // `expanded` is `None` for `Opaque`/`AmbiguousAlias`, or an
+        // unresolvable `Passthrough`, so no edges are added for those.
+        if let Some(cols) = &expanded {
+            for col in cols {
+                for (upstream, upstream_col) in &col.sources {
                     edges.push(LineageEdge {
-                        upstream: Upstream::Node(upstream_id.clone()),
+                        upstream: upstream.clone(),
                         downstream: node_id.clone(),
                         column: Some(ColumnLineage {
-                            upstream_column: column.clone(),
-                            downstream_column: column.clone(),
+                            upstream_column: ColumnName::new(upstream_col.clone()),
+                            downstream_column: ColumnName::new(col.name.clone()),
                         }),
                     });
                 }
             }
-            LocalSchema::Passthrough(Upstream::Origin(_)) | LocalSchema::Opaque => {}
         }
 
         // Baseline node-level edges from dbt's own dependency list, for
@@ -798,19 +979,24 @@ struct ResolvedColumn {
     name: String,
     sources: Vec<(Upstream, String)>,
     expression: Option<String>,
-    /// This column's `STRUCT` internal field shape, when its *immediate*
-    /// defining expression is a `CAST(... AS STRUCT<...>)` or a
-    /// `STRUCT(...)`/`named_struct(...)` constructor that names every
-    /// field explicitly -- see [`extract_struct_shape`]. `None` otherwise,
-    /// including for a plain passthrough/rename of an upstream struct
-    /// column: unlike `sources` (which carries forward through a CTE hop
-    /// via [`source_of`]), this is deliberately *not* propagated across
-    /// CTE hops or wildcard expansion -- only a column's own immediate
-    /// SQL in *this* model ever produces a shape, matching the "knowable
-    /// from the compiled SQL" scope this feature was built for (see
-    /// [`Column::struct_fields`]'s doc comment). A struct column that's
-    /// merely renamed or passed through, even from an upstream CTE that
-    /// itself had an explicit shape, stays `None` here.
+    /// This column's `STRUCT` internal field shape. Set when either:
+    /// - this column's own *immediate* defining expression is a
+    ///   `CAST(... AS STRUCT<...>)` or a `STRUCT(...)`/`named_struct(...)`
+    ///   constructor that names every field explicitly -- see
+    ///   [`extract_struct_shape`]; or
+    /// - it's a plain (optionally qualified) passthrough/rename of a
+    ///   single already-resolved `Known` column that itself has a shape --
+    ///   see [`propagate_struct_shape`], which carries this forward the
+    ///   same way `sources` already carries lineage forward across a CTE
+    ///   hop (via [`source_of`]).
+    ///
+    /// `None` otherwise -- a calculated expression with no explicit struct
+    /// constructor, a struct-field access one level in (`payload.user_id`
+    /// doesn't carry `payload`'s own shape), a rename sourced from a
+    /// `Passthrough`/`Opaque`/`AmbiguousAlias` relation (an Origin's or an
+    /// unresolved relation's real shape is never known), or a wildcard
+    /// expansion (see [`expand_wildcard_of`], which only ever has bare
+    /// column *names* to work with, never full `Column` detail).
     struct_fields: Option<Vec<StructField>>,
 }
 
@@ -825,18 +1011,76 @@ enum LocalSchema {
     Passthrough(Upstream),
     /// An explicit, fully-known projection list.
     Known(Vec<ResolvedColumn>),
-    /// Couldn't resolve (e.g. a `UNION`, a subquery in `FROM`, or an
-    /// ambiguous unqualified wildcard) -- opaque past this point.
+    /// Couldn't resolve (e.g. a table-valued function in `FROM`, a window
+    /// function, or an ambiguous unqualified wildcard) -- opaque past this
+    /// point.
     Opaque,
+    /// Two or more relations in a `FROM` clause ended up sharing the same
+    /// alias (two unaliased relations whose trailing name collides, or a
+    /// base table shadowing an earlier CTE) -- produced by [`resolve_from`]
+    /// instead of immediately collapsing to `Opaque`, so a later *qualified*
+    /// reference to this alias still has a chance at column-by-column
+    /// disambiguation: if a `catalog.json` (see [`read_catalog`]) is
+    /// available and shows the referenced column exists on only one of
+    /// these candidates, [`resolve_path_on_schema`] resolves through that
+    /// one; if it's on more than one (or catalog data doesn't cover all of
+    /// them), it still correctly comes out unresolved, same as before this
+    /// variant existed. An *unqualified* reference never disambiguates
+    /// through this -- see `resolve_unqualified`, which only ever matches
+    /// `Known`/`Passthrough` schemas, so an ambiguous alias simply
+    /// contributes nothing there, exactly as an opaque one already did.
+    AmbiguousAlias(Vec<LocalSchema>),
 }
 
+/// Parses `sql` against [`GenericDialect`] -- the default every existing
+/// caller/test in this module used before dialect-aware parsing existed,
+/// and still what every test that isn't specifically exercising a
+/// non-generic construct uses. [`build_parsed_project`] itself uses
+/// [`parse_query_with_dialect`] instead, selecting whichever dialect the
+/// manifest's own `metadata.adapter_type` calls for (see
+/// [`resolve_sql_dialect`]). `#[cfg(test)]`-only: nothing in production
+/// code parses against a hardcoded dialect anymore.
+#[cfg(test)]
 fn parse_query(sql: &str) -> Option<Query> {
-    let dialect = GenericDialect {};
-    let statements = SqlParser::parse_sql(&dialect, sql).ok()?;
+    parse_query_with_dialect(sql, &GenericDialect {})
+}
+
+/// Parses `sql` against a specific `dialect` -- see [`resolve_sql_dialect`]
+/// for how a compiled model's own SQL picks one.
+fn parse_query_with_dialect(sql: &str, dialect: &dyn Dialect) -> Option<Query> {
+    let statements = SqlParser::parse_sql(dialect, sql).ok()?;
     statements.into_iter().find_map(|stmt| match stmt {
         Statement::Query(query) => Some(*query),
         _ => None,
     })
+}
+
+/// Selects the `sqlparser` [`Dialect`] matching a manifest's own
+/// `metadata.adapter_type` (dbt's name for whichever warehouse it
+/// compiled against -- see [`RawManifestMetadata`]), so a warehouse-
+/// specific SQL construct a compiled model actually uses parses the way
+/// that warehouse's own SQL dialect defines it, rather than however
+/// [`GenericDialect`] happens to interpret (or reject) the same syntax.
+/// Matched case-insensitively against dbt's own
+/// lowercase adapter names. Falls back to [`GenericDialect`] for an
+/// adapter type this crate doesn't have (or doesn't recognize) a more
+/// specific dialect for -- including `adapter_type` being entirely
+/// absent (an unusually old or nonstandard manifest) -- never an error;
+/// `GenericDialect` is also what this crate always used before
+/// dialect-aware parsing existed, so an unrecognized adapter type is no
+/// worse off than before.
+fn resolve_sql_dialect(adapter_type: Option<&str>) -> Box<dyn Dialect> {
+    match adapter_type.map(str::to_ascii_lowercase).as_deref() {
+        Some("snowflake") => Box::new(SnowflakeDialect),
+        Some("bigquery") => Box::new(BigQueryDialect),
+        Some("databricks") => Box::new(DatabricksDialect),
+        Some("spark") => Box::new(SparkSqlDialect),
+        Some("postgres") => Box::new(PostgreSqlDialect {}),
+        Some("redshift") => Box::new(RedshiftSqlDialect {}),
+        Some("duckdb") => Box::new(DuckDbDialect),
+        Some("mysql") => Box::new(MySqlDialect {}),
+        _ => Box::new(GenericDialect {}),
+    }
 }
 
 /// The kind of each join in a query's final `SELECT`'s `FROM` clause, in
@@ -876,18 +1120,54 @@ fn resolve_query(
     query: &Query,
     known_relations: &HashMap<QualifiedName, Upstream>,
     resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    catalog: &CatalogSchemas,
 ) -> LocalSchema {
-    let mut scope: HashMap<String, LocalSchema> = HashMap::new();
+    resolve_query_in_scope(
+        query,
+        &HashMap::new(),
+        known_relations,
+        resolved_schemas,
+        catalog,
+    )
+}
+
+/// The shared implementation behind [`resolve_query`] and an inline `FROM`
+/// subquery ([`collect_table_factor`]'s `TableFactor::Derived` arm): resolves
+/// `query`'s own CTEs, in order, on top of an `outer_scope` that's already in
+/// effect (empty at the top-level model query; the enclosing query's own
+/// scope for a nested subquery, since a CTE defined in an outer query is
+/// visible to a subquery nested in its `FROM` clause, same as real SQL name
+/// resolution), then resolves `query`'s final body against the combined
+/// scope.
+fn resolve_query_in_scope(
+    query: &Query,
+    outer_scope: &HashMap<String, LocalSchema>,
+    known_relations: &HashMap<QualifiedName, Upstream>,
+    resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    catalog: &CatalogSchemas,
+) -> LocalSchema {
+    let mut scope = outer_scope.clone();
 
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            let resolved =
-                resolve_set_expr(&cte.query.body, &scope, known_relations, resolved_schemas);
+            let resolved = resolve_set_expr(
+                &cte.query.body,
+                &scope,
+                known_relations,
+                resolved_schemas,
+                catalog,
+            );
             scope.insert(cte.alias.name.value.clone(), resolved);
         }
     }
 
-    resolve_set_expr(&query.body, &scope, known_relations, resolved_schemas)
+    resolve_set_expr(
+        &query.body,
+        &scope,
+        known_relations,
+        resolved_schemas,
+        catalog,
+    )
 }
 
 fn resolve_set_expr(
@@ -895,11 +1175,98 @@ fn resolve_set_expr(
     scope: &HashMap<String, LocalSchema>,
     known_relations: &HashMap<QualifiedName, Upstream>,
     resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    catalog: &CatalogSchemas,
 ) -> LocalSchema {
     match body {
-        SetExpr::Select(select) => resolve_select(select, scope, known_relations, resolved_schemas),
-        // UNION/INTERSECT/EXCEPT and anything else: not attempted, see
-        // module-level "Known limitations" doc comment.
+        SetExpr::Select(select) => {
+            resolve_select(select, scope, known_relations, resolved_schemas, catalog)
+        }
+        // A parenthesized subquery body: resolves exactly like the query
+        // it wraps.
+        SetExpr::Query(query) => {
+            resolve_query_in_scope(query, scope, known_relations, resolved_schemas, catalog)
+        }
+        // UNION/INTERSECT/EXCEPT: each arm is resolved independently, then
+        // merged column-by-column (see `merge_set_operation_arms`) --
+        // standard SQL set-operation semantics require both arms to already
+        // have the same column count, in the same positional order.
+        SetExpr::SetOperation { left, right, .. } => {
+            let left_schema =
+                resolve_set_expr(left, scope, known_relations, resolved_schemas, catalog);
+            let right_schema =
+                resolve_set_expr(right, scope, known_relations, resolved_schemas, catalog);
+            merge_set_operation_arms(&left_schema, &right_schema, resolved_schemas, catalog)
+        }
+        // VALUES, and DML bodies that can't legally appear here anyway:
+        // not attempted, see module-level "Known limitations" doc comment.
+        _ => LocalSchema::Opaque,
+    }
+}
+
+/// Merges two already-resolved `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` arms
+/// into the result's own [`LocalSchema`]. Real SQL requires both arms to
+/// project the same number of columns, in the same positional order -- the
+/// *names* don't have to match (the result takes the left arm's names,
+/// exactly as every warehouse does), and at runtime a given output row (and
+/// so a given output column's value) can come from either arm, so a result
+/// column's `sources` is the union of what each arm resolves that same
+/// positional column to. This applies uniformly to `INTERSECT`/`EXCEPT` too,
+/// not just `UNION` -- keeping one merge rule for all three set operators
+/// rather than modeling `EXCEPT`'s row-filtering semantics more precisely.
+///
+/// Either arm can itself already be a `Passthrough` (e.g. `select * from a
+/// union select * from b`) -- those are expanded via
+/// [`expand_wildcard_of`] first, using the same already-resolved-Node
+/// column lists a plain wildcard expansion uses. If both arms can't be
+/// reduced to an explicit, equal-length column list, the whole union is
+/// `Opaque` -- a mismatched shape isn't valid SQL to begin with, and
+/// guessing which columns line up would be worse than admitting we don't
+/// know.
+fn merge_set_operation_arms(
+    left: &LocalSchema,
+    right: &LocalSchema,
+    resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    catalog: &CatalogSchemas,
+) -> LocalSchema {
+    let left_cols = expand_wildcard_of(left, resolved_schemas, catalog);
+    let right_cols = expand_wildcard_of(right, resolved_schemas, catalog);
+
+    match (left_cols, right_cols) {
+        (Some(left_cols), Some(right_cols))
+            if !left_cols.is_empty() && left_cols.len() == right_cols.len() =>
+        {
+            let merged = left_cols
+                .into_iter()
+                .zip(right_cols)
+                .map(|(l, r)| {
+                    let mut sources = l.sources.clone();
+                    for candidate in r.sources {
+                        if !sources.contains(&candidate) {
+                            sources.push(candidate);
+                        }
+                    }
+                    ResolvedColumn {
+                        name: l.name,
+                        sources,
+                        // A calculated column's rendered SQL, or a struct's
+                        // internal shape, can legitimately differ between
+                        // arms -- only report either when both arms agree,
+                        // rather than picking one arm's arbitrarily.
+                        expression: if l.expression == r.expression {
+                            l.expression
+                        } else {
+                            None
+                        },
+                        struct_fields: if l.struct_fields == r.struct_fields {
+                            l.struct_fields
+                        } else {
+                            None
+                        },
+                    }
+                })
+                .collect();
+            LocalSchema::Known(merged)
+        }
         _ => LocalSchema::Opaque,
     }
 }
@@ -909,14 +1276,23 @@ fn resolve_select(
     scope: &HashMap<String, LocalSchema>,
     known_relations: &HashMap<QualifiedName, Upstream>,
     resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    catalog: &CatalogSchemas,
 ) -> LocalSchema {
-    let from_scope = resolve_from(&select.from, scope, known_relations, resolved_schemas);
+    let from_scope = resolve_from(
+        &select.from,
+        scope,
+        known_relations,
+        resolved_schemas,
+        catalog,
+    );
 
     // `SELECT * FROM <one thing>` and nothing else is a pure passthrough:
     // propagate whatever LocalSchema that one thing already resolved to,
     // unchanged, rather than forcing an enumeration we may not be able to
-    // do (e.g. the one thing is itself a passthrough of an Origin, whose
-    // real columns we never know).
+    // do (e.g. the one thing is itself a passthrough of an Origin whose
+    // real columns aren't known -- either because no catalog.json is
+    // available at all, or [`build_parsed_project`]'s later expansion,
+    // shared with every other Passthrough, will use it if there is one).
     if let [SelectItem::Wildcard(_)] = select.projection.as_slice() {
         if from_scope.len() == 1 {
             return from_scope.into_values().next().unwrap();
@@ -926,14 +1302,16 @@ fn resolve_select(
     let mut columns = Vec::new();
     for item in &select.projection {
         match item {
-            SelectItem::Wildcard(_) => match expand_wildcard(&from_scope, resolved_schemas) {
-                Some(mut expanded) => columns.append(&mut expanded),
-                None => return LocalSchema::Opaque,
-            },
+            SelectItem::Wildcard(_) => {
+                match expand_wildcard(&from_scope, resolved_schemas, catalog) {
+                    Some(mut expanded) => columns.append(&mut expanded),
+                    None => return LocalSchema::Opaque,
+                }
+            }
             SelectItem::QualifiedWildcard(kind, _) => {
                 let alias = qualified_wildcard_alias(kind);
                 match alias.and_then(|a| from_scope.get(&a)) {
-                    Some(schema) => match expand_wildcard_of(schema, resolved_schemas) {
+                    Some(schema) => match expand_wildcard_of(schema, resolved_schemas, catalog) {
                         Some(mut expanded) => columns.append(&mut expanded),
                         None => return LocalSchema::Opaque,
                     },
@@ -941,19 +1319,41 @@ fn resolve_select(
                 }
             }
             SelectItem::UnnamedExpr(expr) => {
-                columns.push(resolve_expr_column(expr, None, &from_scope));
+                columns.push(resolve_expr_column(expr, None, &from_scope, catalog));
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 columns.push(resolve_expr_column(
                     expr,
                     Some(alias.value.clone()),
                     &from_scope,
+                    catalog,
                 ));
             }
-            // A Snowflake-specific `expr AS (a, b, c)` tuple-expansion
-            // syntax we don't compile against; not attempted (see module
-            // docs' "Known limitations").
-            SelectItem::ExprWithAliases { .. } => return LocalSchema::Opaque,
+            // Spark/Databricks' parenthesized multi-column alias syntax,
+            // `expr AS (a, b, c)` (e.g. `stack(2, 'a', 'b') AS (col1,
+            // col2)`) -- `sqlparser` gates this behind
+            // `Dialect::supports_select_item_multi_column_alias`, which
+            // `GenericDialect`, `DatabricksDialect`, and `SparkSqlDialect`
+            // all enable (only `SnowflakeDialect` -- despite this arm's
+            // previous doc comment calling it Snowflake-specific -- does
+            // not). `expr` is one expression producing every aliased
+            // output column at once (e.g. a table function's multiple
+            // return columns), so every alias shares the same traced
+            // sources and rendered expression text -- there's no way to
+            // attribute a *specific* upstream column to a *specific*
+            // alias from the SQL alone.
+            SelectItem::ExprWithAliases { expr, aliases } => {
+                let sources = collect_expr_sources(expr, &from_scope, catalog);
+                let expression = Some(expr.to_string());
+                for alias in aliases {
+                    columns.push(ResolvedColumn {
+                        name: alias.value.clone(),
+                        sources: sources.clone(),
+                        expression: expression.clone(),
+                        struct_fields: None,
+                    });
+                }
+            }
         }
     }
 
@@ -967,6 +1367,7 @@ fn resolve_from(
     scope: &HashMap<String, LocalSchema>,
     known_relations: &HashMap<QualifiedName, Upstream>,
     resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    catalog: &CatalogSchemas,
 ) -> HashMap<String, LocalSchema> {
     let mut collected: Vec<(String, LocalSchema)> = Vec::new();
     for twj in from {
@@ -975,6 +1376,7 @@ fn resolve_from(
             scope,
             known_relations,
             resolved_schemas,
+            catalog,
             &mut collected,
         );
         for join in &twj.joins {
@@ -983,29 +1385,34 @@ fn resolve_from(
                 scope,
                 known_relations,
                 resolved_schemas,
+                catalog,
                 &mut collected,
             );
         }
     }
 
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (alias, _) in &collected {
-        *counts.entry(alias.clone()).or_insert(0) += 1;
-    }
-
     // A duplicate alias (two unaliased relations that happen to share a
     // trailing name, or a base table shadowing an earlier CTE) means we
-    // can no longer trust which relation a later reference to it meant.
-    // Mark it opaque rather than silently keeping whichever one happened
-    // to be inserted last -- a wrong column-lineage guess is worse than
-    // an admittedly-unresolved one.
-    collected
+    // can no longer trust which relation a later *unqualified* reference
+    // meant. Collapsed into `AmbiguousAlias` (carrying every candidate
+    // that shared this alias) rather than immediately discarding them as
+    // `Opaque` -- a *qualified* reference (`alias.column`) still has a
+    // chance at resolving through `resolve_path_on_schema`, if a
+    // `catalog.json` shows the column exists on only one candidate. An
+    // unqualified reference never gets that chance (see
+    // `resolve_unqualified`), so this is strictly additive, not a
+    // relaxation of the existing guard against a wrong lineage guess.
+    let mut by_alias: HashMap<String, Vec<LocalSchema>> = HashMap::new();
+    for (alias, schema) in collected {
+        by_alias.entry(alias).or_default().push(schema);
+    }
+    by_alias
         .into_iter()
-        .map(|(alias, schema)| {
-            let schema = if counts[alias.as_str()] > 1 {
-                LocalSchema::Opaque
+        .map(|(alias, mut candidates)| {
+            let schema = if candidates.len() > 1 {
+                LocalSchema::AmbiguousAlias(candidates)
             } else {
-                schema
+                candidates.pop().expect("just checked len == 1")
             };
             (alias, schema)
         })
@@ -1016,10 +1423,33 @@ fn collect_table_factor(
     factor: &TableFactor,
     scope: &HashMap<String, LocalSchema>,
     known_relations: &HashMap<QualifiedName, Upstream>,
-    _resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    catalog: &CatalogSchemas,
     collected: &mut Vec<(String, LocalSchema)>,
 ) {
-    if let TableFactor::Table { name, alias, .. } = factor {
+    if let TableFactor::Derived {
+        subquery, alias, ..
+    } = factor
+    {
+        // An inline subquery directly in `FROM` (as opposed to a
+        // `WITH`-defined CTE, handled in `resolve_query_in_scope`):
+        // resolved the same way a CTE's own query is, as a nested scope
+        // that inherits whatever CTEs are already visible here, then
+        // treated exactly like a CTE's `Known` schema by the outer query.
+        let resolved =
+            resolve_query_in_scope(subquery, scope, known_relations, resolved_schemas, catalog);
+        let effective_alias = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_default();
+        collected.push((effective_alias, resolved));
+        return;
+    }
+
+    if let TableFactor::Table {
+        name, alias, args, ..
+    } = factor
+    {
         let parts: Vec<String> = name
             .0
             .iter()
@@ -1030,7 +1460,19 @@ fn collect_table_factor(
             .map(|a| a.name.value.clone())
             .unwrap_or_else(|| parts.last().cloned().unwrap_or_default());
 
-        let resolved = if parts.len() == 3 {
+        // `args: Some(..)` means this is actually a table-valued function
+        // call (`generate_series(1, 10) AS g`), not a plain table/CTE
+        // reference -- sqlparser folds that shape into `TableFactor::Table`
+        // rather than giving it its own variant in every case. A TVF's
+        // name lives in a different SQL namespace than a table/CTE name,
+        // so it must never be looked up against `scope`/`known_relations`
+        // (a TVF that happens to share its bare name with an in-scope CTE
+        // is legal SQL, and must not silently resolve to that CTE) --
+        // stays `Opaque` unconditionally, the same "not attempted" outcome
+        // as `TableFactor::TableFunction` below.
+        let resolved = if args.is_some() {
+            LocalSchema::Opaque
+        } else if parts.len() == 3 {
             let qualified = (parts[0].clone(), parts[1].clone(), parts[2].clone());
             match known_relations.get(&qualified) {
                 Some(upstream) => LocalSchema::Passthrough(upstream.clone()),
@@ -1046,8 +1488,12 @@ fn collect_table_factor(
 
         collected.push((effective_alias, resolved));
     }
-    // Derived subqueries / table functions in FROM: not attempted (see
-    // module-level "Known limitations").
+    // A table-valued function represented as `TableFactor::TableFunction`
+    // (rather than `TableFactor::Table` with `args: Some(..)`, handled
+    // above): not attempted, see module-level "Known limitations" doc
+    // comment. Simply not pushed into `collected` -- its alias never
+    // enters `from_scope`, so any reference to it resolves the same way
+    // any other unrecognized name would.
 }
 
 /// Expands a bare `SELECT *` mixed with other projections, or where
@@ -1057,21 +1503,25 @@ fn collect_table_factor(
 fn expand_wildcard(
     from_scope: &HashMap<String, LocalSchema>,
     resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    catalog: &CatalogSchemas,
 ) -> Option<Vec<ResolvedColumn>> {
     if from_scope.len() != 1 {
         return None;
     }
     let only = from_scope.values().next()?;
-    expand_wildcard_of(only, resolved_schemas)
+    expand_wildcard_of(only, resolved_schemas, catalog)
 }
 
 /// Enumerates a [`LocalSchema`]'s columns as a concrete list, when
 /// possible. A `Passthrough` of a Node can always be enumerated (we've
 /// already resolved that Node's real columns); a `Passthrough` of an
-/// Origin can't (we never know an Origin's real columns).
+/// Origin can only be enumerated when a `catalog.json` covers it (see
+/// [`CatalogSchemas`]) -- absent that, an Origin's real columns still
+/// aren't known.
 fn expand_wildcard_of(
     schema: &LocalSchema,
     resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    catalog: &CatalogSchemas,
 ) -> Option<Vec<ResolvedColumn>> {
     match schema {
         LocalSchema::Passthrough(upstream @ Upstream::Node(id)) => {
@@ -1093,9 +1543,35 @@ fn expand_wildcard_of(
                     .collect(),
             )
         }
-        LocalSchema::Passthrough(Upstream::Origin(_)) => None,
+        LocalSchema::Passthrough(upstream @ Upstream::Origin(id)) => {
+            // An *absent* key already falls back to `Opaque` via `?`
+            // below -- but a key that's *present* with an empty columns
+            // list is just as unusable (a real relation never has zero
+            // columns; an empty entry means catalog.json didn't actually
+            // introspect this relation's columns, not that it genuinely
+            // has none) and must fall back the same way, not be treated
+            // as "known: zero columns." Same guard
+            // `merge_set_operation_arms` already applies to its own
+            // `expand_wildcard_of` results.
+            let cols = catalog.get(id.as_str()).filter(|cols| !cols.is_empty())?;
+            Some(
+                cols.iter()
+                    .map(|name| ResolvedColumn {
+                        name: name.clone(),
+                        sources: vec![(upstream.clone(), name.clone())],
+                        expression: None,
+                        struct_fields: None,
+                    })
+                    .collect(),
+            )
+        }
         LocalSchema::Known(cols) => Some(cols.clone()),
-        LocalSchema::Opaque => None,
+        // A genuinely ambiguous alias can't be enumerated as a column
+        // list even with a catalog -- catalog-backed disambiguation (see
+        // `resolve_path_on_schema`) only ever resolves one *specific,
+        // already-named* column at a time, never "all of this alias's
+        // columns" as a set.
+        LocalSchema::Opaque | LocalSchema::AmbiguousAlias(_) => None,
     }
 }
 
@@ -1118,8 +1594,9 @@ fn resolve_expr_column(
     expr: &Expr,
     alias: Option<String>,
     from_scope: &HashMap<String, LocalSchema>,
+    catalog: &CatalogSchemas,
 ) -> ResolvedColumn {
-    let sources = collect_expr_sources(expr, from_scope);
+    let sources = collect_expr_sources(expr, from_scope, catalog);
 
     // A plain (optionally qualified) identifier is a passthrough/rename,
     // not a calculation -- no expression text is worth showing for it.
@@ -1138,13 +1615,65 @@ fn resolve_expr_column(
         other => other.to_string(),
     });
 
-    let struct_fields = extract_struct_shape(expr);
+    // A column's own immediate defining expression (`extract_struct_shape`)
+    // takes priority when it states a shape explicitly; otherwise, a plain
+    // passthrough/rename of an upstream struct column
+    // (`propagate_struct_shape`) carries that upstream column's
+    // already-resolved shape forward -- the same way `sources` already
+    // carries lineage forward across a CTE hop (see `source_of`) -- so a
+    // struct's field shape now survives a rename or a CTE hop within the
+    // same model, not just its own defining SQL.
+    let struct_fields =
+        extract_struct_shape(expr).or_else(|| propagate_struct_shape(expr, from_scope));
 
     ResolvedColumn {
         name,
         sources,
         expression,
         struct_fields,
+    }
+}
+
+/// Carries a struct-typed column's already-resolved field shape forward
+/// across a plain passthrough/rename -- `expr` is a bare (optionally
+/// qualified) identifier referencing a single already-resolved `Known`
+/// column that itself has a shape (from that column's own immediate
+/// defining expression *or*, transitively, from an earlier hop of this
+/// same propagation -- since a `Known` relation's `struct_fields` is
+/// itself whatever this function already produced for it). Deliberately
+/// narrower than `collect_expr_sources`'s own identifier resolution: only
+/// an unqualified reference against a single relation in scope, or a
+/// 2-part qualified reference (`alias.column`), is attempted -- a struct
+/// shape is a single, specific fact about one column, not something
+/// several ambiguous candidates could plausibly share the way a
+/// calculated column's several *sources* can, so this stays conservative
+/// rather than reusing `resolve_unqualified`/`resolve_qualified`'s
+/// broader (dotted-prefix, multi-source) matching. `None` for anything
+/// else -- a calculated expression, a struct-field access one level in
+/// (`payload.user_id` doesn't carry `payload`'s own shape), a
+/// `Passthrough`/`Opaque`/`AmbiguousAlias` relation, or a column with no
+/// recorded shape at all.
+fn propagate_struct_shape(
+    expr: &Expr,
+    from_scope: &HashMap<String, LocalSchema>,
+) -> Option<Vec<StructField>> {
+    let struct_fields_on = |schema: &LocalSchema, column: &str| match schema {
+        LocalSchema::Known(cols) => cols
+            .iter()
+            .find(|c| c.name == column)
+            .and_then(|c| c.struct_fields.clone()),
+        _ => None,
+    };
+
+    match expr {
+        Expr::Identifier(ident) if from_scope.len() == 1 => {
+            struct_fields_on(from_scope.values().next()?, &ident.value)
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let schema = from_scope.get(&parts[0].value)?;
+            struct_fields_on(schema, &parts[1].value)
+        }
+        _ => None,
     }
 }
 
@@ -1305,15 +1834,17 @@ fn extract_named_struct_shape(function: &sqlparser::ast::Function) -> Option<Vec
 fn collect_expr_sources(
     expr: &Expr,
     from_scope: &HashMap<String, LocalSchema>,
+    catalog: &CatalogSchemas,
 ) -> Vec<(Upstream, String)> {
     let mut found = Vec::new();
-    collect_expr_sources_into(expr, from_scope, &mut found);
+    collect_expr_sources_into(expr, from_scope, catalog, &mut found);
     found
 }
 
 fn collect_expr_sources_into(
     expr: &Expr,
     from_scope: &HashMap<String, LocalSchema>,
+    catalog: &CatalogSchemas,
     found: &mut Vec<(Upstream, String)>,
 ) {
     let push_dedup = |mut new: Vec<(Upstream, String)>, found: &mut Vec<(Upstream, String)>| {
@@ -1324,7 +1855,7 @@ fn collect_expr_sources_into(
     match expr {
         Expr::Identifier(ident) => {
             push_dedup(
-                resolve_unqualified(std::slice::from_ref(&ident.value), from_scope),
+                resolve_unqualified(std::slice::from_ref(&ident.value), from_scope, catalog),
                 found,
             );
         }
@@ -1344,11 +1875,11 @@ fn collect_expr_sources_into(
             let path: Vec<String> = parts.iter().map(|p| p.value.clone()).collect();
             if from_scope.contains_key(&path[0]) {
                 push_dedup(
-                    resolve_qualified(&path[0], &path[1..], from_scope),
+                    resolve_qualified(&path[0], &path[1..], from_scope, catalog),
                     found,
                 );
             } else {
-                push_dedup(resolve_unqualified(&path, from_scope), found);
+                push_dedup(resolve_unqualified(&path, from_scope, catalog), found);
             }
         }
         // Snowflake's and Databricks' semi-structured (`VARIANT`) colon
@@ -1361,7 +1892,7 @@ fn collect_expr_sources_into(
         // collapse it into a longer dotted name the way `CompoundIdentifier`
         // does.
         Expr::JsonAccess { value, .. } => {
-            collect_expr_sources_into(value, from_scope, found);
+            collect_expr_sources_into(value, from_scope, catalog, found);
         }
         // Bracket/subscript access mixed with (or instead of) dot access --
         // array indexing (`arr[0]`), map access (`m['key']`), or a chain
@@ -1393,7 +1924,7 @@ fn collect_expr_sources_into(
                     Some(parts.iter().map(|p| p.value.clone()).collect())
                 }
                 other => {
-                    collect_expr_sources_into(other, from_scope, found);
+                    collect_expr_sources_into(other, from_scope, catalog, found);
                     None
                 }
             };
@@ -1405,9 +1936,9 @@ fn collect_expr_sources_into(
                     chain.next();
                 }
                 if from_scope.contains_key(&path[0]) {
-                    push_dedup(resolve_qualified(&path[0], &path[1..], from_scope), found);
+                    push_dedup(resolve_qualified(&path[0], &path[1..], from_scope, catalog), found);
                 } else {
-                    push_dedup(resolve_unqualified(path, from_scope), found);
+                    push_dedup(resolve_unqualified(path, from_scope, catalog), found);
                 }
             }
 
@@ -1420,7 +1951,7 @@ fn collect_expr_sources_into(
                 if let AccessExpr::Subscript(subscript) = access {
                     match subscript {
                         Subscript::Index { index } => {
-                            collect_expr_sources_into(index, from_scope, found);
+                            collect_expr_sources_into(index, from_scope, catalog, found);
                         }
                         Subscript::Slice {
                             lower_bound,
@@ -1428,7 +1959,7 @@ fn collect_expr_sources_into(
                             stride,
                         } => {
                             for bound in [lower_bound, upper_bound, stride].into_iter().flatten() {
-                                collect_expr_sources_into(bound, from_scope, found);
+                                collect_expr_sources_into(bound, from_scope, catalog, found);
                             }
                         }
                     }
@@ -1450,7 +1981,7 @@ fn collect_expr_sources_into(
                         ..
                     } = arg
                     {
-                        collect_expr_sources_into(arg_expr, from_scope, found);
+                        collect_expr_sources_into(arg_expr, from_scope, catalog, found);
                     }
                 }
             }
@@ -1468,13 +1999,13 @@ fn collect_expr_sources_into(
         | Expr::Extract { expr: inner, .. }
         | Expr::Ceil { expr: inner, .. }
         | Expr::Floor { expr: inner, .. } => {
-            collect_expr_sources_into(inner, from_scope, found);
+            collect_expr_sources_into(inner, from_scope, catalog, found);
         }
         // `POSITION(expr IN expr)` -- same reasoning, two operands
         // instead of one.
         Expr::Position { expr: inner, r#in } => {
-            collect_expr_sources_into(inner, from_scope, found);
-            collect_expr_sources_into(r#in, from_scope, found);
+            collect_expr_sources_into(inner, from_scope, catalog, found);
+            collect_expr_sources_into(r#in, from_scope, catalog, found);
         }
         // `SUBSTRING(expr [FROM expr] [FOR expr])` (or its comma-arg
         // form) -- another dedicated variant, same reasoning.
@@ -1484,12 +2015,12 @@ fn collect_expr_sources_into(
             substring_for,
             ..
         } => {
-            collect_expr_sources_into(inner, from_scope, found);
+            collect_expr_sources_into(inner, from_scope, catalog, found);
             if let Some(from) = substring_from {
-                collect_expr_sources_into(from, from_scope, found);
+                collect_expr_sources_into(from, from_scope, catalog, found);
             }
             if let Some(for_) = substring_for {
-                collect_expr_sources_into(for_, from_scope, found);
+                collect_expr_sources_into(for_, from_scope, catalog, found);
             }
         }
         // `TRIM([BOTH|LEADING|TRAILING] [expr FROM] expr)` -- walks the
@@ -1501,12 +2032,12 @@ fn collect_expr_sources_into(
             trim_characters,
             ..
         } => {
-            collect_expr_sources_into(inner, from_scope, found);
+            collect_expr_sources_into(inner, from_scope, catalog, found);
             if let Some(what) = trim_what {
-                collect_expr_sources_into(what, from_scope, found);
+                collect_expr_sources_into(what, from_scope, catalog, found);
             }
             for c in trim_characters.iter().flatten() {
-                collect_expr_sources_into(c, from_scope, found);
+                collect_expr_sources_into(c, from_scope, catalog, found);
             }
         }
         // `OVERLAY(expr PLACING expr FROM expr [FOR expr])`.
@@ -1516,16 +2047,16 @@ fn collect_expr_sources_into(
             overlay_from,
             overlay_for,
         } => {
-            collect_expr_sources_into(inner, from_scope, found);
-            collect_expr_sources_into(overlay_what, from_scope, found);
-            collect_expr_sources_into(overlay_from, from_scope, found);
+            collect_expr_sources_into(inner, from_scope, catalog, found);
+            collect_expr_sources_into(overlay_what, from_scope, catalog, found);
+            collect_expr_sources_into(overlay_from, from_scope, catalog, found);
             if let Some(for_) = overlay_for {
-                collect_expr_sources_into(for_, from_scope, found);
+                collect_expr_sources_into(for_, from_scope, catalog, found);
             }
         }
         Expr::BinaryOp { left, right, .. } => {
-            collect_expr_sources_into(left, from_scope, found);
-            collect_expr_sources_into(right, from_scope, found);
+            collect_expr_sources_into(left, from_scope, catalog, found);
+            collect_expr_sources_into(right, from_scope, catalog, found);
         }
         Expr::Case {
             operand,
@@ -1534,14 +2065,14 @@ fn collect_expr_sources_into(
             ..
         } => {
             if let Some(operand) = operand {
-                collect_expr_sources_into(operand, from_scope, found);
+                collect_expr_sources_into(operand, from_scope, catalog, found);
             }
             for when in conditions {
-                collect_expr_sources_into(&when.condition, from_scope, found);
-                collect_expr_sources_into(&when.result, from_scope, found);
+                collect_expr_sources_into(&when.condition, from_scope, catalog, found);
+                collect_expr_sources_into(&when.result, from_scope, catalog, found);
             }
             if let Some(else_result) = else_result {
-                collect_expr_sources_into(else_result, from_scope, found);
+                collect_expr_sources_into(else_result, from_scope, catalog, found);
             }
         }
         // Literals, subquery expressions, window functions, and anything
@@ -1562,10 +2093,11 @@ fn collect_expr_sources_into(
 fn resolve_unqualified(
     path: &[String],
     from_scope: &HashMap<String, LocalSchema>,
+    catalog: &CatalogSchemas,
 ) -> Vec<(Upstream, String)> {
     if from_scope.len() == 1 {
         return match from_scope.values().next() {
-            Some(only) => resolve_path_on_schema(only, path),
+            Some(only) => resolve_path_on_schema(only, path, catalog),
             None => Vec::new(),
         };
     }
@@ -1620,9 +2152,10 @@ fn resolve_qualified(
     qualifier: &str,
     path: &[String],
     from_scope: &HashMap<String, LocalSchema>,
+    catalog: &CatalogSchemas,
 ) -> Vec<(Upstream, String)> {
     match from_scope.get(qualifier) {
-        Some(schema) => resolve_path_on_schema(schema, path),
+        Some(schema) => resolve_path_on_schema(schema, path, catalog),
         None => Vec::new(),
     }
 }
@@ -1649,7 +2182,16 @@ fn resolve_qualified(
 ///   is itself the real column -- always collapses to `path[0]`, the
 ///   base column, rather than guessing a longer name is correct.
 /// - `Opaque`: never resolves, same as a single-part reference.
-fn resolve_path_on_schema(schema: &LocalSchema, path: &[String]) -> Vec<(Upstream, String)> {
+/// - `AmbiguousAlias`: resolves `path[0]` (the base column -- the same
+///   collapse a `Passthrough` already does for a dotted path) only if
+///   [`column_exists_on`] can confirm, for *every* candidate that shared
+///   this alias, whether it has that column -- and exactly one of them
+///   does. See [`LocalSchema::AmbiguousAlias`]'s doc comment.
+fn resolve_path_on_schema(
+    schema: &LocalSchema,
+    path: &[String],
+    catalog: &CatalogSchemas,
+) -> Vec<(Upstream, String)> {
     match schema {
         LocalSchema::Known(_) => {
             for len in (1..=path.len()).rev() {
@@ -1663,7 +2205,56 @@ fn resolve_path_on_schema(schema: &LocalSchema, path: &[String]) -> Vec<(Upstrea
         }
         LocalSchema::Passthrough(upstream) => vec![(upstream.clone(), path[0].clone())],
         LocalSchema::Opaque => Vec::new(),
+        LocalSchema::AmbiguousAlias(candidates) => {
+            let column = &path[0];
+            let mut confirmed: Vec<&LocalSchema> = Vec::new();
+            for candidate in candidates {
+                match column_exists_on(candidate, column, catalog) {
+                    Some(true) => confirmed.push(candidate),
+                    Some(false) => {}
+                    // A candidate catalog.json doesn't cover at all: we
+                    // can't rule out it also has this column, so the whole
+                    // reference stays unresolved -- see the doc comment
+                    // above and `LocalSchema::AmbiguousAlias`'s.
+                    None => return Vec::new(),
+                }
+            }
+            match confirmed.len() {
+                1 => resolve_path_on_schema(confirmed[0], path, catalog),
+                _ => Vec::new(),
+            }
+        }
     }
+}
+
+/// Whether `schema` has a column named exactly `column`, when that's
+/// knowable at all -- `Some(true)`/`Some(false)` when it is, `None` when
+/// it isn't (an `Opaque`/`AmbiguousAlias` candidate, or a `Passthrough`
+/// whose upstream isn't covered by `catalog`). Used only to disambiguate
+/// an [`LocalSchema::AmbiguousAlias`]'s candidates -- a `Known` schema
+/// answers from its own already-resolved column list; a `Passthrough`
+/// (Node or Origin alike) answers from `catalog` alone.
+///
+/// Known, deliberately accepted gap: a `Passthrough(Node)` candidate
+/// whose real columns are *already* resolved via `resolved_schemas`
+/// (e.g. the ambiguous alias is a sibling model already fully known from
+/// the manifest, not just from `catalog.json`) still can't be
+/// disambiguated unless `catalog.json` *also* happens to cover it --
+/// `resolved_schemas` isn't threaded this deep (through
+/// `resolve_unqualified`/`resolve_qualified`/`resolve_path_on_schema`)
+/// purely to widen this one narrow case. Never produces a *wrong*
+/// answer, only a more conservative "stays unresolved" one than
+/// theoretically possible.
+fn column_exists_on(schema: &LocalSchema, column: &str, catalog: &CatalogSchemas) -> Option<bool> {
+    let upstream_id = match schema {
+        LocalSchema::Known(cols) => return Some(cols.iter().any(|c| c.name == column)),
+        LocalSchema::Passthrough(Upstream::Node(id)) => id.as_str(),
+        LocalSchema::Passthrough(Upstream::Origin(id)) => id.as_str(),
+        LocalSchema::Opaque | LocalSchema::AmbiguousAlias(_) => return None,
+    };
+    catalog
+        .get(upstream_id)
+        .map(|cols| cols.iter().any(|c| c == column))
 }
 
 /// Every upstream source `column` traces to on `schema`. A `Passthrough`
@@ -1682,7 +2273,11 @@ fn source_of(schema: &LocalSchema, column: &str) -> Vec<(Upstream, String)> {
             .find(|c| c.name == column)
             .map(|c| c.sources.clone())
             .unwrap_or_default(),
-        LocalSchema::Opaque => Vec::new(),
+        // `source_of` is only ever reached via a `Known` relation's own
+        // already-resolved columns (see `resolve_path_on_schema`'s
+        // `Known` arm and `resolve_unqualified`'s dotted-prefix search) --
+        // never directly on an `Opaque` or `AmbiguousAlias` schema.
+        LocalSchema::Opaque | LocalSchema::AmbiguousAlias(_) => Vec::new(),
     }
 }
 
@@ -1834,7 +2429,12 @@ mod tests {
 
         let query =
             parse_query(r#"select t.x from "db"."s1"."t", "db"."s2"."t""#).expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -1877,7 +2477,12 @@ mod tests {
             r#"with a as (select id, name from "db"."s"."tbl") select name from a, "db"."s"."t2""#,
         )
         .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -1890,6 +2495,772 @@ mod tests {
             }
             other => panic!("expected Known([name sourced from tbl via CTE a]), got {other:?}"),
         }
+    }
+
+    /// A two-arm `UNION` resolves each result column to the union of what
+    /// *both* arms resolve that same positional column to -- at runtime the
+    /// value could come from either arm, so both are real lineage, not just
+    /// the left arm's.
+    #[test]
+    fn a_two_arm_union_resolves_each_column_to_both_arms_sources() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t1".to_string()),
+            origin("origin.s.t1"),
+        );
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t2".to_string()),
+            origin("origin.s.t2"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query =
+            parse_query(r#"select a, b from "db"."s"."t1" union select a, b from "db"."s"."t2""#)
+                .expect("should parse");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 2);
+                assert_eq!(cols[0].name, "a");
+                assert_eq!(
+                    cols[0].sources,
+                    vec![
+                        (origin("origin.s.t1"), "a".to_string()),
+                        (origin("origin.s.t2"), "a".to_string()),
+                    ]
+                );
+                assert_eq!(cols[1].name, "b");
+                assert_eq!(
+                    cols[1].sources,
+                    vec![
+                        (origin("origin.s.t1"), "b".to_string()),
+                        (origin("origin.s.t2"), "b".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Known([a, b] each sourced from both arms), got {other:?}"),
+        }
+    }
+
+    /// `UNION ALL` resolves exactly like `UNION` for lineage purposes --
+    /// the `ALL`/`DISTINCT` quantifier only affects duplicate-row handling,
+    /// not which columns a value can come from.
+    #[test]
+    fn a_union_all_resolves_each_column_to_both_arms_sources() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t1".to_string()),
+            origin("origin.s.t1"),
+        );
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t2".to_string()),
+            origin("origin.s.t2"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query =
+            parse_query(r#"select a from "db"."s"."t1" union all select a from "db"."s"."t2""#)
+                .expect("should parse");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![
+                        (origin("origin.s.t1"), "a".to_string()),
+                        (origin("origin.s.t2"), "a".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Known([a] sourced from both arms), got {other:?}"),
+        }
+    }
+
+    /// An inline subquery directly in `FROM` (as opposed to a
+    /// `WITH`-defined CTE) resolves its own `SELECT` list as a nested
+    /// scope, then is treated exactly like a CTE's `Known` schema by the
+    /// outer query.
+    #[test]
+    fn an_inline_from_subquery_resolves_correctly() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"select inner_alias.id as outer_id from (select id from "db"."s"."t") as inner_alias"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "outer_id");
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "id".to_string())]
+                );
+            }
+            other => panic!("expected Known([outer_id] sourced from t.id), got {other:?}"),
+        }
+    }
+
+    /// Regression guard: a table-valued function in `FROM` (as opposed to a
+    /// plain table/CTE reference) must still correctly fall back to
+    /// `Opaque` now that `UNION` and inline `FROM` subqueries resolve --
+    /// this case stays deliberately unsolved (see the module-level "Known
+    /// limitations" doc comment).
+    #[test]
+    fn a_table_valued_function_in_from_still_falls_back_to_opaque() {
+        let known_relations = HashMap::new();
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query("select * from generate_series(1, 10) as g").expect("should parse");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        assert!(
+            matches!(schema, LocalSchema::Opaque),
+            "expected Opaque for a table-valued function in FROM, got {schema:?}"
+        );
+    }
+
+    /// Regression test: a table-valued function call in `FROM` whose bare
+    /// name happens to collide with an in-scope CTE's name (a legal SQL
+    /// namespace collision -- a TVF call and a table/CTE reference are
+    /// distinguished by the presence of `(...)`, not by name) must not
+    /// silently resolve to that CTE's schema.
+    #[test]
+    fn a_table_valued_function_sharing_a_ctes_name_does_not_resolve_to_that_cte() {
+        let known_relations = HashMap::new();
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            "with generate_series as (select id from t) \
+             select g.id from generate_series(1, 10) as g",
+        )
+        .expect("should parse");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert!(
+                    cols[0].sources.is_empty(),
+                    "a table-valued function call must never resolve as though it were a \
+                     reference to a same-named CTE, got {:?}",
+                    cols[0].sources
+                );
+            }
+            other => panic!("expected Known([id]) with an unresolved source, got {other:?}"),
+        }
+    }
+
+    /// `SELECT *` reading directly from a source resolves correctly when a
+    /// `catalog.json` is present and covers that source's real column
+    /// list -- otherwise unknowable from `manifest.json` alone (see the
+    /// module-level doc comment).
+    #[test]
+    fn a_wildcard_from_a_source_expands_via_catalog_when_present() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert(
+            "origin.s.t".to_string(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+
+        let query = parse_query(r#"select * from "db"."s"."t""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas, &catalog);
+
+        match schema {
+            LocalSchema::Passthrough(upstream) => {
+                assert_eq!(upstream, origin("origin.s.t"));
+            }
+            other => panic!(
+                "expected the top-level SELECT * to stay a Passthrough (expansion happens in \
+                 build_parsed_project), got {other:?}"
+            ),
+        }
+    }
+
+    /// The same `SELECT *` from a source, with no `catalog.json` at all
+    /// (an empty [`CatalogSchemas`], exactly what [`read_catalog`]
+    /// produces when the file is absent), falls back to today's existing
+    /// behavior -- a `Passthrough` that never gets enumerated into
+    /// concrete columns.
+    #[test]
+    fn a_wildcard_from_a_source_falls_back_to_opaque_columns_without_catalog() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(r#"select * from "db"."s"."t""#).expect("should parse");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        assert!(
+            expand_wildcard_of(&schema, &resolved_schemas, &CatalogSchemas::new()).is_none(),
+            "expected no catalog to mean the wildcard still can't be expanded, got {schema:?}"
+        );
+    }
+
+    /// Regression test: a catalog.json entry that's *present* for a
+    /// source but lists zero columns must fall back to `Opaque`, the same
+    /// as an entirely-absent entry -- not `Known([])`, which would
+    /// silently misrepresent "catalog.json didn't actually introspect
+    /// this relation's real columns" as "this relation genuinely has no
+    /// columns."
+    #[test]
+    fn a_wildcard_from_a_source_falls_back_to_opaque_when_the_catalog_entry_is_empty() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert("origin.s.t".to_string(), Vec::new());
+
+        let query = parse_query(r#"select * from "db"."s"."t""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas, &catalog);
+
+        assert!(
+            expand_wildcard_of(&schema, &resolved_schemas, &catalog).is_none(),
+            "expected an empty-but-present catalog entry to still mean the wildcard can't be \
+             expanded, got {schema:?}"
+        );
+    }
+
+    /// Two ambiguously-aliased relations (a duplicate `FROM` alias) still
+    /// resolve a qualified column reference deterministically when
+    /// `catalog.json` shows the column exists on only one of them.
+    #[test]
+    fn a_duplicate_alias_resolves_via_catalog_when_the_column_is_on_only_one_relation() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s1".to_string(), "t".to_string()),
+            origin("origin.s1.t"),
+        );
+        known_relations.insert(
+            ("db".to_string(), "s2".to_string(), "t".to_string()),
+            origin("origin.s2.t"),
+        );
+        let resolved_schemas = HashMap::new();
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert("origin.s1.t".to_string(), vec!["x".to_string()]);
+        catalog.insert("origin.s2.t".to_string(), vec!["y".to_string()]);
+
+        let query =
+            parse_query(r#"select t.x from "db"."s1"."t", "db"."s2"."t""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas, &catalog);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s1.t"), "x".to_string())],
+                    "expected t.x to resolve deterministically to s1.t, the only relation whose \
+                     catalog.json column list has an x column"
+                );
+            }
+            other => panic!("expected Known([x] resolved via catalog), got {other:?}"),
+        }
+    }
+
+    /// The same duplicate-alias case, but the column exists on *both*
+    /// relations per `catalog.json` -- must still correctly fall back to
+    /// unresolved, the same as the no-catalog regression test above,
+    /// rather than arbitrarily picking one.
+    #[test]
+    fn a_duplicate_alias_stays_unresolved_via_catalog_when_the_column_is_on_both_relations() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s1".to_string(), "t".to_string()),
+            origin("origin.s1.t"),
+        );
+        known_relations.insert(
+            ("db".to_string(), "s2".to_string(), "t".to_string()),
+            origin("origin.s2.t"),
+        );
+        let resolved_schemas = HashMap::new();
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert("origin.s1.t".to_string(), vec!["x".to_string()]);
+        catalog.insert("origin.s2.t".to_string(), vec!["x".to_string()]);
+
+        let query =
+            parse_query(r#"select t.x from "db"."s1"."t", "db"."s2"."t""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas, &catalog);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert!(
+                    cols[0].sources.is_empty(),
+                    "a column present on both ambiguously-aliased relations must not resolve to \
+                     either one, even with catalog.json coverage"
+                );
+            }
+            other => panic!("expected Known([x]) with an unresolved source, got {other:?}"),
+        }
+    }
+
+    /// End-to-end through [`build_parsed_project`] and
+    /// [`crate::diff::diff`]/[`crate::rules::evaluate`]: a struct-internal
+    /// field added between two versions of a model is now correctly
+    /// classified as a breaking change (`RuleId::StructFieldAdded`), even
+    /// though the struct column itself is only ever *renamed* in this
+    /// model's own outermost `SELECT` -- its real shape is defined two CTE
+    /// hops earlier. Before struct-shape propagation, that column's
+    /// `struct_fields` would have been `None` in both the Baseline and
+    /// current state, so this change would have gone entirely undetected.
+    #[test]
+    fn a_struct_field_added_behind_a_cte_hop_is_classified_as_a_breaking_change() {
+        let manifest_json = |fields: &str| {
+            format!(
+                r#"{{
+                    "nodes": {{
+                        "model.p.m": {{
+                            "unique_id": "model.p.m",
+                            "resource_type": "model",
+                            "name": "m",
+                            "database": "db",
+                            "schema": "s",
+                            "alias": "m",
+                            "depends_on": {{"nodes": ["source.p.raw.t"]}},
+                            "compiled_code": "with base as (select cast(x.payload as struct<{fields}>) as payload from \"db\".\"raw\".\"t\" as x) select b.payload as renamed_payload from base as b"
+                        }}
+                    }},
+                    "sources": {{
+                        "source.p.raw.t": {{
+                            "unique_id": "source.p.raw.t",
+                            "name": "t",
+                            "database": "db",
+                            "schema": "raw",
+                            "identifier": "t"
+                        }}
+                    }}
+                }}"#
+            )
+        };
+
+        let baseline_manifest: RawManifest =
+            serde_json::from_str(&manifest_json("user_id int64")).expect("should parse");
+        let current_manifest: RawManifest =
+            serde_json::from_str(&manifest_json("user_id int64, email string"))
+                .expect("should parse");
+
+        let baseline = build_parsed_project(&baseline_manifest, &CatalogSchemas::new());
+        let current = build_parsed_project(&current_manifest, &CatalogSchemas::new());
+
+        let changes = crate::diff::diff(&baseline, &current);
+        let findings =
+            crate::rules::evaluate(&baseline, &changes, &crate::config::Config::default());
+
+        let node_id = NodeId::new("model.p.m");
+        let expected = crate::rules::Finding {
+            severity: crate::rules::Severity::Error,
+            detail: crate::rules::FindingDetail::StructFieldAdded {
+                node: node_id,
+                column: ColumnName::new("renamed_payload"),
+                field: ColumnName::new("email"),
+            },
+        };
+        assert!(
+            findings.contains(&expected),
+            "expected a StructFieldAdded finding for renamed_payload.email, got {findings:?}"
+        );
+    }
+
+    /// End-to-end through [`build_parsed_project`] (not just
+    /// [`resolve_query`]): a model that's a pure `SELECT * FROM <source>`
+    /// gets its real columns -- and one identity-passthrough edge per
+    /// column -- only once a `catalog.json` covering that source is
+    /// supplied; an empty one (what a missing/unparseable file falls back
+    /// to, see [`read_catalog`]) reproduces today's existing empty-columns
+    /// behavior exactly.
+    #[test]
+    fn build_parsed_project_expands_a_sources_wildcard_model_only_with_catalog() {
+        let manifest: RawManifest = serde_json::from_str(
+            r#"{
+                "nodes": {
+                    "model.p.m": {
+                        "unique_id": "model.p.m",
+                        "resource_type": "model",
+                        "name": "m",
+                        "database": "db",
+                        "schema": "s",
+                        "alias": "m",
+                        "depends_on": {"nodes": ["source.p.raw.t"]},
+                        "compiled_code": "select * from \"db\".\"raw\".\"t\""
+                    }
+                },
+                "sources": {
+                    "source.p.raw.t": {
+                        "unique_id": "source.p.raw.t",
+                        "name": "t",
+                        "database": "db",
+                        "schema": "raw",
+                        "identifier": "t"
+                    }
+                }
+            }"#,
+        )
+        .expect("manifest fixture should parse");
+
+        let without_catalog = build_parsed_project(&manifest, &CatalogSchemas::new());
+        let model = without_catalog
+            .nodes
+            .iter()
+            .find(|n| n.name == "m")
+            .expect("model m should exist");
+        assert!(
+            model.columns.is_empty(),
+            "expected no columns without a catalog, got {:?}",
+            model.columns
+        );
+
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert(
+            "source.p.raw.t".to_string(),
+            vec!["id".to_string(), "amount".to_string()],
+        );
+        let with_catalog = build_parsed_project(&manifest, &catalog);
+        let model = with_catalog
+            .nodes
+            .iter()
+            .find(|n| n.name == "m")
+            .expect("model m should exist");
+        let column_names: Vec<&str> = model.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(column_names, vec!["id", "amount"]);
+
+        let origin_id = OriginId::new("source.p.raw.t");
+        let node_id = NodeId::new("model.p.m");
+        for column in ["id", "amount"] {
+            let has_edge = with_catalog.edges.iter().any(|e| {
+                e.upstream == Upstream::Origin(origin_id.clone())
+                    && e.downstream == node_id
+                    && e.column.as_ref().is_some_and(|c| {
+                        c.upstream_column.as_str() == column
+                            && c.downstream_column.as_str() == column
+                    })
+            });
+            assert!(has_edge, "expected an identity edge for {column}");
+        }
+    }
+
+    /// [`DbtAdapter::parse_for_comparison`] with `use_catalog: false`
+    /// forces `Opaque`-style wildcard behavior even when a real,
+    /// non-empty `catalog.json` is sitting right there -- the whole point
+    /// being to let a caller suppress catalog usage on demand for a
+    /// two-sided comparison, regardless of what's actually on disk. See
+    /// [`DbtAdapter::catalog_available`] for the presence check callers
+    /// use to decide.
+    #[test]
+    fn parse_for_comparison_suppresses_catalog_expansion_when_told_to() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{
+                "nodes": {
+                    "model.p.m": {
+                        "unique_id": "model.p.m",
+                        "resource_type": "model",
+                        "name": "m",
+                        "database": "db",
+                        "schema": "s",
+                        "alias": "m",
+                        "depends_on": {"nodes": ["source.p.raw.t"]},
+                        "compiled_code": "select * from \"db\".\"raw\".\"t\""
+                    }
+                },
+                "sources": {
+                    "source.p.raw.t": {
+                        "unique_id": "source.p.raw.t",
+                        "name": "t",
+                        "database": "db",
+                        "schema": "raw",
+                        "identifier": "t"
+                    }
+                }
+            }"#,
+        )
+        .expect("should write stub manifest.json");
+        std::fs::write(
+            dir.path().join("catalog.json"),
+            r#"{
+                "sources": {
+                    "source.p.raw.t": {
+                        "columns": {
+                            "id": {"name": "id", "index": 1}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("should write stub catalog.json");
+
+        assert!(
+            DbtAdapter.catalog_available(&manifest_path),
+            "expected the stub catalog.json to count as available"
+        );
+
+        let suppressed = DbtAdapter
+            .parse_for_comparison(&manifest_path, false)
+            .expect("should parse");
+        let model = suppressed
+            .nodes
+            .iter()
+            .find(|n| n.name == "m")
+            .expect("model m should exist");
+        assert!(
+            model.columns.is_empty(),
+            "expected use_catalog: false to suppress catalog-backed expansion even though a \
+             real catalog.json exists, got {:?}",
+            model.columns
+        );
+
+        let allowed = DbtAdapter
+            .parse_for_comparison(&manifest_path, true)
+            .expect("should parse");
+        let model = allowed
+            .nodes
+            .iter()
+            .find(|n| n.name == "m")
+            .expect("model m should exist");
+        assert_eq!(
+            model
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id"],
+            "expected use_catalog: true to expand normally"
+        );
+    }
+
+    /// [`DbtAdapter::catalog_available`] is `false` for a project with no
+    /// `catalog.json` at all -- the common case for a Baseline compiled
+    /// in a throwaway worktree that never runs `dbt docs generate`.
+    #[test]
+    fn catalog_available_is_false_with_no_catalog_json() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+
+        assert!(!DbtAdapter.catalog_available(&manifest_path));
+    }
+
+    /// [`read_catalog`] is fully optional: no sibling `catalog.json` at
+    /// all produces an empty [`CatalogSchemas`], not an error.
+    #[test]
+    fn read_catalog_returns_empty_when_no_catalog_file_exists() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+
+        let catalog = read_catalog(&manifest_path);
+
+        assert!(catalog.is_empty());
+    }
+
+    /// A `catalog.json` that fails to parse as valid JSON (or doesn't
+    /// match the expected shape) degrades the same way a missing file
+    /// does -- empty, not an error.
+    #[test]
+    fn read_catalog_returns_empty_when_the_file_is_not_valid_json() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(dir.path().join("catalog.json"), "not valid json")
+            .expect("should write stub catalog.json");
+
+        let catalog = read_catalog(&manifest_path);
+
+        assert!(catalog.is_empty());
+    }
+
+    /// A valid sibling `catalog.json` is read and flattened into real
+    /// column lists, keyed by `unique_id`, ordered by each column's own
+    /// `index` (not object-map iteration order, which JSON doesn't
+    /// guarantee).
+    #[test]
+    fn read_catalog_reads_a_valid_sibling_catalog_json() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(
+            dir.path().join("catalog.json"),
+            r#"{
+                "nodes": {
+                    "model.p.m": {
+                        "columns": {
+                            "NAME": {"name": "name", "type": "varchar", "index": 2},
+                            "ID": {"name": "id", "type": "integer", "index": 1}
+                        }
+                    }
+                },
+                "sources": {
+                    "source.p.raw.t": {
+                        "columns": {
+                            "AMOUNT": {"name": "amount", "type": "numeric", "index": 1}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("should write stub catalog.json");
+
+        let catalog = read_catalog(&manifest_path);
+
+        assert_eq!(
+            catalog.get("model.p.m"),
+            Some(&vec!["id".to_string(), "name".to_string()])
+        );
+        assert_eq!(
+            catalog.get("source.p.raw.t"),
+            Some(&vec!["amount".to_string()])
+        );
+    }
+
+    /// [`resolve_sql_dialect`] picks a recognized adapter type's dedicated
+    /// `sqlparser` dialect (matched case-insensitively), and falls back to
+    /// [`GenericDialect`] for anything it doesn't recognize -- including
+    /// no `adapter_type` at all.
+    #[test]
+    fn resolve_sql_dialect_matches_known_adapter_types_case_insensitively() {
+        use std::any::TypeId;
+
+        assert_eq!(
+            resolve_sql_dialect(Some("Snowflake")).dialect(),
+            TypeId::of::<SnowflakeDialect>()
+        );
+        assert_eq!(
+            resolve_sql_dialect(Some("bigquery")).dialect(),
+            TypeId::of::<BigQueryDialect>()
+        );
+        assert_eq!(
+            resolve_sql_dialect(Some("DATABRICKS")).dialect(),
+            TypeId::of::<DatabricksDialect>()
+        );
+        assert_eq!(
+            resolve_sql_dialect(Some("some-unknown-adapter")).dialect(),
+            TypeId::of::<GenericDialect>()
+        );
+        assert_eq!(
+            resolve_sql_dialect(None).dialect(),
+            TypeId::of::<GenericDialect>()
+        );
+    }
+
+    /// Databricks'/Spark's parenthesized multi-column alias `SELECT`
+    /// syntax (`expr AS (a, b, c)`) -- gated behind
+    /// `Dialect::supports_select_item_multi_column_alias`, which
+    /// `resolve_sql_dialect` now correctly selects `DatabricksDialect`
+    /// for -- resolves each aliased output column to whatever the shared
+    /// expression structurally references, instead of the whole query
+    /// falling back to `Opaque` the way `SelectItem::ExprWithAliases`
+    /// used to unconditionally.
+    #[test]
+    fn a_multi_column_alias_select_resolves_under_databricks_dialect() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query_with_dialect(
+            r#"select x.payload as (a, b) from "db"."s"."t" as x"#,
+            resolve_sql_dialect(Some("databricks")).as_ref(),
+        )
+        .expect("should parse under DatabricksDialect");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 2);
+                assert_eq!(cols[0].name, "a");
+                assert_eq!(cols[1].name, "b");
+                for col in &cols {
+                    assert_eq!(
+                        col.sources,
+                        vec![(origin("origin.s.t"), "payload".to_string())],
+                        "expected both aliases to share the tuple-expansion \
+                         expression's own traced sources"
+                    );
+                }
+            }
+            other => panic!("expected Known([a, b] both sourced from payload), got {other:?}"),
+        }
+
+        // Unlike a genuinely dialect-exclusive construct, this syntax
+        // also parses under `GenericDialect` (it enables the same
+        // `supports_select_item_multi_column_alias` flag) -- confirming
+        // the fix here is `resolve_select`'s own handling of
+        // `ExprWithAliases`, not merely dialect selection succeeding
+        // where it previously failed to parse at all.
+        assert!(parse_query(r#"select x.payload as (a, b) from "db"."s"."t" as x"#).is_some());
+    }
+
+    /// The same syntax genuinely fails to parse under `SnowflakeDialect`
+    /// -- it does not enable
+    /// `Dialect::supports_select_item_multi_column_alias` -- confirming
+    /// this construct is Databricks'/Spark's, not Snowflake's, contrary
+    /// to what an earlier version of this code's comments assumed.
+    #[test]
+    fn a_multi_column_alias_select_does_not_parse_under_snowflake_dialect() {
+        assert!(
+            parse_query_with_dialect(
+                r#"select x.payload as (a, b) from "db"."s"."t" as x"#,
+                &SnowflakeDialect,
+            )
+            .is_none()
+        );
     }
 
     /// A calculated column that references two distinct upstream columns
@@ -1907,7 +3278,12 @@ mod tests {
 
         let query = parse_query(r#"select x.a + x.b as total from "db"."s"."t" as x"#)
             .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -1947,7 +3323,12 @@ mod tests {
         let query =
             parse_query(r#"select extract(year from x.created_at) as year from "db"."s"."t" as x"#)
                 .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2002,7 +3383,12 @@ mod tests {
 
         for (sql, expected_column) in cases {
             let query = parse_query(sql).expect("should parse");
-            let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+            let schema = resolve_query(
+                &query,
+                &known_relations,
+                &resolved_schemas,
+                &CatalogSchemas::new(),
+            );
             match schema {
                 LocalSchema::Known(cols) => {
                     assert_eq!(cols.len(), 1, "{sql}");
@@ -2033,7 +3419,12 @@ mod tests {
         let query =
             parse_query(r#"select round(x.amount / 100.0, 2) as amount from "db"."s"."t" as x"#)
                 .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2062,7 +3453,12 @@ mod tests {
 
         let query =
             parse_query(r#"select x.a as renamed from "db"."s"."t" as x"#).expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2088,7 +3484,12 @@ mod tests {
             r#"select case when x.a > 0 then x.b else x.c end as result from "db"."s"."t" as x"#,
         )
         .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2124,7 +3525,12 @@ mod tests {
             r#"select sum(x.a) over (partition by x.b) as running_total from "db"."s"."t" as x"#,
         )
         .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2153,7 +3559,12 @@ mod tests {
 
         let query = parse_query(r#"select x.a + x.a as doubled from "db"."s"."t" as x"#)
             .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2187,7 +3598,12 @@ mod tests {
 
         let query = parse_query(r#"select t.payload.user_id from "db"."s"."t" as t"#)
             .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2219,7 +3635,12 @@ mod tests {
 
         let query =
             parse_query(r#"select payload.user_id from "db"."s"."t""#).expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2249,7 +3670,12 @@ mod tests {
 
         let query = parse_query(r#"select t.payload:user_id from "db"."s"."t" as t"#)
             .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2276,7 +3702,12 @@ mod tests {
 
         let query =
             parse_query(r#"select payload:user_id from "db"."s"."t""#).expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2306,7 +3737,12 @@ mod tests {
 
         let query = parse_query(r#"select t.events[0].event_type from "db"."s"."t" as t"#)
             .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2335,7 +3771,12 @@ mod tests {
 
         let query = parse_query(r#"select t.arr[t.idx] as picked from "db"."s"."t" as t"#)
             .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2374,7 +3815,12 @@ mod tests {
                select x.payload.user_id from a as x"#,
         )
         .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2410,7 +3856,12 @@ mod tests {
             r#"select x.a + shared as result from "db"."s1"."t" as x, "db"."s2"."u" as y"#,
         )
         .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -2442,7 +3893,12 @@ mod tests {
             r#"with a as (select x.a + x.b as total from "db"."s"."t" as x) select a.total as my_column from a"#,
         )
         .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -3037,7 +4493,12 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
             r#"select cast(x.raw_payload as struct<user_id bigint, name string>) as payload from "db"."s"."t" as x"#,
         )
         .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -3071,7 +4532,12 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
             r#"select struct(x.user_id as user_id, x.name as name) as payload from "db"."s"."t" as x"#,
         )
         .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -3099,7 +4565,12 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
                 .expect("should parse");
         let known_relations: HashMap<QualifiedName, Upstream> = HashMap::new();
         let resolved_schemas = HashMap::new();
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -3127,7 +4598,12 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
         .expect("should parse");
         let known_relations: HashMap<QualifiedName, Upstream> = HashMap::new();
         let resolved_schemas = HashMap::new();
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -3162,7 +4638,12 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
 
         let query = parse_query(r#"select x.payload as payload from "db"."s"."t" as x"#)
             .expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -3174,6 +4655,56 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
                 );
             }
             other => panic!("expected Known([payload with no struct shape]), got {other:?}"),
+        }
+    }
+
+    /// Unlike a rename sourced from a base table (above, where the real
+    /// shape is genuinely never known), a rename sourced from an earlier
+    /// CTE that itself had an explicit struct shape now carries that
+    /// shape forward -- the same way a scalar column's `sources` already
+    /// carry forward across a CTE hop.
+    #[test]
+    fn a_struct_shape_propagates_forward_across_a_cte_hop() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"with base as (
+                select cast(x.payload as struct<user_id int64, name string>) as payload
+                from "db"."s"."t" as x
+            )
+            select b.payload as renamed_payload from base as b"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "renamed_payload");
+                assert_eq!(
+                    cols[0].struct_fields,
+                    Some(vec![
+                        struct_field("user_id", Some("INT64")),
+                        struct_field("name", Some("STRING")),
+                    ]),
+                    "expected the CTE's own explicit struct shape to survive both the CTE hop \
+                     and the rename"
+                );
+            }
+            other => panic!(
+                "expected Known([renamed_payload carrying base.payload's struct shape]), got \
+                 {other:?}"
+            ),
         }
     }
 
@@ -3206,7 +4737,12 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
         // expansion of it has no way to see it.
         let query =
             parse_query(r#"select *, 1 as extra_col from "db"."s"."up""#).expect("should parse");
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {
@@ -3233,7 +4769,12 @@ echo 'ZHAO_RELATION_EXISTS_RESULT:true'
             .expect("should parse");
         let known_relations: HashMap<QualifiedName, Upstream> = HashMap::new();
         let resolved_schemas = HashMap::new();
-        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
 
         match schema {
             LocalSchema::Known(cols) => {

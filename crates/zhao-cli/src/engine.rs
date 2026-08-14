@@ -87,16 +87,32 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         .clone()
         .or_else(|| config.dbt_command().map(str::to_string))
         .unwrap_or_else(|| "dbt".to_string());
-    let baseline = crate::baseline::resolve(
+    // Checked before Baseline resolution: `zhao check`/`zhao diff` must
+    // never let catalog-backed wildcard expansion (see
+    // `zhao_core::adapters::dbt::DbtAdapter::parse_for_comparison`) apply
+    // asymmetrically to just one side of the comparison -- a Baseline
+    // compiled in a throwaway git worktree essentially never has its own
+    // `catalog.json` (see `crate::baseline::resolve`'s doc comment), so
+    // letting each side decide independently would manufacture a
+    // spurious `ColumnAdded` finding for every `SELECT *`-from-a-source
+    // column, on every run. `crate::baseline::resolve` combines this with
+    // its own side's availability and returns the final, symmetric
+    // decision -- which the current side below must honor exactly, not
+    // re-decide from its own availability alone.
+    let current_catalog_available = adapter.catalog_available(&current_manifest);
+    let (baseline, use_catalog) = crate::baseline::resolve(
         &adapter,
         args.state.as_deref(),
         &args.project_dir,
         &against,
         &dbt_command,
         &dbt_passthrough_args,
+        current_catalog_available,
     )
     .map_err(|err| err.to_string())?;
-    let current = load_manifest(&adapter, &current_manifest)?;
+    let current = adapter
+        .parse_for_comparison(&current_manifest, use_catalog)
+        .map_err(|err| format!("{}: {err}", current_manifest.display()))?;
 
     let changes = diff(&baseline, &current);
     let findings = evaluate(&baseline, &changes, &config);
@@ -320,15 +336,6 @@ fn use_color_decision(
     github_actions_env_set || stdout_is_tty
 }
 
-fn load_manifest(
-    adapter: &ResolvedAdapter,
-    path: &Path,
-) -> Result<zhao_core::model::ParsedProject, String> {
-    adapter
-        .parse(path)
-        .map_err(|err| format!("{path}: {err}", path = path.display()))
-}
-
 /// Root-level files that feed `dbt compile`/`dbt parse` directly, checked
 /// for staleness alongside [`DBT_SOURCE_DIRS`].
 const DBT_SOURCE_ROOT_FILES: &[&str] = &["dbt_project.yml", "packages.yml", "dependencies.yml"];
@@ -360,7 +367,8 @@ const DBT_SOURCE_DIRS: &[&str] = &[
 /// nothing to compare. Also a no-op if either mtime can't be read (best
 /// effort, same precedent as [`is_stale`]'s git-based staleness check);
 /// a genuinely missing/unreadable manifest still surfaces its own clear
-/// error from [`load_manifest`] right after this check runs.
+/// error from [`crate::adapter::ResolvedAdapter::parse_for_comparison`]
+/// right after this check runs.
 fn check_current_manifest_freshness(
     project_dir: &Path,
     manifest_path: &Path,

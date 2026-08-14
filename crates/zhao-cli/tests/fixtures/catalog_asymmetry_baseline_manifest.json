@@ -1,0 +1,28 @@
+{
+    "metadata": {
+        "adapter_type": "duckdb"
+    },
+    "nodes": {
+        "model.catalog_asymmetry.m": {
+            "unique_id": "model.catalog_asymmetry.m",
+            "resource_type": "model",
+            "name": "m",
+            "database": "db",
+            "schema": "s",
+            "alias": "m",
+            "depends_on": {
+                "nodes": ["source.catalog_asymmetry.raw.t"]
+            },
+            "compiled_code": "select * from \"db\".\"raw\".\"t\""
+        }
+    },
+    "sources": {
+        "source.catalog_asymmetry.raw.t": {
+            "unique_id": "source.catalog_asymmetry.raw.t",
+            "name": "t",
+            "database": "db",
+            "schema": "raw",
+            "identifier": "t"
+        }
+    }
+}

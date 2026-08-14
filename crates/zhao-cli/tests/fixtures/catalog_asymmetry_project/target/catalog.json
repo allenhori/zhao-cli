@@ -1,0 +1,11 @@
+{
+    "nodes": {},
+    "sources": {
+        "source.catalog_asymmetry.raw.t": {
+            "columns": {
+                "id": {"name": "id", "index": 1},
+                "amount": {"name": "amount", "index": 2}
+            }
+        }
+    }
+}
