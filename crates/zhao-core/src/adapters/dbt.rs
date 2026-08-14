@@ -12,17 +12,23 @@
 //!
 //! Column-level resolution handles the common shape of dbt-compiled SQL:
 //! a chain of CTEs feeding a final `SELECT`, `SELECT *` passthrough, plain
-//! and qualified column references, and simple aliasing. It deliberately
-//! does not attempt to resolve columns through `UNION`/`UNION ALL`, inline
-//! subqueries in a `FROM` clause (as opposed to CTEs), or window functions --
-//! those cases fall back to an unresolved (but still node-level-tracked)
-//! dependency rather than a guessed column mapping. Getting a column
-//! mapping wrong silently would be worse than not having one. Likewise, an
-//! Origin's real columns are never known (dbt's manifest doesn't carry a
-//! source's actual schema), so a wildcard that would need to enumerate an
-//! Origin's columns can't be expanded -- only identity ("this column,
-//! whatever it's called, passes through unchanged") relationships to an
-//! Origin are tracked.
+//! and qualified column references, and simple aliasing. It also resolves
+//! `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` (each arm resolved
+//! independently, then merged column-by-column -- see
+//! `merge_set_operation_arms`) and an inline subquery directly in a `FROM`
+//! clause (resolved as a nested scope, the same machinery a `WITH`-defined
+//! CTE already uses -- see `resolve_query_in_scope`). It deliberately does
+//! not attempt to resolve columns through a table-valued function in
+//! `FROM` or a window function -- those cases fall back to an unresolved
+//! (but still node-level-tracked) dependency rather than a guessed column
+//! mapping. Getting a column mapping wrong silently would be worse than
+//! not having one. Likewise, an Origin's real columns are never known from
+//! `manifest.json` alone (dbt's manifest doesn't carry a source's actual
+//! schema), so a wildcard that would need to enumerate an Origin's columns
+//! can't be expanded from the manifest alone -- only identity ("this
+//! column, whatever it's called, passes through unchanged") relationships
+//! to an Origin are tracked, unless a sibling `catalog.json` is also
+//! available (see [`read_catalog`]).
 //!
 //! A calculated column (a function call, `CAST`, arithmetic, `CASE`, or one
 //! of `EXTRACT`/`CEIL`/`FLOOR`/`POSITION`/`SUBSTRING`/`TRIM`/`OVERLAY` --
@@ -825,8 +831,9 @@ enum LocalSchema {
     Passthrough(Upstream),
     /// An explicit, fully-known projection list.
     Known(Vec<ResolvedColumn>),
-    /// Couldn't resolve (e.g. a `UNION`, a subquery in `FROM`, or an
-    /// ambiguous unqualified wildcard) -- opaque past this point.
+    /// Couldn't resolve (e.g. a table-valued function in `FROM`, a window
+    /// function, or an ambiguous unqualified wildcard) -- opaque past this
+    /// point.
     Opaque,
 }
 
@@ -877,7 +884,24 @@ fn resolve_query(
     known_relations: &HashMap<QualifiedName, Upstream>,
     resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
 ) -> LocalSchema {
-    let mut scope: HashMap<String, LocalSchema> = HashMap::new();
+    resolve_query_in_scope(query, &HashMap::new(), known_relations, resolved_schemas)
+}
+
+/// The shared implementation behind [`resolve_query`] and an inline `FROM`
+/// subquery ([`collect_table_factor`]'s `TableFactor::Derived` arm): resolves
+/// `query`'s own CTEs, in order, on top of an `outer_scope` that's already in
+/// effect (empty at the top-level model query; the enclosing query's own
+/// scope for a nested subquery, since a CTE defined in an outer query is
+/// visible to a subquery nested in its `FROM` clause, same as real SQL name
+/// resolution), then resolves `query`'s final body against the combined
+/// scope.
+fn resolve_query_in_scope(
+    query: &Query,
+    outer_scope: &HashMap<String, LocalSchema>,
+    known_relations: &HashMap<QualifiedName, Upstream>,
+    resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+) -> LocalSchema {
+    let mut scope = outer_scope.clone();
 
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
@@ -898,8 +922,89 @@ fn resolve_set_expr(
 ) -> LocalSchema {
     match body {
         SetExpr::Select(select) => resolve_select(select, scope, known_relations, resolved_schemas),
-        // UNION/INTERSECT/EXCEPT and anything else: not attempted, see
-        // module-level "Known limitations" doc comment.
+        // A parenthesized subquery body: resolves exactly like the query
+        // it wraps.
+        SetExpr::Query(query) => {
+            resolve_query_in_scope(query, scope, known_relations, resolved_schemas)
+        }
+        // UNION/INTERSECT/EXCEPT: each arm is resolved independently, then
+        // merged column-by-column (see `merge_set_operation_arms`) --
+        // standard SQL set-operation semantics require both arms to already
+        // have the same column count, in the same positional order.
+        SetExpr::SetOperation { left, right, .. } => {
+            let left_schema = resolve_set_expr(left, scope, known_relations, resolved_schemas);
+            let right_schema = resolve_set_expr(right, scope, known_relations, resolved_schemas);
+            merge_set_operation_arms(&left_schema, &right_schema, resolved_schemas)
+        }
+        // VALUES, and DML bodies that can't legally appear here anyway:
+        // not attempted, see module-level "Known limitations" doc comment.
+        _ => LocalSchema::Opaque,
+    }
+}
+
+/// Merges two already-resolved `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` arms
+/// into the result's own [`LocalSchema`]. Real SQL requires both arms to
+/// project the same number of columns, in the same positional order -- the
+/// *names* don't have to match (the result takes the left arm's names,
+/// exactly as every warehouse does), and at runtime a given output row (and
+/// so a given output column's value) can come from either arm, so a result
+/// column's `sources` is the union of what each arm resolves that same
+/// positional column to. This applies uniformly to `INTERSECT`/`EXCEPT` too,
+/// not just `UNION` -- keeping one merge rule for all three set operators
+/// rather than modeling `EXCEPT`'s row-filtering semantics more precisely.
+///
+/// Either arm can itself already be a `Passthrough` (e.g. `select * from a
+/// union select * from b`) -- those are expanded via
+/// [`expand_wildcard_of`] first, using the same already-resolved-Node
+/// column lists a plain wildcard expansion uses. If both arms can't be
+/// reduced to an explicit, equal-length column list, the whole union is
+/// `Opaque` -- a mismatched shape isn't valid SQL to begin with, and
+/// guessing which columns line up would be worse than admitting we don't
+/// know.
+fn merge_set_operation_arms(
+    left: &LocalSchema,
+    right: &LocalSchema,
+    resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+) -> LocalSchema {
+    let left_cols = expand_wildcard_of(left, resolved_schemas);
+    let right_cols = expand_wildcard_of(right, resolved_schemas);
+
+    match (left_cols, right_cols) {
+        (Some(left_cols), Some(right_cols))
+            if !left_cols.is_empty() && left_cols.len() == right_cols.len() =>
+        {
+            let merged = left_cols
+                .into_iter()
+                .zip(right_cols)
+                .map(|(l, r)| {
+                    let mut sources = l.sources.clone();
+                    for candidate in r.sources {
+                        if !sources.contains(&candidate) {
+                            sources.push(candidate);
+                        }
+                    }
+                    ResolvedColumn {
+                        name: l.name,
+                        sources,
+                        // A calculated column's rendered SQL, or a struct's
+                        // internal shape, can legitimately differ between
+                        // arms -- only report either when both arms agree,
+                        // rather than picking one arm's arbitrarily.
+                        expression: if l.expression == r.expression {
+                            l.expression
+                        } else {
+                            None
+                        },
+                        struct_fields: if l.struct_fields == r.struct_fields {
+                            l.struct_fields
+                        } else {
+                            None
+                        },
+                    }
+                })
+                .collect();
+            LocalSchema::Known(merged)
+        }
         _ => LocalSchema::Opaque,
     }
 }
@@ -1016,9 +1121,24 @@ fn collect_table_factor(
     factor: &TableFactor,
     scope: &HashMap<String, LocalSchema>,
     known_relations: &HashMap<QualifiedName, Upstream>,
-    _resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
+    resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
     collected: &mut Vec<(String, LocalSchema)>,
 ) {
+    if let TableFactor::Derived {
+        subquery, alias, ..
+    } = factor
+    {
+        // An inline subquery directly in `FROM` (as opposed to a
+        // `WITH`-defined CTE, handled in `resolve_query_in_scope`):
+        // resolved the same way a CTE's own query is, as a nested scope
+        // that inherits whatever CTEs are already visible here, then
+        // treated exactly like a CTE's `Known` schema by the outer query.
+        let resolved = resolve_query_in_scope(subquery, scope, known_relations, resolved_schemas);
+        let effective_alias = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_default();
+        collected.push((effective_alias, resolved));
+        return;
+    }
+
     if let TableFactor::Table { name, alias, .. } = factor {
         let parts: Vec<String> = name
             .0
@@ -1046,8 +1166,11 @@ fn collect_table_factor(
 
         collected.push((effective_alias, resolved));
     }
-    // Derived subqueries / table functions in FROM: not attempted (see
-    // module-level "Known limitations").
+    // A table-valued function in FROM (`TableFactor::TableFunction`, or a
+    // `TableFactor::Table` whose `args` is `Some(..)`): not attempted, see
+    // module-level "Known limitations" doc comment. Simply not pushed into
+    // `collected` -- its alias never enters `from_scope`, so any reference
+    // to it resolves the same way any other unrecognized name would.
 }
 
 /// Expands a bare `SELECT *` mixed with other projections, or where
@@ -1890,6 +2013,142 @@ mod tests {
             }
             other => panic!("expected Known([name sourced from tbl via CTE a]), got {other:?}"),
         }
+    }
+
+    /// A two-arm `UNION` resolves each result column to the union of what
+    /// *both* arms resolve that same positional column to -- at runtime the
+    /// value could come from either arm, so both are real lineage, not just
+    /// the left arm's.
+    #[test]
+    fn a_two_arm_union_resolves_each_column_to_both_arms_sources() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t1".to_string()),
+            origin("origin.s.t1"),
+        );
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t2".to_string()),
+            origin("origin.s.t2"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"select a, b from "db"."s"."t1" union select a, b from "db"."s"."t2""#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 2);
+                assert_eq!(cols[0].name, "a");
+                assert_eq!(
+                    cols[0].sources,
+                    vec![
+                        (origin("origin.s.t1"), "a".to_string()),
+                        (origin("origin.s.t2"), "a".to_string()),
+                    ]
+                );
+                assert_eq!(cols[1].name, "b");
+                assert_eq!(
+                    cols[1].sources,
+                    vec![
+                        (origin("origin.s.t1"), "b".to_string()),
+                        (origin("origin.s.t2"), "b".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Known([a, b] each sourced from both arms), got {other:?}"),
+        }
+    }
+
+    /// `UNION ALL` resolves exactly like `UNION` for lineage purposes --
+    /// the `ALL`/`DISTINCT` quantifier only affects duplicate-row handling,
+    /// not which columns a value can come from.
+    #[test]
+    fn a_union_all_resolves_each_column_to_both_arms_sources() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t1".to_string()),
+            origin("origin.s.t1"),
+        );
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t2".to_string()),
+            origin("origin.s.t2"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"select a from "db"."s"."t1" union all select a from "db"."s"."t2""#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![
+                        (origin("origin.s.t1"), "a".to_string()),
+                        (origin("origin.s.t2"), "a".to_string()),
+                    ]
+                );
+            }
+            other => panic!("expected Known([a] sourced from both arms), got {other:?}"),
+        }
+    }
+
+    /// An inline subquery directly in `FROM` (as opposed to a
+    /// `WITH`-defined CTE) resolves its own `SELECT` list as a nested
+    /// scope, then is treated exactly like a CTE's `Known` schema by the
+    /// outer query.
+    #[test]
+    fn an_inline_from_subquery_resolves_correctly() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query(
+            r#"select inner_alias.id as outer_id from (select id from "db"."s"."t") as inner_alias"#,
+        )
+        .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(cols[0].name, "outer_id");
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "id".to_string())]
+                );
+            }
+            other => panic!("expected Known([outer_id] sourced from t.id), got {other:?}"),
+        }
+    }
+
+    /// Regression guard: a table-valued function in `FROM` (as opposed to a
+    /// plain table/CTE reference) must still correctly fall back to
+    /// `Opaque` now that `UNION` and inline `FROM` subqueries resolve --
+    /// this case stays deliberately unsolved (see the module-level "Known
+    /// limitations" doc comment).
+    #[test]
+    fn a_table_valued_function_in_from_still_falls_back_to_opaque() {
+        let known_relations = HashMap::new();
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query("select * from generate_series(1, 10) as g")
+            .expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas);
+
+        assert!(
+            matches!(schema, LocalSchema::Opaque),
+            "expected Opaque for a table-valued function in FROM, got {schema:?}"
+        );
     }
 
     /// A calculated column that references two distinct upstream columns
