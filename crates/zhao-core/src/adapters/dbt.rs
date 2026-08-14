@@ -95,7 +95,10 @@ use sqlparser::ast::{
     AccessExpr, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select,
     SelectItem, SetExpr, Statement, Subscript, TableFactor, TableWithJoins, Value,
 };
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{
+    BigQueryDialect, DatabricksDialect, Dialect, DuckDbDialect, GenericDialect, MySqlDialect,
+    PostgreSqlDialect, RedshiftSqlDialect, SnowflakeDialect, SparkSqlDialect,
+};
 use sqlparser::parser::Parser as SqlParser;
 use std::collections::HashMap;
 use std::fs;
@@ -697,6 +700,12 @@ fn build_parsed_project(manifest: &RawManifest, catalog: &CatalogSchemas) -> Par
     // upstream's already-resolved column list to expand.
     let ordered = topological_order(&models);
 
+    // Every model in one manifest was compiled against the same target,
+    // so one dialect (picked once, from the manifest's own
+    // `metadata.adapter_type`) applies to every model's `compiled_code` --
+    // see `resolve_sql_dialect`.
+    let dialect = resolve_sql_dialect(manifest.metadata.adapter_type.as_deref());
+
     let mut nodes = Vec::with_capacity(ordered.len());
     let mut edges = Vec::new();
     let mut resolved_schemas: HashMap<NodeId, Vec<ColumnName>> = HashMap::new();
@@ -704,7 +713,10 @@ fn build_parsed_project(manifest: &RawManifest, catalog: &CatalogSchemas) -> Par
     for model in ordered {
         let node_id = NodeId::new(model.unique_id.clone());
 
-        let parsed_query = model.compiled_code.as_deref().and_then(parse_query);
+        let parsed_query = model
+            .compiled_code
+            .as_deref()
+            .and_then(|sql| parse_query_with_dialect(sql, dialect.as_ref()));
         let local_schema = parsed_query
             .as_ref()
             .map(|query| resolve_query(query, &known_relations, &resolved_schemas, catalog))
@@ -954,13 +966,55 @@ enum LocalSchema {
     AmbiguousAlias(Vec<LocalSchema>),
 }
 
+/// Parses `sql` against [`GenericDialect`] -- the default every existing
+/// caller/test in this module used before dialect-aware parsing existed,
+/// and still what every test that isn't specifically exercising a
+/// non-generic construct uses. [`build_parsed_project`] itself uses
+/// [`parse_query_with_dialect`] instead, selecting whichever dialect the
+/// manifest's own `metadata.adapter_type` calls for (see
+/// [`resolve_sql_dialect`]). `#[cfg(test)]`-only: nothing in production
+/// code parses against a hardcoded dialect anymore.
+#[cfg(test)]
 fn parse_query(sql: &str) -> Option<Query> {
-    let dialect = GenericDialect {};
-    let statements = SqlParser::parse_sql(&dialect, sql).ok()?;
+    parse_query_with_dialect(sql, &GenericDialect {})
+}
+
+/// Parses `sql` against a specific `dialect` -- see [`resolve_sql_dialect`]
+/// for how a compiled model's own SQL picks one.
+fn parse_query_with_dialect(sql: &str, dialect: &dyn Dialect) -> Option<Query> {
+    let statements = SqlParser::parse_sql(dialect, sql).ok()?;
     statements.into_iter().find_map(|stmt| match stmt {
         Statement::Query(query) => Some(*query),
         _ => None,
     })
+}
+
+/// Selects the `sqlparser` [`Dialect`] matching a manifest's own
+/// `metadata.adapter_type` (dbt's name for whichever warehouse it
+/// compiled against -- see [`RawManifestMetadata`]), so a warehouse-
+/// specific SQL construct a compiled model actually uses parses the way
+/// that warehouse's own SQL dialect defines it, rather than however
+/// [`GenericDialect`] happens to interpret (or reject) the same syntax.
+/// Matched case-insensitively against dbt's own
+/// lowercase adapter names. Falls back to [`GenericDialect`] for an
+/// adapter type this crate doesn't have (or doesn't recognize) a more
+/// specific dialect for -- including `adapter_type` being entirely
+/// absent (an unusually old or nonstandard manifest) -- never an error;
+/// `GenericDialect` is also what this crate always used before
+/// dialect-aware parsing existed, so an unrecognized adapter type is no
+/// worse off than before.
+fn resolve_sql_dialect(adapter_type: Option<&str>) -> Box<dyn Dialect> {
+    match adapter_type.map(str::to_ascii_lowercase).as_deref() {
+        Some("snowflake") => Box::new(SnowflakeDialect),
+        Some("bigquery") => Box::new(BigQueryDialect),
+        Some("databricks") => Box::new(DatabricksDialect),
+        Some("spark") => Box::new(SparkSqlDialect),
+        Some("postgres") => Box::new(PostgreSqlDialect {}),
+        Some("redshift") => Box::new(RedshiftSqlDialect {}),
+        Some("duckdb") => Box::new(DuckDbDialect),
+        Some("mysql") => Box::new(MySqlDialect {}),
+        _ => Box::new(GenericDialect {}),
+    }
 }
 
 /// The kind of each join in a query's final `SELECT`'s `FROM` clause, in
@@ -1209,10 +1263,31 @@ fn resolve_select(
                     catalog,
                 ));
             }
-            // A Snowflake-specific `expr AS (a, b, c)` tuple-expansion
-            // syntax we don't compile against; not attempted (see module
-            // docs' "Known limitations").
-            SelectItem::ExprWithAliases { .. } => return LocalSchema::Opaque,
+            // Spark/Databricks' parenthesized multi-column alias syntax,
+            // `expr AS (a, b, c)` (e.g. `stack(2, 'a', 'b') AS (col1,
+            // col2)`) -- `sqlparser` gates this behind
+            // `Dialect::supports_select_item_multi_column_alias`, which
+            // `GenericDialect`, `DatabricksDialect`, and `SparkSqlDialect`
+            // all enable (only `SnowflakeDialect` -- despite this arm's
+            // previous doc comment calling it Snowflake-specific -- does
+            // not). `expr` is one expression producing every aliased
+            // output column at once (e.g. a table function's multiple
+            // return columns), so every alias shares the same traced
+            // sources and rendered expression text -- there's no way to
+            // attribute a *specific* upstream column to a *specific*
+            // alias from the SQL alone.
+            SelectItem::ExprWithAliases { expr, aliases } => {
+                let sources = collect_expr_sources(expr, &from_scope, catalog);
+                let expression = Some(expr.to_string());
+                for alias in aliases {
+                    columns.push(ResolvedColumn {
+                        name: alias.value.clone(),
+                        sources: sources.clone(),
+                        expression: expression.clone(),
+                        struct_fields: None,
+                    });
+                }
+            }
         }
     }
 
@@ -2707,6 +2782,107 @@ mod tests {
         assert_eq!(
             catalog.get("source.p.raw.t"),
             Some(&vec!["amount".to_string()])
+        );
+    }
+
+    /// [`resolve_sql_dialect`] picks a recognized adapter type's dedicated
+    /// `sqlparser` dialect (matched case-insensitively), and falls back to
+    /// [`GenericDialect`] for anything it doesn't recognize -- including
+    /// no `adapter_type` at all.
+    #[test]
+    fn resolve_sql_dialect_matches_known_adapter_types_case_insensitively() {
+        use std::any::TypeId;
+
+        assert_eq!(
+            resolve_sql_dialect(Some("Snowflake")).dialect(),
+            TypeId::of::<SnowflakeDialect>()
+        );
+        assert_eq!(
+            resolve_sql_dialect(Some("bigquery")).dialect(),
+            TypeId::of::<BigQueryDialect>()
+        );
+        assert_eq!(
+            resolve_sql_dialect(Some("DATABRICKS")).dialect(),
+            TypeId::of::<DatabricksDialect>()
+        );
+        assert_eq!(
+            resolve_sql_dialect(Some("some-unknown-adapter")).dialect(),
+            TypeId::of::<GenericDialect>()
+        );
+        assert_eq!(
+            resolve_sql_dialect(None).dialect(),
+            TypeId::of::<GenericDialect>()
+        );
+    }
+
+    /// Databricks'/Spark's parenthesized multi-column alias `SELECT`
+    /// syntax (`expr AS (a, b, c)`) -- gated behind
+    /// `Dialect::supports_select_item_multi_column_alias`, which
+    /// `resolve_sql_dialect` now correctly selects `DatabricksDialect`
+    /// for -- resolves each aliased output column to whatever the shared
+    /// expression structurally references, instead of the whole query
+    /// falling back to `Opaque` the way `SelectItem::ExprWithAliases`
+    /// used to unconditionally.
+    #[test]
+    fn a_multi_column_alias_select_resolves_under_databricks_dialect() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+
+        let query = parse_query_with_dialect(
+            r#"select x.payload as (a, b) from "db"."s"."t" as x"#,
+            resolve_sql_dialect(Some("databricks")).as_ref(),
+        )
+        .expect("should parse under DatabricksDialect");
+        let schema = resolve_query(
+            &query,
+            &known_relations,
+            &resolved_schemas,
+            &CatalogSchemas::new(),
+        );
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 2);
+                assert_eq!(cols[0].name, "a");
+                assert_eq!(cols[1].name, "b");
+                for col in &cols {
+                    assert_eq!(
+                        col.sources,
+                        vec![(origin("origin.s.t"), "payload".to_string())],
+                        "expected both aliases to share the tuple-expansion \
+                         expression's own traced sources"
+                    );
+                }
+            }
+            other => panic!("expected Known([a, b] both sourced from payload), got {other:?}"),
+        }
+
+        // Unlike a genuinely dialect-exclusive construct, this syntax
+        // also parses under `GenericDialect` (it enables the same
+        // `supports_select_item_multi_column_alias` flag) -- confirming
+        // the fix here is `resolve_select`'s own handling of
+        // `ExprWithAliases`, not merely dialect selection succeeding
+        // where it previously failed to parse at all.
+        assert!(parse_query(r#"select x.payload as (a, b) from "db"."s"."t" as x"#).is_some());
+    }
+
+    /// The same syntax genuinely fails to parse under `SnowflakeDialect`
+    /// -- it does not enable
+    /// `Dialect::supports_select_item_multi_column_alias` -- confirming
+    /// this construct is Databricks'/Spark's, not Snowflake's, contrary
+    /// to what an earlier version of this code's comments assumed.
+    #[test]
+    fn a_multi_column_alias_select_does_not_parse_under_snowflake_dialect() {
+        assert!(
+            parse_query_with_dialect(
+                r#"select x.payload as (a, b) from "db"."s"."t" as x"#,
+                &SnowflakeDialect,
+            )
+            .is_none()
         );
     }
 
