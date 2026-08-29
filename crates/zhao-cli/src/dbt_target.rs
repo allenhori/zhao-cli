@@ -47,6 +47,42 @@ pub(crate) fn resolve_target_dir(project_dir: &Path, dbt_passthrough_args: &[Str
     }
 }
 
+/// Removes every `--target-path <dir>`/`--target-path=<dir>` pair from
+/// `dbt_passthrough_args`, leaving every other argument untouched and in
+/// order.
+///
+/// A `--target-path` override exists to isolate *one* compile's output
+/// -- e.g. a caller like `zhao-vscode-ext` pointing `zhao lineage
+/// --compile` at a temp directory so it never touches the project's
+/// real `target/`. That same passthrough list also reaches
+/// `zhao check`/`zhao diff`'s Baseline resolution (`crate::baseline::resolve`),
+/// which compiles into its own throwaway git worktree -- already
+/// isolated on its own terms. Forwarding the override there too would
+/// make the Baseline's compile land at that *same* absolute path,
+/// silently clobbering whatever the caller's own isolated compile had
+/// just written there (a write collision, not merely a wrong read) --
+/// this is the fix: the Baseline's own `deps`/`compile` calls are given
+/// this stripped list instead of `extra_args` directly, so they always
+/// land in the worktree's own default `target/`, regardless of any
+/// `--target-path` an unrelated part of the same invocation configured.
+pub(crate) fn strip_target_path_override(dbt_passthrough_args: &[String]) -> Vec<String> {
+    let mut result = Vec::with_capacity(dbt_passthrough_args.len());
+    let mut iter = dbt_passthrough_args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg.starts_with("--target-path=") {
+            continue;
+        }
+        if arg == "--target-path" {
+            if iter.peek().is_some() {
+                iter.next();
+            }
+            continue;
+        }
+        result.push(arg.clone());
+    }
+    result
+}
+
 /// Resolves the final `(dbt_command, dbt_passthrough_args)` pair to use
 /// for a `dbt` subprocess invocation, from a CLI-level `--dbt-command`/
 /// already-split passthrough-args pair plus `zhao.yml`'s own
@@ -84,6 +120,49 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn strip_target_path_override_removes_a_space_separated_pair() {
+        let result =
+            strip_target_path_override(&args(&["--target", "ci", "--target-path", "/tmp/x"]));
+        assert_eq!(result, args(&["--target", "ci"]));
+    }
+
+    #[test]
+    fn strip_target_path_override_removes_the_equals_form() {
+        let result = strip_target_path_override(&args(&["--target-path=/tmp/x", "--full-refresh"]));
+        assert_eq!(result, args(&["--full-refresh"]));
+    }
+
+    #[test]
+    fn strip_target_path_override_removes_every_occurrence() {
+        let result = strip_target_path_override(&args(&[
+            "--target-path",
+            "first",
+            "--target",
+            "ci",
+            "--target-path",
+            "second",
+        ]));
+        assert_eq!(result, args(&["--target", "ci"]));
+    }
+
+    #[test]
+    fn strip_target_path_override_leaves_unrelated_args_untouched() {
+        let result = strip_target_path_override(&args(&["--target", "ci", "--full-refresh"]));
+        assert_eq!(result, args(&["--target", "ci", "--full-refresh"]));
+    }
+
+    #[test]
+    fn strip_target_path_override_on_an_empty_list_is_a_no_op() {
+        assert_eq!(strip_target_path_override(&[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn strip_target_path_override_ignores_a_trailing_flag_with_no_value() {
+        let result = strip_target_path_override(&args(&["--target", "ci", "--target-path"]));
+        assert_eq!(result, args(&["--target", "ci"]));
     }
 
     /// An empty config -- `Config::load` on a nonexistent path is the

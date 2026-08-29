@@ -53,7 +53,13 @@ pub enum BaselineError {
 /// first time. `dbt_command` (from `--dbt-command`/`zhao.yml`'s
 /// `dbt-command`, defaulting to `"dbt"`) is the executable/prefix both
 /// invocations use; `extra_args` (from `--dbt-arg`/`--dbt-args`) are
-/// appended verbatim to both the `dbt deps` and `dbt compile` invocations.
+/// appended verbatim to both the `dbt deps` and `dbt compile`
+/// invocations -- with one exception: a `--target-path` override in
+/// `extra_args` is stripped before either call (see
+/// `crate::dbt_target::strip_target_path_override`), since the
+/// Baseline already has its own isolation (this throwaway worktree) and
+/// that override exists for a different purpose entirely, elsewhere in
+/// the same invocation.
 ///
 /// Before the temporary worktree is torn down (it's removed the moment
 /// this function returns -- see [`git::Worktree`]'s own `Drop`), its
@@ -118,6 +124,19 @@ pub fn resolve(
     let worktree = git::create_worktree(&canonical_repo_root, &merge_base)?;
     let worktree_project_dir = worktree.path().join(relative_project_dir);
 
+    // Never forward a `--target-path` override from `extra_args` to the
+    // Baseline's own `deps`/`compile` calls: the Baseline already has
+    // its own isolation (this throwaway worktree), and a `--target-path`
+    // here exists for a *different* purpose entirely -- e.g.
+    // `zhao-vscode-ext` isolating the *current* side's compile to a temp
+    // directory it later reads back from (see `crate::engine::build_report`'s
+    // `current_manifest`). Forwarding it here would make this compile
+    // land at that same absolute path too, silently clobbering whatever
+    // the caller's own isolated compile had just written there -- a
+    // write collision, not merely a wrong read. See
+    // `crate::dbt_target::strip_target_path_override`.
+    let baseline_extra_args = crate::dbt_target::strip_target_path_override(extra_args);
+
     if worktree_project_dir.join("packages.yml").exists()
         || worktree_project_dir.join("dependencies.yml").exists()
     {
@@ -125,14 +144,14 @@ pub fn resolve(
             "deps",
             &worktree_project_dir,
             project_dir,
-            adapter.deps(&worktree_project_dir, dbt_command, extra_args),
+            adapter.deps(&worktree_project_dir, dbt_command, &baseline_extra_args),
         )?;
     }
     crate::log::log_dbt_result(
         "compile",
         &worktree_project_dir,
         project_dir,
-        adapter.compile(&worktree_project_dir, dbt_command, extra_args),
+        adapter.compile(&worktree_project_dir, dbt_command, &baseline_extra_args),
     )?;
 
     let manifest_path = worktree_project_dir.join("target").join("manifest.json");

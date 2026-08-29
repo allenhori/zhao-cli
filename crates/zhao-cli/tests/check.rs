@@ -1461,6 +1461,105 @@ mod git_native_baseline {
         );
     }
 
+    /// A `dbt` stub that honors `--target-path <dir>` (or defaults to
+    /// `target`) the same way real `dbt compile` does -- unlike
+    /// `stub_dbt_dir`, which always writes to the literal `target/`
+    /// regardless of any passthrough args.
+    fn target_path_aware_stub_dbt_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let path = dir.path().join("dbt");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             target_dir=target\n\
+             prev=\"\"\n\
+             for arg in \"$@\"; do\n\
+             \x20\x20if [ \"$prev\" = \"--target-path\" ]; then target_dir=\"$arg\"; fi\n\
+             \x20\x20prev=\"$arg\"\n\
+             done\n\
+             if [ \"$1\" = \"compile\" ]; then\n\
+             \x20\x20mkdir -p \"$target_dir\"\n\
+             \x20\x20cp dbt_manifest_source.json \"$target_dir/manifest.json\"\n\
+             fi\n",
+        )
+        .expect("should write stub dbt script");
+        let mut perms = std::fs::metadata(&path)
+            .expect("should stat stub script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("should chmod stub script");
+        dir
+    }
+
+    /// The bug a `zhao-vscode-ext` diff-highlight refresh would hit
+    /// otherwise: `--dbt-args "--target-path <dir>"` isolates the
+    /// *current* manifest read (see `crate::dbt_target::resolve_target_dir`,
+    /// used by `engine.rs`), but the exact same passthrough args also
+    /// reach the Baseline's own worktree compile -- so the override must
+    /// redirect *that* compile's manifest read too, or Baseline
+    /// resolution fails with a spurious "manifest not found" even though
+    /// the compile itself actually succeeded, just not where the read
+    /// was still looking.
+    #[test]
+    fn a_target_path_override_isolates_the_baseline_compile_too_and_is_read_back_from_there() {
+        let stub_dir = target_path_aware_stub_dbt_dir();
+        let repo = new_test_repo();
+        repo.write("dbt_manifest_source.json", &rules_baseline_manifest_json());
+        repo.commit("baseline state");
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("README.md", "an unrelated change on the feature branch\n");
+        repo.commit("feature work, ahead of master");
+
+        // The *current* side, isolated the same way `zhao lineage
+        // --compile` would have already isolated it -- written directly
+        // here (matching `repo_with_baseline_and_current`'s convention)
+        // since this test is about Baseline resolution, not re-proving
+        // the current-side fix issue #68 already covers.
+        let current_target_path = tempfile::tempdir().expect("should create temp dir");
+        std::fs::write(
+            current_target_path.path().join("manifest.json"),
+            rules_project_current_manifest_json(),
+        )
+        .expect("should write current manifest");
+
+        let output = Command::cargo_bin("zhao")
+            .expect("binary should build")
+            .env("PATH", path_with_stub_dbt_prepended(&stub_dir))
+            .arg("check")
+            .arg("--project-dir")
+            .arg(&repo.path)
+            .arg("--format")
+            .arg("json")
+            .arg("--dbt-arg")
+            .arg("--target-path")
+            .arg("--dbt-arg")
+            .arg(current_target_path.path())
+            .output()
+            .expect("command should run");
+
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "expected exit 0 or 1 (Baseline resolution should succeed), got {:?}; stderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
+        assert_eq!(
+            parsed["findings"]
+                .as_array()
+                .expect("findings should be an array")
+                .len(),
+            1,
+            "expected the same single finding resolves_and_compiles_the_merge_base_commit_as_the_baseline asserts: {parsed:#?}"
+        );
+
+        assert!(
+            !repo.path.join("target").join("manifest.json").exists(),
+            "the project's real target/manifest.json should never be written"
+        );
+    }
+
     /// Same shape as `repo_with_baseline_and_current`, but the default
     /// branch is named `main` (not `master`) -- since zhao's own
     /// hardcoded default is `"master"`, a merge-base resolution that
