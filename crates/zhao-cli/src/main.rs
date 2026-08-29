@@ -10,6 +10,7 @@ mod addon;
 mod baseline;
 mod check;
 mod cli;
+mod dbt_target;
 mod diff;
 mod engine;
 mod lineage;

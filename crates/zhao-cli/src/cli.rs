@@ -65,9 +65,12 @@ pub struct LineageArgs {
     pub target: Option<String>,
 
     /// The dbt project directory to query. Its current compiled manifest
-    /// is read from `<project-dir>/target/manifest.json`, as-is -- run
-    /// `dbt compile` in the project before invoking `zhao lineage` (or
-    /// pass `--compile`).
+    /// is read from `<project-dir>/target/manifest.json` by default --
+    /// run `dbt compile` in the project before invoking `zhao lineage`
+    /// (or pass `--compile`) -- unless `--dbt-arg`/`--dbt-args` includes
+    /// a `--target-path` override, in which case the manifest is read
+    /// from `<project-dir>/<target-path>/manifest.json` instead. See
+    /// `crate::dbt_target::resolve_target_dir`.
     #[arg(long, default_value = ".")]
     pub project_dir: PathBuf,
 
@@ -120,9 +123,59 @@ pub struct LineageArgs {
     /// purging happens at all -- the default is "keep everything."
     #[arg(long = "purge-logs")]
     pub purge_logs: Option<u32>,
+
+    /// An extra argument to append to the `dbt compile` invocation
+    /// `--compile` runs -- repeat for multiple arguments, e.g.
+    /// `--dbt-arg --target --dbt-arg ci`. Appended verbatim, in the
+    /// order given; zhao never parses or validates these, dbt does --
+    /// except a `--target-path <dir>` pair (or `--target-path=<dir>`),
+    /// which zhao also reads back itself to locate the resulting
+    /// `manifest.json`, so `--compile`'s output can be isolated to a
+    /// directory other than the project's real `target/` without zhao
+    /// losing track of where to read it from afterward. Mutually
+    /// exclusive with `--dbt-args`.
+    #[arg(
+        long = "dbt-arg",
+        conflicts_with = "dbt_args",
+        allow_hyphen_values = true
+    )]
+    pub dbt_arg: Vec<String>,
+
+    /// A single dbt-invocation-shaped string to split (shell-word-style)
+    /// into individual arguments and append to the `dbt compile`
+    /// invocation `--compile` runs -- a convenience alternative to
+    /// repeating `--dbt-arg`, e.g. `--dbt-args "--target-path /tmp/zhao
+    /// --target ci"`. Same `--target-path` handling as `--dbt-arg`.
+    /// Mutually exclusive with `--dbt-arg`.
+    #[arg(
+        long = "dbt-args",
+        conflicts_with = "dbt_arg",
+        allow_hyphen_values = true
+    )]
+    pub dbt_args: Option<String>,
+
+    /// The executable/prefix zhao invokes for the `dbt compile`
+    /// subprocess `--compile` runs -- ordinarily just `"dbt"`, resolved
+    /// via `PATH`. Accepts a multi-word prefix (shell-word-split, same
+    /// as `--dbt-args`), so a project already using its own wrapper
+    /// instead of invoking `dbt` directly can point zhao at that
+    /// instead. Overrides `zhao.yml`'s `dbt-command` when given; with
+    /// neither set, defaults to `"dbt"`.
+    #[arg(long = "dbt-command", allow_hyphen_values = true)]
+    pub dbt_command: Option<String>,
 }
 
 impl LineageArgs {
+    /// Resolves the final, ordered list of extra arguments to append to
+    /// the `dbt compile` invocation `--compile` runs, from whichever of
+    /// `--dbt-arg`/`--dbt-args` was given (clap's `conflicts_with` on
+    /// both fields already guarantees at most one was) -- empty if
+    /// neither was. Shares its splitting logic with
+    /// [`CheckArgs::dbt_passthrough_args`].
+    pub fn dbt_passthrough_args(&self) -> Result<Vec<String>, String> {
+        split_dbt_passthrough_args(&self.dbt_arg, &self.dbt_args)
+    }
+
     /// Splits `target` into the bare model name, an optional column name
     /// (present for a `model.column` target), and the requested
     /// [`zhao_core::lineage::Direction`], per dbt's own `+`-prefix/suffix
@@ -297,16 +350,29 @@ impl CheckArgs {
     /// every `dbt deps`/`dbt compile` invocation, from whichever of
     /// `--dbt-arg`/`--dbt-args` was given (clap's `conflicts_with` on both
     /// fields already guarantees at most one was) -- empty if neither was.
+    /// Shares its splitting logic with [`LineageArgs::dbt_passthrough_args`].
     pub fn dbt_passthrough_args(&self) -> Result<Vec<String>, String> {
-        if !self.dbt_arg.is_empty() {
-            return Ok(self.dbt_arg.clone());
-        }
-        if let Some(raw) = &self.dbt_args {
-            return shell_words::split(raw)
-                .map_err(|err| format!("could not parse --dbt-args {raw:?}: {err}"));
-        }
-        Ok(Vec::new())
+        split_dbt_passthrough_args(&self.dbt_arg, &self.dbt_args)
     }
+}
+
+/// The splitting logic shared by [`CheckArgs::dbt_passthrough_args`] and
+/// [`LineageArgs::dbt_passthrough_args`], both of which accept the same
+/// two mutually-exclusive CLI forms for a `dbt` passthrough-arguments
+/// list: repeated `--dbt-arg` wins outright when given; otherwise a
+/// single `--dbt-args` string is shell-word-split; otherwise empty.
+fn split_dbt_passthrough_args(
+    dbt_arg: &[String],
+    dbt_args: &Option<String>,
+) -> Result<Vec<String>, String> {
+    if !dbt_arg.is_empty() {
+        return Ok(dbt_arg.to_vec());
+    }
+    if let Some(raw) = dbt_args {
+        return shell_words::split(raw)
+            .map_err(|err| format!("could not parse --dbt-args {raw:?}: {err}"));
+    }
+    Ok(Vec::new())
 }
 
 /// `zhao check`'s output format.
@@ -354,6 +420,9 @@ mod tests {
             package: None,
             log_level: None,
             purge_logs: None,
+            dbt_arg: Vec::new(),
+            dbt_args: None,
+            dbt_command: None,
         }
     }
 
