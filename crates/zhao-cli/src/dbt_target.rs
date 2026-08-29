@@ -6,7 +6,7 @@
 //! `CheckArgs::dbt_passthrough_args`).
 //!
 //! Without this, a compile isolated via `--dbt-args "--target-path
-//! <dir>"` would still have its resulting `manifest.json` read back
+//! some-dir"` would still have its resulting `manifest.json` read back
 //! from the project's real `target/` -- the literal, hardcoded path
 //! every other part of zhao assumed until now -- silently ignoring the
 //! isolation the caller asked dbt for. `resolve_target_dir` is the one
