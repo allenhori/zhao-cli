@@ -56,20 +56,41 @@ Valid severities: `error`, `warn`, `pass`.
 
 ## `defer`
 
-Backs the report's ready-to-run `--defer` command (see [`zhao check`'s report
+Backs the report's `Defer plan:` section (see [`zhao check`'s report
 sections](commands.md#report-sections-text-output)):
 
 ```yaml
 defer:
-  target: prod                              # a human-readable label, shown next to the command
+  target: prod                              # a human-readable label, shown alongside the plan
   state: artifacts/prod/manifest.json       # the path dbt's --state flag needs
 ```
 
-Both are optional and independent. `state` alone still produces a full, ready-to-run
-`dbt build --select <impacted models> --defer --state <path>` command; `target` alone (no
-`state`) labels the plan without a command, since dbt's `--defer` mechanism has nothing to
-function without a state path. `--defer-target`/`--defer-state` CLI flags override either
-value when given.
+Both are optional and independent. `target`/`state` are surfaced as-is — the plan's `build`/
+`defer` Node lists plus this raw state path, deliberately never assembled into a ready-to-run
+command: `defer` alone doesn't tell zhao whether your workflow invokes `dbt build`, `dbt run`,
+or something else. If you also want a genuine ready-to-run command, see
+[`recommended-command`](#recommended-command) below, which resolves exactly that ambiguity.
+`--defer-target`/`--defer-state` CLI flags override either value when given.
+
+## `recommended-command`
+
+Backs the report's `Recommended command:` line — a ready-to-run command that rebuilds exactly
+the impacted models (the same set `Impacted models:`/`impacted_models` already names):
+
+```yaml
+recommended-command:
+  subcommand: run   # or build, test -- whatever your workflow actually uses
+```
+
+`None` (the default, if this key is unset) means no `Recommended command:` line is generated
+at all — the same "never assumes" reasoning `defer` documents above: zhao has no way to know
+which dbt subcommand your workflow wants unless you tell it. Once set, the generated command
+is `<dbt-command> <subcommand> --select <impacted models...>`, using the same
+[`dbt-command`](#dbt-commanddbt-args) wrapper every other `dbt` call zhao makes already uses,
+plus `--target <label>` appended when [`defer.target`](#defer) (or `--defer-target`) is also
+set. Absent entirely (no field at all, not even `null`) from `--format json`/
+`run-metadata.json` output when nothing was impacted or no subcommand is configured, same as
+`defer_plan`.
 
 ## `against`
 
@@ -183,6 +204,9 @@ rules:
 defer:
   target: prod
   state: artifacts/prod/manifest.json
+
+recommended-command:
+  subcommand: run
 
 against: main
 ```

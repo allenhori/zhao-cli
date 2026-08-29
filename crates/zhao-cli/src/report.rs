@@ -33,10 +33,7 @@ pub struct Report {
     pub staleness_warning: Option<String>,
     /// Exactly which Nodes named in `findings`' Downstream impact need
     /// validating, in the adapter's own display names (e.g. dbt's bare
-    /// model name) -- deliberately just the list, not a constructed
-    /// command: zhao has no way to know whether a project's CI actually
-    /// invokes `dbt build`, `dbt run`, or some custom wrapper, so it never
-    /// assumes one. Always present, `[]` when there's nothing to
+    /// model name). Always present, `[]` when there's nothing to
     /// validate (either no impactful non-`pass`-severity Finding fired at
     /// all, or this report was built without
     /// [`Report::with_impacted_models`]).
@@ -47,6 +44,16 @@ pub struct Report {
     /// under the same conditions as an empty `impacted_models`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defer_plan: Option<DeferPlanJson>,
+    /// A ready-to-run command to rebuild exactly `impacted_models` --
+    /// see [`Report::with_recommended_command`]. `None` unless
+    /// `zhao.yml`'s `recommended-command.subcommand` is set: zhao has no
+    /// way to know whether a project's workflow wants `dbt run`, `dbt
+    /// build`, or something else, so it never assumes one (the same
+    /// "never assumes" reasoning `defer_plan.state` documents for
+    /// `--defer`) -- also `None` when `impacted_models` is empty, same
+    /// as `defer_plan`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_command: Option<String>,
     /// One entry per schema-changing Change (column added/removed/type
     /// changed -- never a join change, which isn't a schema change) on a
     /// Node materialized `incremental`. Phrased as a conditional
@@ -74,6 +81,7 @@ impl Report {
             staleness_warning: None,
             impacted_models: Vec::new(),
             defer_plan: None,
+            recommended_command: None,
             schema_evolution_warnings: Vec::new(),
         }
     }
@@ -169,6 +177,51 @@ impl Report {
             None
         } else {
             Some(DeferPlanJson::compute(current, build, vocabulary, settings))
+        };
+        self
+    }
+
+    /// Sets this report's recommended command: `<dbt_command> <subcommand>
+    /// --select <impacted_models...>`, optionally followed by `--target
+    /// <target_label>` -- a single, ready-to-run command that rebuilds
+    /// exactly the impacted-Node set `with_impacted_models` computed,
+    /// using the adapter's own display names the same way
+    /// `impacted_models`/`defer_plan` already do.
+    ///
+    /// `subcommand` is `zhao.yml`'s `recommended-command.subcommand`
+    /// (e.g. `"run"`, `"build"`, `"test"`) -- `None` (not configured)
+    /// produces no recommended command at all, same "never assumes"
+    /// reasoning as `--defer`. `dbt_command` is the already-resolved
+    /// `dbt-command` wrapper (CLI override, else `zhao.yml`, else
+    /// `"dbt"`) every other `dbt` invocation this run already uses.
+    /// `target_label` is [`DeferSettings::target`] -- reusing the
+    /// existing `defer.target`/`--defer-target` concept exactly as-is
+    /// rather than introducing a second way to name a target, since a
+    /// human-readable target label already means the same thing in both
+    /// places: what environment this command's output should be
+    /// compared/deployed against.
+    ///
+    /// `None` when `impacted_models` is empty, same as `defer_plan` --
+    /// there's nothing to build, so no command makes sense.
+    pub fn with_recommended_command(
+        mut self,
+        subcommand: Option<&str>,
+        dbt_command: &str,
+        target_label: Option<&str>,
+    ) -> Self {
+        self.recommended_command = match subcommand {
+            Some(subcommand) if !self.impacted_models.is_empty() => {
+                let mut command = format!(
+                    "{dbt_command} {subcommand} --select {}",
+                    self.impacted_models.join(" ")
+                );
+                if let Some(target) = target_label {
+                    command.push_str(" --target ");
+                    command.push_str(target);
+                }
+                Some(command)
+            }
+            _ => None,
         };
         self
     }
@@ -934,6 +987,10 @@ pub fn render_text(report: &Report, vocabulary: &dyn AdapterVocabulary, use_colo
         }
     }
 
+    if let Some(command) = &report.recommended_command {
+        out.push_str(&format!("\nRecommended command: {command}\n"));
+    }
+
     if !report.schema_evolution_warnings.is_empty() {
         out.push_str("\nSchema evolution:\n");
         for warning in &report.schema_evolution_warnings {
@@ -1407,6 +1464,101 @@ mod tests {
         let text = render_text(&report, &DbtVocabulary, false);
 
         assert!(!text.contains("Impacted models:"), "{text}");
+    }
+
+    fn impacted_models_finding(node: &str) -> Finding {
+        Finding {
+            severity: Severity::Error,
+            detail: FindingDetail::ColumnRemovedWithActiveReferences {
+                node: NodeId::new(node),
+                column: zhao_core::model::ColumnName::new("id"),
+                reached: NodeId::new(node),
+                reached_column: zhao_core::model::ColumnName::new("id"),
+            },
+        }
+    }
+
+    #[test]
+    fn with_recommended_command_is_none_when_subcommand_is_not_configured() {
+        let findings = vec![impacted_models_finding("model.zhao_dbt_test.stg_customers")];
+        let report = Report::new(&[], &findings)
+            .with_impacted_models(&DbtVocabulary)
+            .with_recommended_command(None, "dbt", None);
+
+        assert!(report.recommended_command.is_none());
+    }
+
+    #[test]
+    fn with_recommended_command_is_none_when_nothing_is_impacted_even_if_configured() {
+        let report = Report::new(&[], &[]).with_recommended_command(Some("run"), "dbt", None);
+
+        assert!(report.recommended_command.is_none());
+    }
+
+    #[test]
+    fn with_recommended_command_builds_a_select_command_from_impacted_models() {
+        let findings = vec![
+            impacted_models_finding("model.zhao_dbt_test.stg_customers"),
+            impacted_models_finding("model.zhao_dbt_test.dim_customers"),
+        ];
+        let report = Report::new(&[], &findings)
+            .with_impacted_models(&DbtVocabulary)
+            .with_recommended_command(Some("run"), "dbt", None);
+
+        assert_eq!(
+            report.recommended_command.as_deref(),
+            Some("dbt run --select stg_customers dim_customers")
+        );
+    }
+
+    #[test]
+    fn with_recommended_command_uses_the_configured_dbt_command_wrapper() {
+        let findings = vec![impacted_models_finding("model.zhao_dbt_test.stg_customers")];
+        let report = Report::new(&[], &findings)
+            .with_impacted_models(&DbtVocabulary)
+            .with_recommended_command(Some("build"), "uv run dbt", None);
+
+        assert_eq!(
+            report.recommended_command.as_deref(),
+            Some("uv run dbt build --select stg_customers")
+        );
+    }
+
+    #[test]
+    fn with_recommended_command_appends_target_when_a_label_is_given() {
+        let findings = vec![impacted_models_finding("model.zhao_dbt_test.stg_customers")];
+        let report = Report::new(&[], &findings)
+            .with_impacted_models(&DbtVocabulary)
+            .with_recommended_command(Some("run"), "dbt", Some("prod"));
+
+        assert_eq!(
+            report.recommended_command.as_deref(),
+            Some("dbt run --select stg_customers --target prod")
+        );
+    }
+
+    #[test]
+    fn render_text_appends_the_recommended_command_line_when_present() {
+        let findings = vec![impacted_models_finding("model.zhao_dbt_test.stg_customers")];
+        let report = Report::new(&[], &findings)
+            .with_impacted_models(&DbtVocabulary)
+            .with_recommended_command(Some("run"), "dbt", None);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(
+            text.contains("Recommended command: dbt run --select stg_customers"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_text_omits_the_recommended_command_line_when_absent() {
+        let report = Report::new(&[], &[]);
+
+        let text = render_text(&report, &DbtVocabulary, false);
+
+        assert!(!text.contains("Recommended command:"), "{text}");
     }
 
     /// A minimal `ParsedProject` with one Node per `(id, name)` pair and

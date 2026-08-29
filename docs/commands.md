@@ -25,8 +25,8 @@ zhao check [OPTIONS]
 | `--dbt-args "<string>"` | — | Same, but as one shell-word-style string to split, e.g. `--dbt-args "--target ci --vars '{\"key\": \"value\"}'"`. Mutually exclusive with `--dbt-arg`. |
 | `--dbt-command "<cmd>"` | `dbt` | The executable/prefix for every internal `dbt` call zhao makes itself. Shell-word-split, so a wrapper's own leading flags work too (e.g. `"uv run dbt"`, or a custom in-house wrapper like `"myshell custom-flag"`). Overrides `zhao.yml`'s `dbt-command` when given — see [Configuring `zhao.yml`](configuration.md#dbt-commanddbt-args). |
 | `--check-relations` | — | Opt-in: actually checks whether each flagged incremental model exists in your configured target (same connection `dbt run` already needs), turning the conditional schema-evolution note into a definitive one. |
-| `--defer-target <name>` | — | A human-readable label (e.g. `"prod"`) for the target the `--defer` plan defers to. Shown next to the generated command; not passed to dbt itself. Overrides `zhao.yml`'s `defer.target`. |
-| `--defer-state <path>` | — | A compiled manifest path to defer to — when set, the report includes a ready-to-run `dbt build --select ... --defer --state <path>` command. Overrides `zhao.yml`'s `defer.state`. |
+| `--defer-target <name>` | — | A human-readable label (e.g. `"prod"`) for the target the `Defer plan:` section defers to — also appended as `--target <name>` on the [recommended command](configuration.md#recommended-command), if one is configured. Not passed to dbt itself as part of the defer plan. Overrides `zhao.yml`'s `defer.target`. |
+| `--defer-state <path>` | — | A compiled manifest path to defer to — when set, the report's `Defer plan:` section includes this path alongside its `build`/`defer` Node lists. Overrides `zhao.yml`'s `defer.state`. |
 | `--allow-stale-manifest` | — | Skips the check that `<project-dir>/target/manifest.json` is newer than the project's own dbt source files (`dbt_project.yml`, `packages.yml`/`dependencies.yml`, and everything under `models/`, `macros/`, `seeds/`, `snapshots/`, `analyses/`, `tests/`). Without this flag, a stale manifest — e.g. checked out on a different branch, or pulled without rerunning `dbt compile` — fails fast (exit `2`) instead of silently producing an incorrect diff. Not recommended; exists for cases like a hand-supplied test fixture with no real dbt project alongside it. |
 
 **Exit codes**: `0` nothing breaking; `1` a `BREAKING` finding fired; `2` zhao itself
@@ -40,16 +40,20 @@ not found, ...).
 2. **Downstream impact** — every model actually *reached* by a change (never the whole
    downstream cone), each labeled `[BREAKING]` or `[WARN]` with the specific reference and
    the Rule that fired.
-3. **Summary** — a one-line count, plus (if applicable) an `Impacted models:` list and a
-   `Defer plan:` section (see [Configuring `defer`](configuration.md#defer)).
+3. **Summary** — a one-line count, plus (if applicable) an `Impacted models:` list, a
+   `Defer plan:` section (see [Configuring `defer`](configuration.md#defer)), and a
+   `Recommended command:` line (see [Configuring
+   `recommended-command`](configuration.md#recommended-command)).
 
 `Impacted models` is deliberately just the list of model names, not a constructed command —
 zhao has no way to know whether your CI actually invokes `dbt build`, `dbt run`, or a custom
-wrapper, so it never assumes one. Build your own command from the list, e.g.
-`dbt build --select $(echo "$names" | tr ',' ' ')`, or (more robustly, avoiding any shell
-word-splitting concerns) pull the same list straight from `--format json`'s `impacted_models`
-array — a real JSON array of strings, ready for a script to consume directly without any
-text-parsing at all.
+wrapper, so it never assumes one *unless you tell it to* via
+[`recommended-command.subcommand`](configuration.md#recommended-command), which turns this
+same list into a genuine `Recommended command:` line. Without that configured, build your own
+command from the list instead, e.g. `dbt build --select $(echo "$names" | tr ',' ' ')`, or
+(more robustly, avoiding any shell word-splitting concerns) pull the same list straight from
+`--format json`'s `impacted_models` array — a real JSON array of strings, ready for a script
+to consume directly without any text-parsing at all.
 
 A **Schema evolution** section appears whenever a schema-changing change (column
 added/removed/type-changed) lands on a model materialized `incremental` — phrased

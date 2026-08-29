@@ -108,6 +108,7 @@ pub struct Config {
     dbt_command: Option<String>,
     dbt_args: Option<String>,
     tool: Option<String>,
+    recommended_command_subcommand: Option<String>,
 }
 
 impl Default for Config {
@@ -122,6 +123,7 @@ impl Default for Config {
             log_retention_days: None,
             dbt_command: None,
             dbt_args: None,
+            recommended_command_subcommand: None,
             tool: None,
         }
     }
@@ -186,6 +188,20 @@ impl Config {
     /// `zhao-cli`'s own `CheckArgs::dbt_passthrough_args`).
     pub fn dbt_args(&self) -> Option<&str> {
         self.dbt_args.as_deref()
+    }
+
+    /// The configured dbt subcommand (e.g. `"run"`, `"build"`, `"test"`)
+    /// a `zhao check`/`zhao diff` run's recommended command uses, if
+    /// `zhao.yml` sets `recommended-command.subcommand`. `None` if it
+    /// doesn't -- in which case no recommended command is generated at
+    /// all: zhao has no way to know whether a project's workflow wants
+    /// `dbt run`, `dbt build`, or something else, so it never assumes
+    /// one (the same reasoning [`Config::defer_state`] documents for
+    /// `--defer`). Passed through as-is, not validated against a fixed
+    /// enum -- dbt itself is the authority on what a valid subcommand
+    /// is.
+    pub fn recommended_command_subcommand(&self) -> Option<&str> {
+        self.recommended_command_subcommand.as_deref()
     }
 
     /// The configured Transformation Tool Adapter name (e.g. `"dbt"`), if
@@ -286,6 +302,7 @@ struct ConfigLayer {
     dbt_command: Option<String>,
     dbt_args: Option<String>,
     tool: Option<String>,
+    recommended_command_subcommand: Option<String>,
 }
 
 impl ConfigLayer {
@@ -326,6 +343,9 @@ impl ConfigLayer {
             dbt_command: self.dbt_command.or(base.dbt_command),
             dbt_args: self.dbt_args.or(base.dbt_args),
             tool: self.tool.or(base.tool),
+            recommended_command_subcommand: self
+                .recommended_command_subcommand
+                .or(base.recommended_command_subcommand),
         }
     }
 
@@ -341,6 +361,7 @@ impl ConfigLayer {
             dbt_command: self.dbt_command,
             dbt_args: self.dbt_args,
             tool: self.tool,
+            recommended_command_subcommand: self.recommended_command_subcommand,
         }
     }
 }
@@ -374,6 +395,16 @@ struct RawConfig {
     dbt_args: Option<String>,
     #[serde(default)]
     tool: Option<String>,
+    #[serde(rename = "recommended-command", default)]
+    recommended_command: Option<RawRecommendedCommandConfig>,
+}
+
+/// The `recommended-command:` section of `zhao.yml` -- see
+/// [`Config::recommended_command_subcommand`].
+#[derive(Debug, Default, Deserialize)]
+struct RawRecommendedCommandConfig {
+    #[serde(default)]
+    subcommand: Option<String>,
 }
 
 /// The `log:` section of `zhao.yml` -- see [`Config::log_level`].
@@ -431,6 +462,10 @@ impl RawConfig {
             Some(defer) => (defer.target, defer.state),
         };
 
+        let recommended_command_subcommand = self
+            .recommended_command
+            .and_then(|recommended_command| recommended_command.subcommand);
+
         let (log_level_name, log_retention_days) = match self.log {
             None => (None, None),
             Some(log) => (log.level, log.retention_days),
@@ -456,6 +491,7 @@ impl RawConfig {
             dbt_command: self.dbt_command,
             dbt_args: self.dbt_args,
             tool: self.tool,
+            recommended_command_subcommand,
         })
     }
 }
@@ -965,6 +1001,39 @@ mod tests {
         let config = Config::load_for_project(&repo.project_dir).expect("should parse");
 
         assert_eq!(config.dbt_command(), Some("myshell custom-flag"));
+    }
+
+    #[test]
+    fn missing_recommended_command_subcommand_leaves_it_unset() {
+        let config = Config::load(Path::new("/nonexistent/zhao.yml")).expect("should be ok");
+        assert_eq!(config.recommended_command_subcommand(), None);
+    }
+
+    #[test]
+    fn recommended_command_subcommand_is_read_from_zhao_yml() {
+        let file = write_temp_yaml("recommended-command:\n  subcommand: build\n");
+        let config = Config::load(file.path()).expect("should parse");
+
+        assert_eq!(config.recommended_command_subcommand(), Some("build"));
+    }
+
+    #[test]
+    fn project_local_recommended_command_subcommand_wins_over_root() {
+        let repo = fake_repo();
+        fs::write(
+            repo.root.join("zhao.yml"),
+            "recommended-command:\n  subcommand: run\n",
+        )
+        .expect("should write root config");
+        fs::write(
+            repo.project_dir.join("zhao.yml"),
+            "recommended-command:\n  subcommand: build\n",
+        )
+        .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        assert_eq!(config.recommended_command_subcommand(), Some("build"));
     }
 
     #[test]
