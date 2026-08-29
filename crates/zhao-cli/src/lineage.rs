@@ -1,9 +1,12 @@
 //! The `zhao lineage` command: a structural query over the current
 //! project's compiled state -- what's upstream/downstream of a target
 //! model, using dbt's own `+`-prefix/suffix selector syntax. Unlike
-//! `zhao check`/`zhao diff`, this reads no Baseline, resolves no `--state`,
-//! and never invokes `dbt compile` -- it operates purely on
-//! `<project-dir>/target/manifest.json` as it already is.
+//! `zhao check`/`zhao diff`, this reads no Baseline and resolves no
+//! `--state`. Its compiled manifest is read from
+//! `<project-dir>/target/manifest.json` by default, or from
+//! `<project-dir>/<target-path>/manifest.json` when `--dbt-arg`/
+//! `--dbt-args` carries a `--target-path` override -- see
+//! `crate::dbt_target::resolve_target_dir`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -41,28 +44,49 @@ pub fn run(args: &LineageArgs) -> ExitCode {
         Err(err) => return fail(&err.to_string()),
     };
 
+    // `--dbt-command`/`--dbt-arg`/`--dbt-args` win outright when given;
+    // otherwise falls back to `zhao.yml`'s `dbt-command`/`dbt-args`;
+    // otherwise `"dbt"`/no extra args -- same precedence `zhao check`/
+    // `zhao diff` already use (see `crate::dbt_target::resolve_dbt_invocation`,
+    // shared with `crate::engine::build_report`). A project already
+    // using its own wrapper instead of invoking `dbt` directly shouldn't
+    // need `zhao lineage --compile` to be the one place that still
+    // hardcodes `"dbt"`.
+    let dbt_passthrough_args = match args.dbt_passthrough_args() {
+        Ok(args) => args,
+        Err(err) => return fail(&err),
+    };
+    let (dbt_command, dbt_passthrough_args) = match crate::dbt_target::resolve_dbt_invocation(
+        args.dbt_command.as_deref(),
+        dbt_passthrough_args,
+        &config,
+    ) {
+        Ok(resolved) => resolved,
+        Err(err) => return fail(&err),
+    };
+
     if args.compile {
-        // Same `dbt-command` config zhao's other subcommands honor (see
-        // `zhao_core::config::Config::dbt_command`) -- a project already
-        // using its own wrapper instead of invoking `dbt` directly
-        // shouldn't need `zhao lineage --compile` to be the one place
-        // that still hardcodes `"dbt"`.
-        let dbt_command = config.dbt_command().unwrap_or("dbt").to_string();
         // `dbt_project_dir` and `real_project_dir` are the same path
         // here -- unlike `baseline::resolve`'s git-native Baseline
         // compile (which runs in a throwaway worktree), `--compile`
         // runs directly in the real project directory. See issue #36.
+        // `--dbt-args`/`--dbt-arg` (e.g. a `--target-path` override) are
+        // forwarded to the compile itself -- see `resolve_target_dir`
+        // just below for where the resulting manifest gets read back
+        // from.
         if let Err(err) = crate::log::log_dbt_result(
             "compile",
             &args.project_dir,
             &args.project_dir,
-            adapter.compile(&args.project_dir, &dbt_command, &[]),
+            adapter.compile(&args.project_dir, &dbt_command, &dbt_passthrough_args),
         ) {
             return fail(&err.to_string());
         }
     }
 
-    let manifest_path = args.project_dir.join("target").join("manifest.json");
+    let target_dir =
+        crate::dbt_target::resolve_target_dir(&args.project_dir, &dbt_passthrough_args);
+    let manifest_path = target_dir.join("manifest.json");
     let project = match adapter.parse(&manifest_path) {
         Ok(project) => project,
         Err(err) => return fail(&format!("{}: {err}", manifest_path.display())),

@@ -41,7 +41,28 @@ pub(crate) struct EngineOutput {
 /// evaluation -- and builds the resulting [`Report`], including its
 /// staleness warning, recommended command, and `--defer` plan.
 pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
-    let current_manifest = args.project_dir.join("target").join("manifest.json");
+    let config = Config::load_for_project(&args.project_dir).map_err(|err| err.to_string())?;
+    // `--dbt-command`/`--dbt-arg`/`--dbt-args` win outright when given
+    // (clap's `conflicts_with` already guarantees at most one CLI form
+    // for the args); otherwise falls back to `zhao.yml`'s
+    // `dbt-command`/`dbt-args`; otherwise `"dbt"`/no extra args -- see
+    // `crate::dbt_target::resolve_dbt_invocation`. Resolved before
+    // `current_manifest` below, since a `--target-path` override in here
+    // changes where that manifest is read from.
+    let (dbt_command, dbt_passthrough_args) = crate::dbt_target::resolve_dbt_invocation(
+        args.dbt_command.as_deref(),
+        args.dbt_passthrough_args()?,
+        &config,
+    )?;
+    // Read from `<project-dir>/target/manifest.json` by default, or from
+    // `<project-dir>/<target-path>/manifest.json` when
+    // `dbt_passthrough_args` carries a `--target-path` override -- e.g.
+    // a manifest `zhao lineage --compile --dbt-args "--target-path
+    // <dir>"` isolated away from the project's real `target/`. See
+    // `crate::dbt_target::resolve_target_dir`.
+    let current_manifest =
+        crate::dbt_target::resolve_target_dir(&args.project_dir, &dbt_passthrough_args)
+            .join("manifest.json");
 
     // Checked before Baseline resolution (which compiles a whole
     // temporary git worktree -- not cheap) so a stale current manifest
@@ -50,26 +71,11 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         check_current_manifest_freshness(&args.project_dir, &current_manifest)?;
     }
 
-    let config = Config::load_for_project(&args.project_dir).map_err(|err| err.to_string())?;
     // Auto-detected by project marker first, `zhao.yml`'s `tool:` key
     // only consulted as a fallback when detection alone can't produce a
     // single answer -- see `crate::adapter::ResolvedAdapter::resolve`.
     let adapter = ResolvedAdapter::resolve(&args.project_dir, config.tool())
         .map_err(|err| err.to_string())?;
-    // CLI `--dbt-arg`/`--dbt-args` wins outright when either is given
-    // (clap's `conflicts_with` already guarantees at most one CLI form);
-    // otherwise falls back to `zhao.yml`'s `dbt-args`, shell-word-split
-    // the same way the CLI's own `--dbt-args` string form is.
-    let dbt_passthrough_args = args.dbt_passthrough_args()?;
-    let dbt_passthrough_args = if dbt_passthrough_args.is_empty() {
-        match config.dbt_args() {
-            Some(raw) => shell_words::split(raw)
-                .map_err(|err| format!("zhao.yml dbt-args {raw:?}: {err}"))?,
-            None => Vec::new(),
-        }
-    } else {
-        dbt_passthrough_args
-    };
     // `--against` wins when explicitly passed; otherwise `zhao.yml`'s
     // `against`; otherwise zhao's own default. Resolved once, up front,
     // so both Baseline resolution and the staleness check (which must
@@ -79,14 +85,6 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         .clone()
         .or_else(|| config.against().map(str::to_string))
         .unwrap_or_else(|| "master".to_string());
-    // `--dbt-command` wins when explicitly passed; otherwise `zhao.yml`'s
-    // `dbt-command`; otherwise `"dbt"`, resolved via `PATH` -- the same
-    // precedence `against` already uses just above.
-    let dbt_command = args
-        .dbt_command
-        .clone()
-        .or_else(|| config.dbt_command().map(str::to_string))
-        .unwrap_or_else(|| "dbt".to_string());
     // Checked before Baseline resolution: `zhao check`/`zhao diff` must
     // never let catalog-backed wildcard expansion (see
     // `zhao_core::adapters::dbt::DbtAdapter::parse_for_comparison`) apply

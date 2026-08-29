@@ -398,6 +398,48 @@ fn exits_zero_when_nothing_breaking_is_found() {
         .stdout(predicate::str::contains("\"findings\": []"));
 }
 
+/// A `--dbt-args "--target-path <dir>"` override changes where the
+/// *current* manifest is read from too, not just `zhao lineage`'s --
+/// this is what lets `zhao diff` read back a manifest `zhao lineage
+/// --compile` isolated away from the project's real `target/`, for
+/// `zhao-vscode-ext`'s diff-highlight feature. Uses `--state` (no git
+/// Baseline resolution) so this needs no `dbt`/git at all: only the
+/// current-manifest read path is under test here.
+#[test]
+fn a_target_path_override_changes_where_the_current_manifest_is_read_from() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    write_dbt_project_marker(project_dir);
+    std::fs::create_dir_all(project_dir.join("custom_target")).expect("should create dir");
+    std::fs::copy(
+        fixture("clean_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("custom_target").join("manifest.json"),
+    )
+    .expect("should copy fixture manifest into the custom target-path dir");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest_clean.json"))
+        .arg("--project-dir")
+        .arg(project_dir)
+        .arg("--dbt-args")
+        .arg("--target-path custom_target")
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("\"findings\": []"));
+
+    assert!(
+        !project_dir.join("target").join("manifest.json").exists(),
+        "the current manifest should be read from custom_target/, never written to target/"
+    );
+}
+
 /// Acceptance criterion 1: the impacted-models list exactly matches the
 /// Nodes named in the Downstream impact section.
 #[test]

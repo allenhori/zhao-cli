@@ -1093,3 +1093,153 @@ fn full_lineage_json_is_written_even_when_the_target_fails_to_resolve() {
         expected.display()
     );
 }
+
+// -----------------------------------------------------------------------
+// `--compile` + `--dbt-args "--target-path <dir>"` -- compile isolation.
+// The scenario `zhao-vscode-ext`'s "Refresh Lineage" action depends on:
+// a compile that never touches the project's real `target/manifest.json`,
+// so it can't collide with a user-triggered `dbt run`.
+// -----------------------------------------------------------------------
+
+/// Writes a fake `dbt` executable into a fresh temp dir and returns that
+/// dir. Unlike a real `dbt`, it only understands enough to make this
+/// test meaningful: on `compile`, it copies `dbt_manifest_source.json`
+/// (written into the project dir by the caller) to
+/// `<target-path>/manifest.json`, honoring a `--target-path <dir>`
+/// override the same way real `dbt compile` does -- defaulting to
+/// `target` when none is given, matching dbt's own default.
+#[cfg(unix)]
+fn target_path_aware_stub_dbt_dir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let path = dir.path().join("dbt");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         target_dir=target\n\
+         prev=\"\"\n\
+         for arg in \"$@\"; do\n\
+         \x20\x20if [ \"$prev\" = \"--target-path\" ]; then target_dir=\"$arg\"; fi\n\
+         \x20\x20prev=\"$arg\"\n\
+         done\n\
+         if [ \"$1\" = \"compile\" ]; then\n\
+         \x20\x20mkdir -p \"$target_dir\"\n\
+         \x20\x20cp dbt_manifest_source.json \"$target_dir/manifest.json\"\n\
+         fi\n",
+    )
+    .expect("should write stub dbt script");
+    let mut perms = std::fs::metadata(&path)
+        .expect("should stat stub script")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("should chmod stub script");
+    dir
+}
+
+#[cfg(unix)]
+fn path_with_stub_dbt_prepended(stub_dir: &std::path::Path) -> String {
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", stub_dir.display())
+}
+
+/// `--compile --dbt-args "--target-path custom_target"` writes the
+/// compiled manifest to `custom_target/manifest.json`, never the
+/// project's real `target/manifest.json` -- and `zhao lineage` reads it
+/// back from that same isolated location, producing a correct result.
+#[cfg(unix)]
+#[test]
+fn compile_with_a_target_path_override_isolates_the_manifest_and_is_read_back_from_there() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    write_dbt_project_marker(project_dir);
+    std::fs::copy(
+        fixture("rules_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("dbt_manifest_source.json"),
+    )
+    .expect("should copy fixture manifest as the stub's compile source");
+
+    let stub_dir = target_path_aware_stub_dbt_dir();
+
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .env("PATH", path_with_stub_dbt_prepended(stub_dir.path()))
+        .arg("lineage")
+        .arg("--text")
+        .arg("stg_orders")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .arg("--compile")
+        .arg("--dbt-args")
+        .arg("--target-path custom_target")
+        .output()
+        .expect("command should run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("source source.zhao_dbt_test.raw.raw_orders"),
+        "expected the isolated compile's manifest to actually be read: {stdout}"
+    );
+
+    assert!(
+        !project_dir.join("target").join("manifest.json").exists(),
+        "the project's real target/manifest.json should never be written"
+    );
+    assert!(
+        project_dir
+            .join("custom_target")
+            .join("manifest.json")
+            .exists(),
+        "the compiled manifest should land at the isolated --target-path instead"
+    );
+}
+
+/// The isolation applies to a plain, uncompiled read too: pointing
+/// `--dbt-args` at a `--target-path` that already holds a manifest (no
+/// `--compile` involved) reads from there, not `target/`.
+#[test]
+fn a_target_path_override_is_honored_without_compile_too() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    write_dbt_project_marker(project_dir);
+    std::fs::create_dir_all(project_dir.join("custom_target")).expect("should create dir");
+    std::fs::copy(
+        fixture("rules_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("custom_target").join("manifest.json"),
+    )
+    .expect("should copy fixture manifest into the custom target-path dir");
+
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("lineage")
+        .arg("--text")
+        .arg("stg_orders")
+        .arg("--project-dir")
+        .arg(project_dir)
+        .arg("--dbt-args")
+        .arg("--target-path custom_target")
+        .output()
+        .expect("command should run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(
+        stdout.contains("source source.zhao_dbt_test.raw.raw_orders"),
+        "expected the manifest at the custom target-path to be read, not target/: {stdout}"
+    );
+}
