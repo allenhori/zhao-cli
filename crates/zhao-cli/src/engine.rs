@@ -129,6 +129,11 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         .with_staleness_warning(is_stale(&args.project_dir, &against))
         .with_impacted_models(adapter.vocabulary())
         .with_defer_plan(&current, adapter.vocabulary(), &defer_settings)
+        .with_recommended_command(
+            config.recommended_command_subcommand(),
+            &dbt_command,
+            defer_settings.target.as_deref(),
+        )
         .with_schema_evolution_warnings(&current);
 
     if args.check_relations {

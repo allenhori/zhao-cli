@@ -460,6 +460,64 @@ fn impacted_models_matches_the_downstream_impact_nodes() {
         ));
 }
 
+/// `recommended-command.subcommand` in `zhao.yml` produces a
+/// ready-to-run command naming exactly the impacted models -- the
+/// zhao-vscode-ext "Copy dbt command"/"Run in Terminal" feature's whole
+/// premise: zhao-cli computes it, the extension only displays it.
+#[test]
+fn recommended_command_is_built_from_impacted_models_when_configured() {
+    let dir = tempfile::tempdir().expect("should create temp dir");
+    let project_dir = dir.path();
+    write_dbt_project_marker(project_dir);
+    std::fs::create_dir_all(project_dir.join("target")).expect("should create target dir");
+    std::fs::copy(
+        fixture("breaking_project")
+            .join("target")
+            .join("manifest.json"),
+        project_dir.join("target").join("manifest.json"),
+    )
+    .expect("should copy fixture manifest");
+    std::fs::write(
+        project_dir.join("zhao.yml"),
+        "tool: dbt\nrecommended-command:\n  subcommand: run\n",
+    )
+    .expect("should write zhao.yml");
+
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(project_dir)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "\"recommended_command\": \"dbt run --select stg_customers dim_customers\"",
+        ));
+}
+
+/// Without `recommended-command.subcommand` configured, no
+/// `recommended_command` field appears at all -- zhao never assumes a
+/// subcommand, same reasoning as `defer.state`.
+#[test]
+fn recommended_command_is_absent_from_json_when_not_configured() {
+    Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .arg("check")
+        .arg("--state")
+        .arg(fixture("diff_baseline_manifest.json"))
+        .arg("--project-dir")
+        .arg(fixture("breaking_project"))
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("\"recommended_command\"").not());
+}
+
 /// Acceptance criterion 2: a run with zero impacted Nodes still surfaces
 /// `impacted_models`, but empty -- covers both "zero Changes at all" and
 /// "a Change exists but its only Finding is pass-severity" (not
