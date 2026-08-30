@@ -3934,6 +3934,22 @@ mod tests {
             .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).expect("should chmod stub script");
+        // A brief pause before this script gets exec'd by whichever test
+        // called this: on CI runners using overlayfs (every GitHub-hosted
+        // Linux runner's container root), a file just written and
+        // chmod'd can still intermittently report `ETXTBSY`/"Text file
+        // busy" for a few milliseconds if it's exec'd immediately --
+        // overlayfs's own copy-up bookkeeping lagging behind the fd
+        // actually closing, not anything wrong with the script itself.
+        // Seen intermittently in CI as `compile`'s tests spuriously
+        // getting `CommandNotFound { source: ExecutableFileBusy }`
+        // instead of actually running. This is test-only: real `dbt`
+        // installs are long-existing binaries nothing is concurrently
+        // writing to, so this race is specific to writing-then-
+        // immediately-executing a throwaway script in the same process,
+        // never a real production scenario worth handling in
+        // `TransformationToolAdapter::compile` itself.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         path
     }
 

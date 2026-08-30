@@ -1134,6 +1134,10 @@ fn target_path_aware_stub_dbt_dir() -> tempfile::TempDir {
         .permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).expect("should chmod stub script");
+    // A brief pause: writing then immediately exec'ing a fresh script
+    // can spuriously hit `ETXTBSY` on CI's overlayfs -- see the
+    // detailed comment on zhao-core's own `stub_dbt_command`.
+    std::thread::sleep(std::time::Duration::from_millis(50));
     dir
 }
 
