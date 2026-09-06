@@ -57,6 +57,46 @@ fn expands_a_seed_wildcard_from_a_real_fusion_node_columns_parquet() {
     );
 }
 
+/// A seed is `Upstream::Node` for lineage-edge purposes, but that alone
+/// doesn't make it enumerable as a real `Node` in `project.nodes` -- a
+/// consumer building a lineage graph purely from `project.nodes`/`edges`
+/// (zhao-cli's own HTML export, or a downstream tool like the VS Code
+/// extension reading `full_lineage.json`) could compute that the seed is
+/// in scope, but never actually had a node object to draw for it.
+#[test]
+fn a_seed_appears_as_its_own_node_with_real_columns_from_the_index() {
+    let manifest_path = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/dbt_fusion_passthrough/manifest.json"
+    ));
+
+    let project = DbtAdapter
+        .parse(manifest_path)
+        .expect("fixture should parse");
+
+    let seed = project
+        .nodes
+        .iter()
+        .find(|n| n.name == "raw_orders")
+        .expect("the raw_orders seed should appear as its own Node");
+    let column_names: Vec<&str> = seed.columns.iter().map(|c| c.name.as_str()).collect();
+
+    assert_eq!(
+        column_names,
+        vec![
+            "ID",
+            "CUSTOMER",
+            "ORDERED_AT",
+            "STORE_ID",
+            "SUBTOTAL",
+            "TAX_PAID",
+            "ORDER_TOTAL",
+        ],
+        "the seed's own Node entry should carry its real columns from the same Fusion index, \
+         not an empty list"
+    );
+}
+
 #[test]
 fn produces_the_expected_nodes_and_origins() {
     let project = DbtAdapter

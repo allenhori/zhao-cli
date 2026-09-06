@@ -1114,6 +1114,50 @@ fn build_parsed_project(manifest: &RawManifest, catalog: &CatalogSchemas) -> Par
         });
     }
 
+    // Seeds are `Upstream::Node` for lineage-edge purposes (see
+    // `resolve_dependency_id`) but deliberately never join `models`/
+    // `ordered`/the SQL-resolution loop above (no `compiled_code` to
+    // resolve -- see this module's own doc comment). Without a matching
+    // entry here, though, a seed is reachable in a graph traversal (an
+    // edge names it) but was never actually enumerable as a real Node at
+    // all -- `full_lineage.json`'s own `nodes` list came from exactly
+    // this `nodes` Vec, so a lineage graph (zhao's own HTML export, or a
+    // consumer like the VS Code extension) could compute that a seed is
+    // in scope, but never had an actual node to draw for it, only a
+    // dangling edge endpoint. This closes that gap: one `Node` per seed,
+    // real columns from `catalog` when it's available (the same
+    // fallback `expand_wildcard_of`'s `Upstream::Node` arm already uses
+    // for a seed with no `resolved_schemas` entry), empty otherwise --
+    // never an error, matching every other catalog-backed lookup here.
+    for seed in &seeds {
+        let columns = catalog
+            .get(seed.unique_id.as_str())
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| Column {
+                        name: ColumnName::new(name.clone()),
+                        data_type: None,
+                        expression: None,
+                        struct_fields: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        nodes.push(Node {
+            id: NodeId::new(seed.unique_id.clone()),
+            name: seed.name.clone(),
+            columns,
+            joins: Vec::new(),
+            // A seed has no `config.materialized` of its own to read --
+            // it's always, structurally, a real physical table dbt
+            // loads from a CSV, so `Table` is simply accurate, not a
+            // fallback/default the way it is for a model with no
+            // declared materialization.
+            materialization: Materialization::Table,
+        });
+    }
+
     ParsedProject {
         nodes,
         origins,
