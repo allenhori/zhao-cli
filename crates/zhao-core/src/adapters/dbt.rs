@@ -94,6 +94,8 @@ use crate::model::{
     Column, ColumnLineage, ColumnName, JoinKind, LineageEdge, Materialization, Node, NodeId,
     Origin, OriginId, ParsedProject, StructField, Upstream,
 };
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::Field as ParquetField;
 use serde::Deserialize;
 use sqlparser::ast::{
     AccessExpr, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select,
@@ -440,46 +442,150 @@ fn read_manifest(path: &Path) -> Result<RawManifest, DbtAdapterError> {
 }
 
 /// Every model's or source's real column names, as introspected from the
-/// warehouse and recorded in dbt's `catalog.json` artifact (produced by
-/// `dbt docs generate`, not `dbt compile` -- so it's a genuinely optional,
-/// separately-generated file), keyed by `unique_id` -- the same key
-/// `manifest.json`'s own `nodes`/`sources` maps use, and so directly
-/// comparable to an [`Upstream::Node`]'s or [`Upstream::Origin`]'s own id.
-/// Column order matches the warehouse's own column ordering (`catalog.json`
-/// records each column's `index`; see [`RawCatalogColumn`]).
+/// warehouse (dbt-core's `catalog.json`) or statically inferred (dbt
+/// Fusion's `dbt.node_columns.parquet` -- see [`read_node_columns_parquet`]),
+/// keyed by `unique_id` -- the same key `manifest.json`'s own
+/// `nodes`/`sources` maps use, and so directly comparable to an
+/// [`Upstream::Node`]'s or [`Upstream::Origin`]'s own id. Column order
+/// matches each source's own recorded ordering (`catalog.json`'s `index`,
+/// see [`RawCatalogColumn`]; the parquet index's `column_index`).
 ///
 /// Unlike `manifest.json`, whose columns are only ever whatever a project's
 /// `schema.yml` happens to document (see the module-level doc comment),
-/// `catalog.json`'s columns are the real, complete output schema -- which
-/// is what makes it useful for expanding a `SELECT *` read directly from a
-/// source (an Origin's real columns are otherwise never knowable at all)
-/// and for disambiguating an otherwise-ambiguous duplicate `FROM` alias
-/// (see [`LocalSchema::AmbiguousAlias`]).
+/// this is meant to be the real, complete output schema -- which is what
+/// makes it useful for expanding a `SELECT *` read directly from a source
+/// (an Origin's real columns are otherwise never knowable at all) and for
+/// disambiguating an otherwise-ambiguous duplicate `FROM` alias (see
+/// [`LocalSchema::AmbiguousAlias`]). In practice `catalog.json` delivers on
+/// that fully (a live warehouse introspection covers every relation), while
+/// the Fusion parquet index currently only reliably covers seeds (knowable
+/// from local data, no warehouse round-trip needed) -- see
+/// [`read_node_columns_parquet`]'s doc comment for why a genuine `source`'s
+/// columns still won't resolve under Fusion today.
 type CatalogSchemas = HashMap<String, Vec<String>>;
 
-/// Reads and parses a sibling `catalog.json` next to the manifest at
-/// `manifest_path` (dbt always writes both to the same `target/`
-/// directory), producing an empty [`CatalogSchemas`] -- exactly as if no
-/// catalog-backed resolution were available at all -- for any reason it
-/// can't: no sibling directory, the file doesn't exist, it can't be read,
-/// or its contents aren't valid `catalog.json` JSON. This is deliberately
-/// infallible (unlike [`read_manifest`]): a `catalog.json` is optional
-/// bonus detail a project may never have generated (it takes a live
-/// warehouse connection and a separate `dbt docs generate` run, unlike
-/// `manifest.json` which every `dbt compile` already produces), so its
-/// absence must never surface as an adapter error, only as today's
-/// existing `Opaque`/unexpanded-wildcard behavior.
+/// Reads real column schemas from whichever artifact is actually sitting
+/// next to the manifest at `manifest_path` (dbt always writes its own
+/// artifacts to the same `target/` directory): a sibling `catalog.json`
+/// (dbt-core) when one is present, else dbt Fusion's own
+/// `index/dbt.node_columns.parquet` index. Producing an empty
+/// [`CatalogSchemas`] -- exactly as if no catalog-backed resolution were
+/// available at all -- when neither is present, or the one that is present
+/// can't be read/parsed. This is deliberately infallible (unlike
+/// [`read_manifest`]): both artifacts are optional bonus detail a project
+/// may never have generated, so their absence must never surface as an
+/// adapter error, only as today's existing `Opaque`/unexpanded-wildcard
+/// behavior.
+///
+/// `catalog.json` always wins when both are present (e.g. a `target/` left
+/// over from a project mid-migration from dbt-core to Fusion) -- a real,
+/// warehouse-verified schema should never be displaced by a statically
+/// inferred one. Selection is based on which file actually exists on disk,
+/// not on parsing `manifest.json`'s own `dbt_version`, so a future dbt
+/// release that keeps writing either artifact in the same shape keeps
+/// working here unchanged.
 fn read_catalog(manifest_path: &Path) -> CatalogSchemas {
     let Some(dir) = manifest_path.parent() else {
         return CatalogSchemas::new();
     };
-    let Ok(raw) = fs::read_to_string(dir.join("catalog.json")) else {
+    let catalog_json_path = dir.join("catalog.json");
+    if catalog_json_path.is_file() {
+        return read_catalog_json(&catalog_json_path);
+    }
+    read_node_columns_parquet(&dir.join("index").join("dbt.node_columns.parquet"))
+}
+
+/// Reads and parses `catalog.json` at `path`, producing an empty
+/// [`CatalogSchemas`] if it can't be read or its contents aren't valid
+/// `catalog.json` JSON. Callers ([`read_catalog`]) only reach this once
+/// they've confirmed the file exists -- unlike that unreadable/unparseable
+/// case, a genuinely *missing* `catalog.json` doesn't reach here at all, so
+/// [`read_catalog`] can fall through to the Fusion parquet index instead.
+fn read_catalog_json(path: &Path) -> CatalogSchemas {
+    let Ok(raw) = fs::read_to_string(path) else {
         return CatalogSchemas::new();
     };
     let Ok(catalog) = serde_json::from_str::<RawCatalog>(&raw) else {
         return CatalogSchemas::new();
     };
     build_catalog_schemas(&catalog)
+}
+
+/// Reads dbt Fusion's `index/dbt.node_columns.parquet` at `path` -- written
+/// whenever a project compiles with `--write-index` and
+/// `static_analysis: strict` (`dbt docs generate` implies `--write-index`;
+/// `dbt compile`/`build` need it passed explicitly), one row per relation
+/// per column. Only three of its ~20 columns are consulted --
+/// `unique_id`, `column_name`, `column_index` -- read by name via
+/// [`parquet`]'s row API rather than positionally, so the many other
+/// columns Fusion also writes (types, descriptions, tags, ...) can vary or
+/// grow across Fusion releases without breaking this reader. Column
+/// ordering mirrors [`build_catalog_schemas`]'s own `catalog.json`
+/// convention: rows are grouped by `unique_id`, sorted by `column_index`
+/// (missing treated as sorting last, same as a missing `catalog.json`
+/// `index`), then flattened to a bare name list.
+///
+/// Deliberately infallible, the same as [`read_catalog_json`]: a missing
+/// index directory/file, a corrupt file, or one with an unexpected schema
+/// all degrade silently to an empty [`CatalogSchemas`] rather than an
+/// error -- this is undocumented, internal Fusion artifact whose exact
+/// shape isn't a stable contract yet.
+///
+/// Known coverage gap, not a bug in this reader: as observed against a
+/// real Fusion build, this index reliably carries real columns for
+/// **seeds** (a seed's schema is knowable purely from local CSV data, no
+/// warehouse connection needed) but not for genuine `source`-declared
+/// external tables -- Fusion's static analysis has no way to know a live,
+/// externally managed table's real schema without actually connecting to
+/// the warehouse. `catalog.json` closes that gap for dbt-core because it's
+/// built from a real warehouse introspection; Fusion has no working
+/// equivalent artifact for that case today.
+fn read_node_columns_parquet(path: &Path) -> CatalogSchemas {
+    (|| -> Option<CatalogSchemas> {
+        let file = fs::File::open(path).ok()?;
+        let reader = SerializedFileReader::new(file).ok()?;
+        let mut raw: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+        // `get_row_iter(None)` reads every column of every row, including
+        // the ~17 others a real Fusion build also writes here (types,
+        // descriptions, tags, ...) that this reader never looks at -- a
+        // projected schema naming just the 3 fields below would skip
+        // decoding the rest. Left as `None` for now (a projection needs
+        // building a `SchemaType` subset from `reader.metadata()`'s own
+        // schema, not done here yet); worth revisiting if a real, large
+        // project's `dbt.node_columns.parquet` makes this measurably
+        // slow.
+        for row in reader.get_row_iter(None).ok()? {
+            let row = row.ok()?;
+            let mut unique_id: Option<String> = None;
+            let mut column_name: Option<String> = None;
+            let mut column_index: i64 = i64::MAX;
+            for (name, field) in row.get_column_iter() {
+                match (name.as_str(), field) {
+                    ("unique_id", ParquetField::Str(value)) => unique_id = Some(value.clone()),
+                    ("column_name", ParquetField::Str(value)) => column_name = Some(value.clone()),
+                    ("column_index", ParquetField::Long(value)) => column_index = *value,
+                    _ => {}
+                }
+            }
+            if let (Some(unique_id), Some(column_name)) = (unique_id, column_name) {
+                raw.entry(unique_id)
+                    .or_default()
+                    .push((column_index, column_name));
+            }
+        }
+        Some(
+            raw.into_iter()
+                .map(|(unique_id, mut columns)| {
+                    columns.sort_by_key(|(index, _)| *index);
+                    (
+                        unique_id,
+                        columns.into_iter().map(|(_, name)| name).collect(),
+                    )
+                })
+                .collect(),
+        )
+    })()
+    .unwrap_or_default()
 }
 
 /// Flattens a parsed [`RawCatalog`]'s `nodes` and `sources` maps (both
@@ -724,6 +830,24 @@ fn build_parsed_project(manifest: &RawManifest, catalog: &CatalogSchemas) -> Par
         .filter(|n| n.resource_type == "model" && n.qualified_name().is_some())
         .collect();
 
+    // Seeds are never SQL-parsed (no `compiled_code` -- dbt loads them
+    // straight from a CSV, see `RawNode`'s doc comment), so they
+    // deliberately stay out of `models`/`ordered`/the SQL-resolution loop
+    // below: a seed never becomes its own top-level `Node` entry with a
+    // resolved column list the way a model does, and never gets a
+    // `resolved_schemas` entry either -- unchanged from before this. But a
+    // model can still `ref()` a seed directly, and dbt compiles that to
+    // the seed's own fully-qualified relation name, same as any other
+    // `ref()`/`source()` -- so a seed's *qualified name* still needs to be
+    // in `known_relations`, or a `SELECT ... FROM <that seed>` can never
+    // even match it to `Upstream::Node(seed_id)` in the first place, no
+    // matter what real-schema fallback `expand_wildcard_of` might offer.
+    let seeds: Vec<&RawNode> = manifest
+        .nodes
+        .values()
+        .filter(|n| n.resource_type == "seed" && n.qualified_name().is_some())
+        .collect();
+
     let sources: Vec<&RawSource> = manifest
         .sources
         .values()
@@ -742,6 +866,18 @@ fn build_parsed_project(manifest: &RawManifest, catalog: &CatalogSchemas) -> Par
     // qualified table references (dbt always compiles `ref()`/`source()`
     // to `"database"."schema"."identifier"`) can be matched back to a
     // specific Node or Origin.
+    //
+    // Insertion order here is a deliberate precedence, not just iteration
+    // order: sources, then models, then seeds -- so a seed wins whenever
+    // its physical relation happens to collide with a source's (a real,
+    // supported dbt pattern: a project can declare both a `source()` and
+    // a seed pointing at the same physical table, so either can be
+    // `ref()`'d/`source()`'d interchangeably -- jaffle_shop's own
+    // tutorial models do exactly this). A `ref('a_seed')` compiles to
+    // that seed's own relation name, so attributing it to the seed's own
+    // Node -- what the SQL actually called -- is more faithful than
+    // attributing it to a same-address source purely because that
+    // source's entry happened to be inserted first.
     let mut known_relations: HashMap<QualifiedName, Upstream> = HashMap::new();
     for source in &sources {
         known_relations.insert(
@@ -753,6 +889,12 @@ fn build_parsed_project(manifest: &RawManifest, catalog: &CatalogSchemas) -> Par
         known_relations.insert(
             model.qualified_name().expect("filtered above"),
             Upstream::Node(NodeId::new(model.unique_id.clone())),
+        );
+    }
+    for seed in &seeds {
+        known_relations.insert(
+            seed.qualified_name().expect("filtered above"),
+            Upstream::Node(NodeId::new(seed.unique_id.clone())),
         );
     }
 
@@ -1449,10 +1591,22 @@ fn collect_table_factor(
         name, alias, args, ..
     } = factor
     {
+        // `Ident::to_string()` re-serializes *with* whatever quote
+        // character that identifier was originally written with -- `"`
+        // for ANSI/Postgres/Snowflake/BigQuery, `` ` `` for
+        // MySQL/Databricks/Spark, `[`/`]` for SQL Server. Stripping only
+        // `"` left a backtick-quoted relation (e.g. Databricks'
+        // `` `catalog`.`schema`.`table` `` -- how dbt-databricks always
+        // renders a compiled relation reference) never matching
+        // `known_relations`' clean, quote-free keys, so every such
+        // relation resolved as `Opaque` instead of a real `Passthrough` --
+        // silently breaking column-level lineage for every Databricks
+        // project, dbt-core and Fusion alike, not something specific to
+        // either.
         let parts: Vec<String> = name
             .0
             .iter()
-            .map(|p| p.to_string().replace('"', ""))
+            .map(|p| p.to_string().replace(['"', '`', '[', ']'], ""))
             .collect();
         let effective_alias = alias
             .as_ref()
@@ -1512,11 +1666,17 @@ fn expand_wildcard(
 }
 
 /// Enumerates a [`LocalSchema`]'s columns as a concrete list, when
-/// possible. A `Passthrough` of a Node can always be enumerated (we've
-/// already resolved that Node's real columns); a `Passthrough` of an
-/// Origin can only be enumerated when a `catalog.json` covers it (see
-/// [`CatalogSchemas`]) -- absent that, an Origin's real columns still
-/// aren't known.
+/// possible. A `Passthrough` of a Node whose SQL has already been resolved
+/// (an ordinary model) always enumerates from that -- its real columns are
+/// already known. A `Passthrough` of a Node with *no* SQL of its own (a
+/// seed: dbt loads it straight from a CSV, so it's a [`Upstream::Node`]
+/// with no `compiled_code` to parse, and so no `resolved_schemas` entry
+/// either -- see the module-level doc comment's discussion of seeds) falls
+/// back to `catalog`, the same real-schema source an Origin already relies
+/// on entirely. A `Passthrough` of an Origin can only be enumerated when a
+/// `catalog.json` (or, for a dbt Fusion project, its native parquet
+/// equivalent -- see [`read_node_columns_parquet`]) covers it -- absent
+/// that, an Origin's real columns still aren't known.
 fn expand_wildcard_of(
     schema: &LocalSchema,
     resolved_schemas: &HashMap<NodeId, Vec<ColumnName>>,
@@ -1524,19 +1684,37 @@ fn expand_wildcard_of(
 ) -> Option<Vec<ResolvedColumn>> {
     match schema {
         LocalSchema::Passthrough(upstream @ Upstream::Node(id)) => {
-            let cols = resolved_schemas.get(id)?;
+            if let Some(cols) = resolved_schemas.get(id) {
+                return Some(
+                    cols.iter()
+                        .map(|c| ResolvedColumn {
+                            name: c.as_str().to_string(),
+                            sources: vec![(upstream.clone(), c.as_str().to_string())],
+                            expression: None,
+                            // A wildcard expansion only ever has an
+                            // upstream Node's resolved column *names* to
+                            // work with (`resolved_schemas:
+                            // HashMap<NodeId, Vec<ColumnName>>` never
+                            // carried full `Column` detail) -- there's no
+                            // shape to carry forward even if the upstream
+                            // column had one.
+                            struct_fields: None,
+                        })
+                        .collect(),
+                );
+            }
+            // No `resolved_schemas` entry: this Node has no SQL of its own
+            // to have resolved one from (a seed) -- same "real names,
+            // catalog-only" treatment as an Origin, same empty-entry guard
+            // as below (an empty catalog entry means the seed just isn't
+            // covered, not that it genuinely has zero columns).
+            let cols = catalog.get(id.as_str()).filter(|cols| !cols.is_empty())?;
             Some(
                 cols.iter()
-                    .map(|c| ResolvedColumn {
-                        name: c.as_str().to_string(),
-                        sources: vec![(upstream.clone(), c.as_str().to_string())],
+                    .map(|name| ResolvedColumn {
+                        name: name.clone(),
+                        sources: vec![(upstream.clone(), name.clone())],
                         expression: None,
-                        // A wildcard expansion only ever has an upstream
-                        // Node's resolved column *names* to work with
-                        // (`resolved_schemas: HashMap<NodeId,
-                        // Vec<ColumnName>>` never carried full `Column`
-                        // detail) -- there's no shape to carry forward
-                        // even if the upstream column had one.
                         struct_fields: None,
                     })
                     .collect(),
@@ -2115,7 +2293,7 @@ fn resolve_unqualified(
         let candidate = path[..len].join(".");
         let known_hits: Vec<&LocalSchema> = from_scope
             .values()
-            .filter(|schema| matches!(schema, LocalSchema::Known(cols) if cols.iter().any(|c| c.name == candidate)))
+            .filter(|schema| matches!(schema, LocalSchema::Known(cols) if cols.iter().any(|c| column_names_match(&c.name, &candidate))))
             .collect();
         match known_hits.len() {
             1 => return source_of(known_hits[0], &candidate),
@@ -2246,14 +2424,47 @@ fn resolve_path_on_schema(
 /// theoretically possible.
 fn column_exists_on(schema: &LocalSchema, column: &str, catalog: &CatalogSchemas) -> Option<bool> {
     let upstream_id = match schema {
-        LocalSchema::Known(cols) => return Some(cols.iter().any(|c| c.name == column)),
+        LocalSchema::Known(cols) => {
+            return Some(cols.iter().any(|c| column_names_match(&c.name, column)));
+        }
         LocalSchema::Passthrough(Upstream::Node(id)) => id.as_str(),
         LocalSchema::Passthrough(Upstream::Origin(id)) => id.as_str(),
         LocalSchema::Opaque | LocalSchema::AmbiguousAlias(_) => return None,
     };
     catalog
         .get(upstream_id)
-        .map(|cols| cols.iter().any(|c| c == column))
+        .map(|cols| cols.iter().any(|c| column_names_match(c, column)))
+}
+
+/// Whether `a` and `b` name the same column -- compared
+/// case-insensitively (ASCII only; dbt-supported warehouses' unquoted
+/// identifiers don't extend case-folding beyond ASCII), matching how an
+/// unquoted identifier actually resolves on every warehouse zhao's SQL
+/// dialects target (Snowflake, Databricks, BigQuery, ...): a model's SQL
+/// commonly references a column in whatever case its author typed it
+/// (`order_total`), while the real, catalog- or index-sourced column name
+/// reflects however the warehouse itself stores it (`ORDER_TOTAL`, e.g. a
+/// seed loaded from an upper-cased CSV header) -- an exact-case comparison
+/// between the two would wrongly treat a real column as nonexistent. Used
+/// everywhere a catalog- or index-derived real name is compared against a
+/// SQL-parsed reference; never needed for two names both drawn from the
+/// same compiled SQL text (already guaranteed to agree on case there).
+///
+/// Known, accepted trade-off: on a warehouse that allows two genuinely
+/// distinct, case-differing quoted columns to coexist on the same
+/// relation (e.g. Postgres's `"Total"` and `"total"` as separate,
+/// deliberately-quoted columns), an unqualified reference to one now
+/// matches both here -- callers ([`source_of`]'s `find`,
+/// `column_exists_on`'s `any`) don't disambiguate, so this can pick
+/// whichever the real-column list happens to list first rather than
+/// reporting a genuine ambiguity. Accepted because that shape is rare (it
+/// requires a project to deliberately create two case-only-differing
+/// quoted columns on one relation) next to the alternative this fixes --
+/// case-insensitive identifiers are the norm across every warehouse zhao
+/// targets, so treating case as always significant would silently miss
+/// far more real matches than this occasionally mis-picks.
+fn column_names_match(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
 }
 
 /// Every upstream source `column` traces to on `schema`. A `Passthrough`
@@ -2269,7 +2480,7 @@ fn source_of(schema: &LocalSchema, column: &str) -> Vec<(Upstream, String)> {
         LocalSchema::Passthrough(upstream) => vec![(upstream.clone(), column.to_string())],
         LocalSchema::Known(cols) => cols
             .iter()
-            .find(|c| c.name == column)
+            .find(|c| column_names_match(&c.name, column))
             .map(|c| c.sources.clone())
             .unwrap_or_default(),
         // `source_of` is only ever reached via a `Known` relation's own
@@ -2772,6 +2983,77 @@ mod tests {
         );
     }
 
+    /// A real column reference resolves against a catalog- or
+    /// index-sourced real column name even when the two disagree on case
+    /// (`ORDER_TOTAL` in the catalog, `order_total` in the SQL) -- the
+    /// common shape on a case-insensitive warehouse (Databricks,
+    /// Snowflake, ...) where a seed loaded from an upper-cased CSV header
+    /// is referenced in lower-case, unquoted SQL. Applies equally to
+    /// dbt-core's `catalog.json` and dbt Fusion's parquet index, since
+    /// both feed the same [`CatalogSchemas`].
+    #[test]
+    fn a_wildcard_from_a_source_expands_and_matches_regardless_of_case() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+        let mut catalog = CatalogSchemas::new();
+        catalog.insert("origin.s.t".to_string(), vec!["ORDER_TOTAL".to_string()]);
+
+        let query = parse_query(r#"select order_total from "db"."s"."t""#).expect("should parse");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas, &catalog);
+
+        match schema {
+            LocalSchema::Known(cols) => {
+                assert_eq!(cols.len(), 1);
+                assert_eq!(
+                    cols[0].sources,
+                    vec![(origin("origin.s.t"), "order_total".to_string())],
+                    "a lower-case SQL reference should still resolve against the catalog's \
+                     upper-cased real column name, got {cols:?}"
+                );
+            }
+            other => {
+                panic!("expected Known([order_total] resolved case-insensitively), got {other:?}")
+            }
+        }
+    }
+
+    /// A backtick-quoted, fully-qualified relation reference (MySQL's/
+    /// Databricks'/Spark's own quoting -- how dbt-databricks always
+    /// renders a compiled relation) matches `known_relations` the same as
+    /// a double-quoted one already does. Before this, only `"` was
+    /// stripped from a parsed identifier, so a backtick-quoted relation
+    /// never matched `known_relations`' quote-free keys at all --
+    /// silently breaking every Databricks project's column-level lineage.
+    #[test]
+    fn a_backtick_quoted_relation_reference_resolves_the_same_as_a_double_quoted_one() {
+        let mut known_relations = HashMap::new();
+        known_relations.insert(
+            ("db".to_string(), "s".to_string(), "t".to_string()),
+            origin("origin.s.t"),
+        );
+        let resolved_schemas = HashMap::new();
+        let catalog = CatalogSchemas::new();
+
+        let query = parse_query_with_dialect(
+            "select * from `db`.`s`.`t`",
+            resolve_sql_dialect(Some("databricks")).as_ref(),
+        )
+        .expect("should parse under DatabricksDialect");
+        let schema = resolve_query(&query, &known_relations, &resolved_schemas, &catalog);
+
+        match schema {
+            LocalSchema::Passthrough(upstream) => assert_eq!(upstream, origin("origin.s.t")),
+            other => panic!(
+                "expected a backtick-quoted relation to resolve to the known Origin, not \
+                 Opaque, got {other:?}"
+            ),
+        }
+    }
+
     /// Two ambiguously-aliased relations (a duplicate `FROM` alias) still
     /// resolve a qualified column reference deterministically when
     /// `catalog.json` shows the column exists on only one of them.
@@ -3158,6 +3440,201 @@ mod tests {
         assert_eq!(
             catalog.get("source.p.raw.t"),
             Some(&vec!["amount".to_string()])
+        );
+    }
+
+    /// Writes a minimal, valid `dbt.node_columns.parquet` fixture at
+    /// `path` -- three real columns ([`read_node_columns_parquet`] cares
+    /// about) plus one it doesn't (`inferred_type`), and column rows
+    /// deliberately out of `column_index` order, to prove selection is by
+    /// name (not position) and rows are re-sorted rather than trusted as
+    /// already ordered.
+    fn write_node_columns_fixture(path: &Path, rows: &[(&str, &str, i64, &str)]) {
+        use parquet::data_type::ByteArray;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+        use std::sync::Arc;
+
+        std::fs::create_dir_all(path.parent().expect("fixture path should have a parent"))
+            .expect("should create fixture's parent dir");
+
+        let schema = Arc::new(
+            parse_message_type(
+                "message schema {
+                    REQUIRED BYTE_ARRAY unique_id (UTF8);
+                    REQUIRED BYTE_ARRAY column_name (UTF8);
+                    REQUIRED INT64 column_index;
+                    REQUIRED BYTE_ARRAY inferred_type (UTF8);
+                }",
+            )
+            .expect("schema literal should parse"),
+        );
+        let file = fs::File::create(path).expect("should create fixture file");
+        let mut writer = SerializedFileWriter::new(file, schema, Arc::new(WriterProperties::new()))
+            .expect("should create parquet writer");
+        let mut row_group = writer.next_row_group().expect("should open a row group");
+
+        let unique_ids: Vec<ByteArray> = rows
+            .iter()
+            .map(|(id, _, _, _)| ByteArray::from(*id))
+            .collect();
+        let mut col = row_group
+            .next_column()
+            .expect("should open unique_id column")
+            .expect("unique_id column should exist");
+        col.typed::<parquet::data_type::ByteArrayType>()
+            .write_batch(&unique_ids, None, None)
+            .expect("should write unique_id column");
+        col.close().expect("should close unique_id column");
+
+        let names: Vec<ByteArray> = rows
+            .iter()
+            .map(|(_, name, _, _)| ByteArray::from(*name))
+            .collect();
+        let mut col = row_group
+            .next_column()
+            .expect("should open column_name column")
+            .expect("column_name column should exist");
+        col.typed::<parquet::data_type::ByteArrayType>()
+            .write_batch(&names, None, None)
+            .expect("should write column_name column");
+        col.close().expect("should close column_name column");
+
+        let indices: Vec<i64> = rows.iter().map(|(_, _, index, _)| *index).collect();
+        let mut col = row_group
+            .next_column()
+            .expect("should open column_index column")
+            .expect("column_index column should exist");
+        col.typed::<parquet::data_type::Int64Type>()
+            .write_batch(&indices, None, None)
+            .expect("should write column_index column");
+        col.close().expect("should close column_index column");
+
+        let types: Vec<ByteArray> = rows
+            .iter()
+            .map(|(_, _, _, ty)| ByteArray::from(*ty))
+            .collect();
+        let mut col = row_group
+            .next_column()
+            .expect("should open inferred_type column")
+            .expect("inferred_type column should exist");
+        col.typed::<parquet::data_type::ByteArrayType>()
+            .write_batch(&types, None, None)
+            .expect("should write inferred_type column");
+        col.close().expect("should close inferred_type column");
+
+        row_group.close().expect("should close row group");
+        writer.close().expect("should close parquet writer");
+    }
+
+    /// [`read_node_columns_parquet`] is fully optional, same bar as
+    /// [`read_catalog_json`]: no index file at all produces an empty
+    /// [`CatalogSchemas`], not an error.
+    #[test]
+    fn read_node_columns_parquet_returns_empty_when_no_index_file_exists() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+
+        let schemas = read_node_columns_parquet(&dir.path().join("index/dbt.node_columns.parquet"));
+
+        assert!(schemas.is_empty());
+    }
+
+    /// A file that exists at the expected path but isn't valid parquet
+    /// degrades the same way a missing file does -- empty, not a panic or
+    /// an error.
+    #[test]
+    fn read_node_columns_parquet_returns_empty_when_the_file_is_not_valid_parquet() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let index_path = dir.path().join("index").join("dbt.node_columns.parquet");
+        fs::create_dir_all(index_path.parent().unwrap()).expect("should create index dir");
+        fs::write(&index_path, b"not a parquet file").expect("should write stub index file");
+
+        let schemas = read_node_columns_parquet(&index_path);
+
+        assert!(schemas.is_empty());
+    }
+
+    /// A valid `dbt.node_columns.parquet` is read and flattened into real
+    /// column lists, keyed by `unique_id`, ordered by each row's own
+    /// `column_index` (not row-write order, which the fixture deliberately
+    /// scrambles) -- selected by field *name*, so the fixture's extra
+    /// `inferred_type` column (present in every real Fusion build, unused
+    /// here) doesn't interfere.
+    #[test]
+    fn read_node_columns_parquet_reads_a_valid_index() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let index_path = dir.path().join("index").join("dbt.node_columns.parquet");
+        write_node_columns_fixture(
+            &index_path,
+            &[
+                ("seed.p.raw_orders", "customer", 1, "Utf8"),
+                ("seed.p.raw_orders", "order_total", 6, "Int64"),
+                ("seed.p.raw_orders", "id", 0, "Utf8"),
+                ("model.p.stg_orders", "order_id", 0, "Utf8"),
+            ],
+        );
+
+        let schemas = read_node_columns_parquet(&index_path);
+
+        assert_eq!(
+            schemas.get("seed.p.raw_orders"),
+            Some(&vec![
+                "id".to_string(),
+                "customer".to_string(),
+                "order_total".to_string()
+            ])
+        );
+        assert_eq!(
+            schemas.get("model.p.stg_orders"),
+            Some(&vec!["order_id".to_string()])
+        );
+    }
+
+    /// [`read_catalog`] prefers a real `catalog.json` over the Fusion
+    /// parquet index whenever both happen to be present (e.g. a `target/`
+    /// left over from a project mid-migration from dbt-core to Fusion) --
+    /// a warehouse-verified schema must never be displaced by a statically
+    /// inferred one.
+    #[test]
+    fn read_catalog_prefers_catalog_json_when_both_are_present() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(
+            dir.path().join("catalog.json"),
+            r#"{"nodes": {"seed.p.raw_orders": {"columns": {"A": {"name": "from_catalog_json", "index": 0}}}}, "sources": {}}"#,
+        )
+        .expect("should write catalog.json");
+        write_node_columns_fixture(
+            &dir.path().join("index").join("dbt.node_columns.parquet"),
+            &[("seed.p.raw_orders", "from_parquet", 0, "Utf8")],
+        );
+
+        let catalog = read_catalog(&manifest_path);
+
+        assert_eq!(
+            catalog.get("seed.p.raw_orders"),
+            Some(&vec!["from_catalog_json".to_string()])
+        );
+    }
+
+    /// [`read_catalog`] falls back to the Fusion parquet index when no
+    /// `catalog.json` is present at all -- the common Fusion case, since
+    /// Fusion never writes one.
+    #[test]
+    fn read_catalog_falls_back_to_node_columns_parquet_when_no_catalog_json() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let manifest_path = dir.path().join("manifest.json");
+        write_node_columns_fixture(
+            &dir.path().join("index").join("dbt.node_columns.parquet"),
+            &[("seed.p.raw_orders", "order_total", 0, "Int64")],
+        );
+
+        let catalog = read_catalog(&manifest_path);
+
+        assert_eq!(
+            catalog.get("seed.p.raw_orders"),
+            Some(&vec!["order_total".to_string()])
         );
     }
 
