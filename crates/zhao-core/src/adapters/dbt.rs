@@ -251,14 +251,14 @@ impl TransformationToolAdapter for DbtAdapter {
     /// the tests run. `extra_args` are appended verbatim after `compile`
     /// (e.g. `--target`, `--vars`) -- zhao never interprets or validates
     /// these, dbt does -- except that, when `command` reports itself as
-    /// dbt Fusion (see [`command_reports_dbt_fusion`]), `--write-index
+    /// dbt Fusion (via its own `--version` banner), `--write-index
     /// --static-analysis strict` are appended too, unless `extra_args`
     /// already configures `--write-index` itself. Without this, Fusion
-    /// never writes `target/index/dbt.node_columns.parquet` at all (see
-    /// [`read_node_columns_parquet`]) -- every `--compile` would silently
-    /// keep reading whatever stale index happened to already be on disk,
-    /// or none. Never added for dbt-core, which doesn't recognize either
-    /// flag and would fail outright.
+    /// never writes `target/index/dbt.node_columns.parquet` at all --
+    /// every `--compile` would silently keep reading whatever stale
+    /// index happened to already be on disk, or none. Never added for
+    /// dbt-core, which doesn't recognize either flag and would fail
+    /// outright.
     fn compile(
         &self,
         project_dir: &Path,
