@@ -250,14 +250,23 @@ impl TransformationToolAdapter for DbtAdapter {
     /// depending on whether a real `dbt` happens to be installed wherever
     /// the tests run. `extra_args` are appended verbatim after `compile`
     /// (e.g. `--target`, `--vars`) -- zhao never interprets or validates
-    /// these, dbt does.
+    /// these, dbt does -- except that, when `command` reports itself as
+    /// dbt Fusion (via its own `--version` banner), `--write-index
+    /// --static-analysis strict` are appended too, unless `extra_args`
+    /// already configures `--write-index` itself. Without this, Fusion
+    /// never writes `target/index/dbt.node_columns.parquet` at all --
+    /// every `--compile` would silently keep reading whatever stale
+    /// index happened to already be on disk, or none. Never added for
+    /// dbt-core, which doesn't recognize either flag and would fail
+    /// outright.
     fn compile(
         &self,
         project_dir: &Path,
         command: &str,
         extra_args: &[String],
     ) -> Result<DbtCommandOutput, DbtAdapterError> {
-        let output = run_dbt_subcommand(command, "compile", project_dir, extra_args)?;
+        let effective_args = with_fusion_index_flags(project_dir, command, extra_args);
+        let output = run_dbt_subcommand(command, "compile", project_dir, &effective_args)?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         if !output.status.success() {
@@ -669,6 +678,82 @@ fn split_dbt_command(dbt_command: &str) -> Result<(String, Vec<String>), DbtAdap
     }
     let program = parts.remove(0);
     Ok((program, parts))
+}
+
+/// Returns `extra_args` unchanged unless `command` reports itself as dbt
+/// Fusion (see [`command_reports_dbt_fusion`]) *and* doesn't already
+/// configure `--write-index` itself -- in which case
+/// `--write-index --static-analysis strict` is appended. Only
+/// [`DbtAdapter::compile`] calls this, never `deps` (which never writes
+/// this artifact regardless) or the Baseline's own compile indirectly
+/// through it -- a Baseline compiled this way benefits the same as any
+/// other compile, no special-casing needed.
+///
+/// This is *additive* detection on top of `extra_args`, not a decision
+/// zhao-cli makes once and remembers: `command_reports_dbt_fusion` runs
+/// again on every `compile()` call. That's deliberately simple over
+/// caching the result -- a single extra `--version` invocation per
+/// compile is cheap next to the compile itself, and avoids a whole
+/// class of "the cached answer went stale when the user swapped dbt
+/// versions mid-session" bugs for a saving that wouldn't be
+/// measurable anyway.
+fn with_fusion_index_flags(
+    project_dir: &Path,
+    command: &str,
+    extra_args: &[String],
+) -> Vec<String> {
+    let already_configured = extra_args.iter().any(|arg| arg == "--write-index");
+    if already_configured || !command_reports_dbt_fusion(project_dir, command) {
+        return extra_args.to_vec();
+    }
+    let mut effective = extra_args.to_vec();
+    effective.push("--write-index".to_string());
+    effective.push("--static-analysis".to_string());
+    effective.push("strict".to_string());
+    effective
+}
+
+/// Whether `command --version` reports itself as dbt Fusion (its own
+/// version banner starts with `dbt-fusion`, e.g. `dbt-fusion
+/// 2.0.0-preview.218` -- confirmed against a real Fusion install; dbt-
+/// core's own `--version` output never contains this string).
+///
+/// Run in `project_dir`, the same as [`run_dbt_subcommand`] -- `--version`
+/// itself doesn't need an actual dbt project to answer, but `command`
+/// isn't necessarily real `dbt`: it can be a user-configured wrapper
+/// script (`dbt-command` in `zhao.yml`) that does something else
+/// entirely for `--version`, and a test's own stub script always is one
+/// (see `stub_fusion_dbt_command`) -- either way, nothing this probe
+/// invokes should be free to write into whatever directory zhao-cli's
+/// own process happens to have as its CWD.
+///
+/// Deliberately defaults to `false` (dbt-core's behavior: no extra
+/// flags) for anything other than a confirmed Fusion match -- a
+/// `command` that can't be split, can't be spawned, exits non-zero, or
+/// whose output just doesn't mention Fusion. Getting this wrong in the
+/// "add the flags anyway" direction would break every dbt-core
+/// project's compile outright (unrecognized flags); getting it wrong in
+/// the "don't add them" direction only costs the same missing-index gap
+/// this function exists to close, matching today's existing behavior --
+/// so an inconclusive answer always resolves to the safer of the two.
+fn command_reports_dbt_fusion(project_dir: &Path, command: &str) -> bool {
+    let Ok((program, prefix_args)) = split_dbt_command(command) else {
+        return false;
+    };
+    let Ok(output) = std::process::Command::new(&program)
+        .args(&prefix_args)
+        .arg("--version")
+        .current_dir(project_dir)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stdout.contains("dbt-fusion") || stderr.contains("dbt-fusion")
 }
 
 /// Runs `dbt_command <subcommand> <extra_args...>` in `project_dir`,
@@ -4603,6 +4688,109 @@ mod tests {
         let recorded_args =
             fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
         assert_eq!(recorded_args.trim(), "compile --target ci");
+    }
+
+    /// A stub `dbt` that answers `--version` like a real Fusion install
+    /// (`dbt-fusion 2.0.0-preview.218`) and otherwise just echoes its
+    /// own argv to `args.txt`, the same recording trick
+    /// `compile_appends_extra_args_after_the_subcommand` uses.
+    #[cfg(unix)]
+    fn stub_fusion_dbt_command(dir: &Path) -> std::path::PathBuf {
+        stub_dbt_command(
+            dir,
+            r#"if [ "$1" = "--version" ]; then echo "dbt-fusion 2.0.0-preview.218"; exit 0; fi
+echo "$@" > args.txt"#,
+        )
+    }
+
+    /// [`DbtAdapter::compile`]'s core new behavior: when `dbt --version`
+    /// reports Fusion, `--write-index --static-analysis strict` are
+    /// appended -- without this, Fusion never writes the column-schema
+    /// index `read_node_columns_parquet` depends on.
+    #[cfg(unix)]
+    #[test]
+    fn compile_appends_write_index_flags_when_dbt_reports_fusion() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_fusion_dbt_command(stub_dir.path());
+
+        DbtAdapter
+            .compile(project_dir.path(), dbt.to_str().expect("utf8 path"), &[])
+            .expect("compile should succeed");
+
+        let recorded_args =
+            fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
+        assert_eq!(
+            recorded_args.trim(),
+            "compile --write-index --static-analysis strict"
+        );
+    }
+
+    /// The dbt-core case (today's existing stub scripts never answer
+    /// `--version` with anything Fusion-shaped): no flags are added --
+    /// dbt-core doesn't recognize `--write-index`/`--static-analysis`
+    /// and would fail outright if they were.
+    #[cfg(unix)]
+    #[test]
+    fn compile_does_not_append_write_index_flags_for_dbt_core() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        // A dbt-core-shaped --version answer -- no mention of Fusion.
+        let dbt = stub_dbt_command(
+            stub_dir.path(),
+            r#"if [ "$1" = "--version" ]; then echo "Core: - installed: 1.7.4"; exit 0; fi
+echo "$@" > args.txt"#,
+        );
+
+        DbtAdapter
+            .compile(project_dir.path(), dbt.to_str().expect("utf8 path"), &[])
+            .expect("compile should succeed");
+
+        let recorded_args =
+            fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
+        assert_eq!(recorded_args.trim(), "compile");
+    }
+
+    /// A user who already configured their own `--write-index` (via
+    /// `zhao.yml`'s `dbt-args`) never gets a duplicate appended, even
+    /// against a Fusion install.
+    #[cfg(unix)]
+    #[test]
+    fn compile_does_not_duplicate_write_index_when_already_configured() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_fusion_dbt_command(stub_dir.path());
+
+        DbtAdapter
+            .compile(
+                project_dir.path(),
+                dbt.to_str().expect("utf8 path"),
+                &["--write-index".to_string()],
+            )
+            .expect("compile should succeed");
+
+        let recorded_args =
+            fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
+        assert_eq!(recorded_args.trim(), "compile --write-index");
+    }
+
+    /// [`DbtAdapter::deps`] never gets the Fusion index flags -- `dbt
+    /// deps` doesn't compile or write any index at all, so there's
+    /// nothing for them to do there.
+    #[cfg(unix)]
+    #[test]
+    fn deps_does_not_append_write_index_flags_even_for_fusion() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = tempfile::tempdir().expect("should create temp dir");
+        let dbt = stub_fusion_dbt_command(stub_dir.path());
+
+        DbtAdapter
+            .deps(project_dir.path(), dbt.to_str().expect("utf8 path"), &[])
+            .expect("deps should succeed");
+
+        let recorded_args =
+            fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
+        assert_eq!(recorded_args.trim(), "deps");
     }
 
     #[cfg(unix)]
