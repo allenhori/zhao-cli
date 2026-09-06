@@ -896,15 +896,14 @@ fn build_parsed_project(manifest: &RawManifest, catalog: &CatalogSchemas) -> Par
 
 /// Resolves a `depends_on.nodes` entry (a dbt `unique_id`) to an
 /// [`Upstream`]. Returns `None` for a dependency on anything other than a
-/// model or a source (a seed or snapshot, for instance) -- v1 only
-/// represents Nodes (models) and Origins (sources), so a dependency on
-/// some other resource type currently produces no edge at all, not even a
-/// node-level one. This is a deliberate v1 scope limitation, not an
-/// oversight: extending Node/Origin to cover other dbt resource types is
-/// future work.
+/// model, seed, or source. Seeds are treated as Nodes (the same way models
+/// are), since they're buildable dbt resources that zhao tracks. Origins
+/// (sources) and other resource types (snapshots, tests, etc.) are handled
+/// separately. This allows seeded data to appear in lineage graphs.
 fn resolve_dependency_id(unique_id: &str, manifest: &RawManifest) -> Option<Upstream> {
     if let Some(node) = manifest.nodes.get(unique_id) {
-        if node.resource_type == "model" {
+        // Treat both models and seeds as Nodes (buildable resources)
+        if node.resource_type == "model" || node.resource_type == "seed" {
             return Some(Upstream::Node(NodeId::new(node.unique_id.clone())));
         }
         return None;
