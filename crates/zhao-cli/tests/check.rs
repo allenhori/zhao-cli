@@ -1850,7 +1850,10 @@ mod git_native_baseline {
             .collect();
         assert_eq!(
             subcommands,
-            vec!["deps", "compile"],
+            // `--version` is the compile step's own Fusion-vs-core probe
+            // (see `command_reports_dbt_fusion`) -- unrelated to deps/
+            // compile ordering, but it does precede the real compile call.
+            vec!["deps", "--version", "compile"],
             "dbt deps should run, before dbt compile, when packages.yml is present: {log}"
         );
     }
@@ -1888,7 +1891,9 @@ mod git_native_baseline {
             .collect();
         assert_eq!(
             subcommands,
-            vec!["compile"],
+            // `--version` is the compile step's own Fusion-vs-core probe
+            // (see `command_reports_dbt_fusion`), not a `deps` call.
+            vec!["--version", "compile"],
             "dbt deps should not run at all when no packages.yml exists: {log}"
         );
     }
@@ -1935,7 +1940,10 @@ mod git_native_baseline {
             .collect();
         assert_eq!(
             subcommands,
-            vec!["deps", "compile"],
+            // `--version` is the compile step's own Fusion-vs-core probe
+            // (see `command_reports_dbt_fusion`) -- unrelated to deps/
+            // compile ordering, but it does precede the real compile call.
+            vec!["deps", "--version", "compile"],
             "dbt deps should run, before dbt compile, when dependencies.yml is present: {log}"
         );
     }
@@ -1976,7 +1984,12 @@ mod git_native_baseline {
         let log = std::fs::read_to_string(&invocation_log).expect("should read invocation log");
         assert_eq!(
             log.lines().collect::<Vec<_>>(),
-            vec!["deps --target=ci", "compile --target=ci"],
+            // `--version` (the compile step's own Fusion-vs-core probe --
+            // called with no extra args at all, see
+            // `command_reports_dbt_fusion`) precedes the real compile
+            // invocation; `deps` never gets it, since `deps()` never calls
+            // `with_fusion_index_flags`.
+            vec!["deps --target=ci", "--version", "compile --target=ci"],
             "--dbt-arg values should be appended to both the deps and compile invocations: {log}"
         );
     }
@@ -2012,9 +2025,12 @@ mod git_native_baseline {
 
         let log = std::fs::read_to_string(&invocation_log).expect("should read invocation log");
         assert_eq!(
-            log.trim(),
-            "compile --target=ci --vars={\"foo\": \"bar\"}",
-            "both --dbt-arg values should be appended, in order, to the compile invocation"
+            log.lines().collect::<Vec<_>>(),
+            // `--version` (the compile step's own Fusion-vs-core probe,
+            // unrelated to --dbt-arg -- see `command_reports_dbt_fusion`)
+            // precedes the real compile invocation.
+            vec!["--version", "compile --target=ci --vars={\"foo\": \"bar\"}"],
+            "both --dbt-arg values should be appended, in order, to the compile invocation: {log}"
         );
     }
 
@@ -2046,10 +2062,12 @@ mod git_native_baseline {
 
         let log = std::fs::read_to_string(&invocation_log).expect("should read invocation log");
         assert_eq!(
-            log.trim(),
-            "compile --target ci --vars {\"foo\": \"bar\"}",
+            log.lines().collect::<Vec<_>>(),
+            // `--version` (the compile step's own Fusion-vs-core probe,
+            // unrelated to --dbt-args) precedes the real compile invocation.
+            vec!["--version", "compile --target ci --vars {\"foo\": \"bar\"}"],
             "--dbt-args should shell-word-split into the same argument boundaries \
-             --dbt-arg would have produced by hand"
+             --dbt-arg would have produced by hand: {log}"
         );
     }
 
