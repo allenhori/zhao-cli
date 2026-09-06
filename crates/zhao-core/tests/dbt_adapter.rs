@@ -15,6 +15,48 @@ fn fixture_path() -> &'static Path {
     ))
 }
 
+/// A model that's a bare `SELECT *` straight off a seed, paired with a
+/// real `index/dbt.node_columns.parquet` captured from an actual dbt
+/// Fusion build (`dbt-fusion 2.0.0-preview.218`, Databricks adapter,
+/// `careervista_tutorials/jaffle_shop`'s `raw_orders` seed) -- not a
+/// hand-written fixture, so this exercises the adapter's real parquet
+/// parsing against real Fusion output, not just this crate's own
+/// synthetic test data.
+#[test]
+fn expands_a_seed_wildcard_from_a_real_fusion_node_columns_parquet() {
+    let manifest_path = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/dbt_fusion_passthrough/manifest.json"
+    ));
+
+    let project = DbtAdapter
+        .parse(manifest_path)
+        .expect("fixture should parse");
+
+    let model = project
+        .nodes
+        .iter()
+        .find(|n| n.name == "raw_orders_passthrough")
+        .expect("raw_orders_passthrough should exist");
+    let column_names: Vec<&str> = model.columns.iter().map(|c| c.name.as_str()).collect();
+
+    assert_eq!(
+        column_names,
+        vec![
+            "ID",
+            "CUSTOMER",
+            "ORDERED_AT",
+            "STORE_ID",
+            "SUBTOTAL",
+            "TAX_PAID",
+            "ORDER_TOTAL",
+        ],
+        "the seed's real columns, in the Fusion index's own column_index order, should have \
+         come through from the real captured parquet file -- with no catalog.json present at \
+         all, this is only possible via the Fusion-native fallback"
+    );
+}
+
 #[test]
 fn produces_the_expected_nodes_and_origins() {
     let project = DbtAdapter

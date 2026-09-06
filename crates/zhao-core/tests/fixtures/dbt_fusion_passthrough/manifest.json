@@ -1,0 +1,30 @@
+{
+    "metadata": {
+        "adapter_type": "databricks"
+    },
+    "nodes": {
+        "seed.jaffle_shop.raw_orders": {
+            "unique_id": "seed.jaffle_shop.raw_orders",
+            "resource_type": "seed",
+            "name": "raw_orders",
+            "database": "workspace",
+            "schema": "career_vista_raw",
+            "alias": "raw_orders",
+            "depends_on": {"nodes": []},
+            "columns": {}
+        },
+        "model.jaffle_shop.raw_orders_passthrough": {
+            "unique_id": "model.jaffle_shop.raw_orders_passthrough",
+            "resource_type": "model",
+            "name": "raw_orders_passthrough",
+            "database": "workspace",
+            "schema": "career_vista",
+            "alias": "raw_orders_passthrough",
+            "depends_on": {"nodes": ["seed.jaffle_shop.raw_orders"]},
+            "compiled_code": "select * from `workspace`.`career_vista_raw`.`raw_orders`",
+            "columns": {},
+            "config": {"materialized": "view"}
+        }
+    },
+    "sources": {}
+}
