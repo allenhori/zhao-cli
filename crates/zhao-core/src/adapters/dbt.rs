@@ -664,7 +664,31 @@ struct RawCatalogColumn {
 /// `"uv run dbt"`. Shared by [`run_dbt_subcommand`] and
 /// [`DbtQueryExecutor::run_operation`], the two places that actually spawn
 /// a `dbt`-shaped subprocess.
+///
+/// `dbt_command` is checked against the filesystem *first*, before any
+/// shell-word splitting is attempted: when it already names a real,
+/// existing file on its own, it's used directly as the program with no
+/// args, never run through `shell_words::split` at all. This matters
+/// specifically on Windows, where `shell_words` (POSIX shell tokenizing
+/// rules -- backslash is an *escape character*) and a real Windows path
+/// (backslash as the directory separator, routinely containing spaces
+/// too, e.g. anything under `%USERPROFILE%\OneDrive\Documents`) are
+/// fundamentally incompatible: splitting a raw absolute path like
+/// `C:\Users\alex\dbt test\.venv\Scripts\dbt.exe` mangles it (a bare
+/// space becomes an argument boundary; backslashes before ordinary
+/// characters get silently eaten as escape sequences) long before it
+/// ever reaches `Command::new`, no matter how the value is quoted in
+/// `zhao.yml`. A path that exists is unambiguous -- there's no reason to
+/// tokenize it into a "program" and "args" at all -- so this sidesteps
+/// the whole class of problem for the common "point `dbt-command` at one
+/// specific binary" case, while still shell-word-splitting exactly as
+/// before for a genuine multi-word wrapper (which never names a real
+/// file directly, since the file is one of the *later* words).
 fn split_dbt_command(dbt_command: &str) -> Result<(String, Vec<String>), DbtAdapterError> {
+    if Path::new(dbt_command).is_file() {
+        return Ok((dbt_command.to_string(), Vec::new()));
+    }
+
     let mut parts =
         shell_words::split(dbt_command).map_err(|source| DbtAdapterError::CommandNotFound {
             command: dbt_command.to_string(),
@@ -4873,6 +4897,40 @@ echo "$@" > args.txt"#,
         let recorded_args =
             fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
         assert_eq!(recorded_args.trim(), "--wrapper-flag deps");
+    }
+
+    /// A `dbt-command` that's a real, existing file path -- e.g. an
+    /// absolute path into a venv's `Scripts`/`bin` directory, the
+    /// standard way to disambiguate multiple installed dbt versions
+    /// (see this module's own doc comment on why case-insensitive
+    /// column matching and dialect resolution exist) -- is used
+    /// directly, never run through shell-word splitting at all. Proven
+    /// here with a space in the containing directory name (a routine
+    /// occurrence on Windows -- anything under `OneDrive\Documents`,
+    /// `Program Files`, ...): shell-word splitting a raw path
+    /// containing a space would mangle it into two garbage fragments at
+    /// that space, long before it ever reached `Command::new`, no
+    /// matter how the value was quoted in `zhao.yml`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dbt_command_that_is_itself_an_existing_path_is_used_directly_even_with_a_space_in_it() {
+        let project_dir = tempfile::tempdir().expect("should create temp dir");
+        let stub_root = tempfile::tempdir().expect("should create temp dir");
+        let stub_dir = stub_root
+            .path()
+            .join("dbt test")
+            .join(".venv")
+            .join("Scripts");
+        fs::create_dir_all(&stub_dir).expect("should create nested stub dir");
+        let dbt = stub_dbt_command(&stub_dir, "echo \"$@\" > args.txt");
+
+        DbtAdapter
+            .deps(project_dir.path(), dbt.to_str().expect("utf8 path"), &[])
+            .expect("deps should succeed -- the space-containing path must resolve as one token");
+
+        let recorded_args =
+            fs::read_to_string(project_dir.path().join("args.txt")).expect("should read args.txt");
+        assert_eq!(recorded_args.trim(), "deps");
     }
 
     /// Same as `compile`'s equivalent (see issue #36): a successful

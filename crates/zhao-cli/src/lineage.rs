@@ -247,13 +247,45 @@ fn run_html(
         .canonicalize()
         .unwrap_or_else(|_| html_path.to_path_buf());
     let printed = format!(
-        "Wrote {} -- open it at file://{}\n",
+        "Wrote {} -- open it at {}\n",
         html_path.display(),
-        absolute_path.display()
+        file_url(&absolute_path)
     );
     print!("{printed}");
     crate::log::mirror(&args.project_dir, &printed);
     ExitCode::from(EXIT_OK)
+}
+
+/// Builds a `file://` URI a browser can actually open when pasted in,
+/// from an absolute path -- correct on both Unix and Windows, unlike a
+/// plain `format!("file://{}", path.display())` (what this used to do).
+///
+/// Two Windows-specific problems that alone: a Windows path never
+/// starts with `/` (it starts with a drive letter, `C:\...`), so simply
+/// prepending `file://` leaves out the third slash a `file://` URI's
+/// authority-less form needs (`file:///C:/...`, not `file://C:/...`);
+/// and separately, backslashes are path separators, not valid URI path
+/// characters, so they need converting to forward slashes regardless.
+/// A third, easy-to-miss problem: `Path::canonicalize()` on Windows
+/// returns a `\\?\`-prefixed extended-length path (e.g.
+/// `\\?\C:\Users\...`) even for an ordinary path with no special
+/// length or reserved-name issue at all -- stripped here before the
+/// rest of the conversion, since a browser has no idea what to do with
+/// that prefix either.
+fn file_url(absolute_path: &Path) -> String {
+    let mut path = absolute_path.display().to_string().replace('\\', "/");
+    if let Some(stripped) = path.strip_prefix("//?/") {
+        path = stripped.to_string();
+    }
+    if path.starts_with('/') {
+        format!("file://{path}")
+    } else {
+        // A Windows drive-letter path (`C:/Users/...`) has no leading
+        // slash of its own to reuse -- file://'s authority-less form
+        // needs exactly one more than a Unix absolute path already
+        // supplies.
+        format!("file:///{path}")
+    }
 }
 
 /// The `--text` path: prints the plain-text report, same as before HTML
@@ -419,6 +451,44 @@ mod tests {
     use super::*;
     use zhao_core::adapters::dbt::DbtVocabulary;
     use zhao_core::model::{NodeId, OriginId};
+
+    // -----------------------------------------------------------------
+    // `file_url` -- a correct file:// URI on both Unix and Windows.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_unix_absolute_path_gets_exactly_one_more_leading_slash() {
+        assert_eq!(
+            file_url(Path::new(
+                "/Users/allen/project/target/zhao/full_lineage.html"
+            )),
+            "file:///Users/allen/project/target/zhao/full_lineage.html"
+        );
+    }
+
+    #[test]
+    fn a_windows_drive_letter_path_gets_forward_slashes_and_a_triple_slash_prefix() {
+        assert_eq!(
+            file_url(Path::new(
+                r"C:\Users\allen\project\target\zhao\full_lineage.html"
+            )),
+            "file:///C:/Users/allen/project/target/zhao/full_lineage.html"
+        );
+    }
+
+    /// `Path::canonicalize()` on Windows returns a `\\?\`-prefixed
+    /// extended-length path even for an ordinary path -- this must be
+    /// stripped, not just have its backslashes swapped, or the URI
+    /// would end up as the nonsensical `file:////?/C:/...`.
+    #[test]
+    fn a_windows_extended_length_path_prefix_is_stripped() {
+        assert_eq!(
+            file_url(Path::new(
+                r"\\?\C:\Users\allen\project\target\zhao\full_lineage.html"
+            )),
+            "file:///C:/Users/allen/project/target/zhao/full_lineage.html"
+        );
+    }
 
     // -----------------------------------------------------------------
     // `default_html_path` -- the filenaming table from issue #38.
