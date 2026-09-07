@@ -192,18 +192,96 @@ fn extract_binary(archive_bytes: &[u8], target: &str) -> Result<Vec<u8>, String>
 }
 
 /// Writes `new_binary_bytes` to a temp file in `current_exe`'s own
-/// directory (guaranteeing the final rename is on the same filesystem,
-/// so it's atomic), makes it executable on Unix, then renames it over
-/// `current_exe`. Renaming over the file backing the currently
-/// *running* process is safe on both Unix (the OS keeps the old inode
-/// alive for the still-running process; the new file only takes effect
-/// on the next launch) and Windows (renaming, unlike deleting or
-/// truncating-in-place, doesn't require exclusive access to a mapped
-/// executable). Every step before the rename can fail without touching
-/// `current_exe` at all; the rename itself is the one moment the swap
-/// actually happens, and it's a single filesystem operation, not a
-/// multi-step window where a partial binary could be left in place.
+/// directory (guaranteeing the final swap is on the same filesystem, so
+/// it's atomic), makes it executable on Unix, then swaps it into place
+/// over `current_exe` -- the file backing the currently *running*
+/// process. Every step before the swap can fail without touching
+/// `current_exe` at all.
+///
+/// Unix: a single rename directly over `current_exe`. Safe unconditionally
+/// -- the OS keeps the old inode alive for the still-running process; the
+/// new file only takes effect on the next launch.
+///
+/// Windows: **not** a single rename-over, unlike Unix -- see the
+/// platform-specific doc comment on the Windows `replace_binary` below
+/// for why a direct replace can fail even though renaming a running
+/// executable is normally allowed.
+#[cfg(unix)]
 fn replace_binary(current_exe: &Path, new_binary_bytes: &[u8]) -> Result<(), String> {
+    let temp = write_new_binary_to_temp_file(current_exe, new_binary_bytes)?;
+    temp.persist(current_exe).map_err(|err| {
+        format!(
+            "could not replace {}: {err} -- the previous binary is still in place, untouched",
+            current_exe.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Windows counterpart of the Unix `replace_binary` above.
+///
+/// A direct rename-over of `current_exe` (what `NamedTempFile::persist`
+/// does, and what this crate used to do unconditionally on every
+/// platform) is, in principle, allowed by Windows even against a running
+/// executable's own file -- but reported in practice (issue: `zhao
+/// update` failing with "Access is denied (os error 5)" on a real,
+/// locked-down corporate Windows machine) to still fail on some real
+/// setups, most plausibly endpoint security software specifically
+/// flagging/blocking "one .exe overwriting another" as dropper-shaped
+/// behavior, separately from whatever the OS itself would allow.
+///
+/// The fix: rename the currently-running exe *out of the way* to a
+/// `.old` sibling first (a plain rename to a new, non-conflicting name,
+/// not a same-name replace), then move the new binary into the now-
+/// vacant original path -- the same two-step pattern `rustup` and the
+/// `self_replace` crate both use for exactly this reason. The `.old`
+/// file is then best-effort deleted; if that fails too (e.g. still
+/// technically mapped by the about-to-exit `zhao update` process
+/// itself), it's simply left behind rather than treated as an error --
+/// a harmless leftover next to the binary, not a broken install. On any
+/// failure *after* the exe has already been renamed out of the way,
+/// the original is restored to its own path before returning, so a
+/// failed update never leaves the user without a working `zhao.exe` at
+/// all.
+#[cfg(windows)]
+fn replace_binary(current_exe: &Path, new_binary_bytes: &[u8]) -> Result<(), String> {
+    let temp = write_new_binary_to_temp_file(current_exe, new_binary_bytes)?;
+
+    let old_path = current_exe.with_extension("exe.old");
+    let _ = std::fs::remove_file(&old_path); // best-effort: a leftover from a previous update
+
+    std::fs::rename(current_exe, &old_path).map_err(|err| {
+        format!(
+            "could not rename {} out of the way before replacing it: {err} -- the previous \
+             binary is still in place, untouched",
+            current_exe.display()
+        )
+    })?;
+
+    if let Err(err) = temp.persist(current_exe) {
+        // The exe's own original name is now vacant -- restore it before
+        // surfacing the error, so a failed update never leaves the user
+        // with no working zhao.exe at all.
+        let _ = std::fs::rename(&old_path, current_exe);
+        return Err(format!(
+            "could not move the downloaded binary into {}: {err} -- the previous binary was \
+             restored, untouched",
+            current_exe.display()
+        ));
+    }
+
+    let _ = std::fs::remove_file(&old_path);
+    Ok(())
+}
+
+/// Writes `new_binary_bytes` to a temp file in `current_exe`'s own
+/// directory, and makes it executable on Unix. Shared by both
+/// platforms' `replace_binary` -- everything up to (not including) the
+/// actual swap into `current_exe`'s path is identical either way.
+fn write_new_binary_to_temp_file(
+    current_exe: &Path,
+    new_binary_bytes: &[u8],
+) -> Result<tempfile::NamedTempFile, String> {
     let dir = current_exe.parent().ok_or_else(|| {
         format!(
             "could not determine the directory containing {}",
@@ -232,13 +310,7 @@ fn replace_binary(current_exe: &Path, new_binary_bytes: &[u8]) -> Result<(), Str
             .map_err(|err| format!("could not make the downloaded binary executable: {err}"))?;
     }
 
-    temp.persist(current_exe).map_err(|err| {
-        format!(
-            "could not replace {}: {err} -- the previous binary is still in place, untouched",
-            current_exe.display()
-        )
-    })?;
-    Ok(())
+    Ok(temp)
 }
 
 #[cfg(test)]
@@ -379,6 +451,32 @@ mod tests {
 
         let contents = std::fs::read(&exe_path).expect("should read replaced binary");
         assert_eq!(contents, b"new binary");
+    }
+
+    /// Windows-specific: the two-step rename-out/rename-in doesn't leave
+    /// its `.exe.old` sidecar lying around after a successful replace --
+    /// only a failed persist (restored from it, see `replace_binary`'s
+    /// own doc comment) should ever leave one behind.
+    ///
+    /// Not exercised by this project's CI, which only runs on Ubuntu --
+    /// `#[cfg(windows)]` code compiles on every platform's *checker*, but
+    /// only actually runs on a real Windows machine, or a future
+    /// Windows CI job.
+    #[cfg(windows)]
+    #[test]
+    fn replace_binary_cleans_up_its_old_sidecar_file_after_a_successful_replace() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let exe_path = dir.path().join("zhao.exe");
+        std::fs::write(&exe_path, b"old binary").expect("should write initial binary");
+
+        replace_binary(&exe_path, b"new binary").expect("should replace");
+
+        let contents = std::fs::read(&exe_path).expect("should read replaced binary");
+        assert_eq!(contents, b"new binary");
+        assert!(
+            !exe_path.with_extension("exe.old").exists(),
+            "the .exe.old sidecar should be cleaned up after a successful replace"
+        );
     }
 
     #[cfg(unix)]
