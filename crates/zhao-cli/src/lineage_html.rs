@@ -315,6 +315,7 @@ fn render_html(graph_data_json: &str, node_term: &str, origin_term: &str) -> Str
     <div class="legend">
       <span class="legend-item"><span class="legend-dot origin"></span>{origin_term}</span>
       <span class="legend-item"><span class="legend-dot node"></span>{node_term}</span>
+      <span class="legend-item"><span class="legend-dot seed"></span>seed</span>
     </div>
   </header>
   <div id="scope-banner">
@@ -376,6 +377,8 @@ const CSS: &str = r#"
   --series-node-soft: #2a78d61a;
   --series-origin:  #eb6834;
   --series-origin-soft: #eb68341a;
+  --series-seed:    #4a9b3e;
+  --series-seed-soft: #4a9b3e1a;
   --column-highlight: #e87ba4;
   color-scheme: light;
 }
@@ -392,6 +395,8 @@ const CSS: &str = r#"
     --series-node-soft: #3987e526;
     --series-origin:  #d95926;
     --series-origin-soft: #d9592626;
+    --series-seed:    #5cb84e;
+    --series-seed-soft: #5cb84e26;
     --column-highlight: #d55181;
     color-scheme: dark;
   }
@@ -433,6 +438,7 @@ body {
 .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
 .legend-dot.node { background: var(--series-node); }
 .legend-dot.origin { background: var(--series-origin); }
+.legend-dot.seed { background: var(--series-seed); }
 
 /* Hidden by default -- shown only when the initial view is scoped to a
    target's related subgraph (issue #40); JS toggles `display` directly,
@@ -506,10 +512,13 @@ body {
 }
 .node-box.origin .card-accent { fill: var(--series-origin); }
 .node-box.node .card-accent { fill: var(--series-node); }
+.node-box.seed .card-accent { fill: var(--series-seed); }
 .node-box.selected .card { stroke: var(--series-node); stroke-width: 2; filter: drop-shadow(0 2px 10px var(--series-node-soft)); }
 .node-box.selected.origin .card { stroke: var(--series-origin); filter: drop-shadow(0 2px 10px var(--series-origin-soft)); }
+.node-box.selected.seed .card { stroke: var(--series-seed); filter: drop-shadow(0 2px 10px var(--series-seed-soft)); }
 .node-box.highlighted .card { stroke: var(--series-node); stroke-width: 1.5; }
 .node-box.highlighted.origin .card { stroke: var(--series-origin); }
+.node-box.highlighted.seed .card { stroke: var(--series-seed); }
 .node-box.search-match .card { stroke: var(--series-node); stroke-width: 1.5; filter: drop-shadow(0 2px 8px var(--series-node-soft)); }
 .node-box.dimmed { opacity: 0.28; }
 .node-box .title { font-size: 12.5px; font-weight: 600; fill: var(--text-primary); pointer-events: none; letter-spacing: -0.005em; }
@@ -588,6 +597,18 @@ const JS: &str = r#"
     const e = document.createElementNS(ns || SVG_NS, tag);
     for (const k in attrs) e.setAttribute(k, attrs[k]);
     return e;
+  }
+
+  // "seed" has no Adapter Vocabulary translation of its own (unlike
+  // "node"/"origin", which the dbt vocabulary renders as "model"/
+  // "source") -- it's already a neutral, tool-agnostic term, so this is
+  // the one shared place that decides the label term for all three
+  // kinds, rather than each call site re-deriving a two-way ternary
+  // that silently mislabels a seed as data.node_term.
+  function kindTerm(n) {
+    if (n.kind === "origin") return data.origin_term;
+    if (n.kind === "seed") return "seed";
+    return data.node_term;
   }
 
   function nodeHeight(n) {
@@ -701,7 +722,7 @@ const JS: &str = r#"
       g.appendChild(title);
 
       const tooltip = el("title", {});
-      tooltip.textContent = `${n.kind === "origin" ? data.origin_term : data.node_term} ${n.id}`;
+      tooltip.textContent = `${kindTerm(n)} ${n.id}`;
       g.appendChild(tooltip);
 
       if (showColumns && n.columns.length > 0) {
@@ -790,7 +811,7 @@ const JS: &str = r#"
       return;
     }
     const n = selectedId && byId.get(selectedId);
-    const label = n ? `${n.kind === "origin" ? data.origin_term : data.node_term} ${n.name}` : "the selected target";
+    const label = n ? `${kindTerm(n)} ${n.name}` : "the selected target";
     document.getElementById("scope-banner-text").textContent =
       `Showing ${label} and its lineage only.`;
     banner.style.display = "flex";
@@ -1016,7 +1037,7 @@ const JS: &str = r#"
     const n = byId.get(id);
     document.getElementById("panel-empty").style.display = "none";
     document.getElementById("panel-content").style.display = "block";
-    document.getElementById("panel-kind").textContent = n.kind === "origin" ? data.origin_term : data.node_term;
+    document.getElementById("panel-kind").textContent = kindTerm(n);
     document.getElementById("panel-title").textContent = n.name;
     renderPanelColumns(n, columnResult);
 
@@ -1212,6 +1233,30 @@ mod tests {
         assert!(
             seed_entry.get("materialization").is_none(),
             "a seed has no materialization field at all: {seed_entry}"
+        );
+    }
+
+    /// A seed must actually be stylable in the generated HTML, not just
+    /// carry the right `kind` in the embedded JSON -- this is the seam
+    /// a purely-JSON-focused test would miss: the CSS/JS side must
+    /// recognize `"seed"` as its own class with its own accent color,
+    /// not silently render unstyled (the browser SVG default) or
+    /// mislabeled as the node vocabulary term.
+    #[test]
+    fn a_seed_gets_its_own_css_accent_rule_and_legend_entry_in_generated_html() {
+        let html = generate(&sample_project(), &DbtVocabulary, None, None);
+        assert!(
+            html.contains(".node-box.seed .card-accent"),
+            "seed must have its own accent-color CSS rule, not fall through unstyled"
+        );
+        assert!(
+            html.contains("legend-dot seed"),
+            "the legend should list seed alongside model/source"
+        );
+        assert!(
+            html.contains("kindTerm(n)"),
+            "label lookups should go through the shared kindTerm helper, which \
+             knows about seed, rather than a two-way node/origin ternary"
         );
     }
 
