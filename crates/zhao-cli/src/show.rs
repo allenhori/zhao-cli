@@ -215,18 +215,28 @@ fn normalize_show_value(value: serde_json::Value) -> Result<ShowResult, String> 
         serde_json::Value::Object(mut obj) => match obj.remove("show") {
             Some(serde_json::Value::Array(rows)) => rows,
             Some(other) => {
-                return Err(format!("expected \"show\" to be a JSON array, got: {other}"));
+                return Err(format!(
+                    "expected \"show\" to be a JSON array, got: {other}"
+                ));
             }
             None => return Err("expected a \"show\" key in dbt's JSON output".to_string()),
         },
-        other => return Err(format!("unexpected top-level JSON shape from dbt show: {other}")),
+        other => {
+            return Err(format!(
+                "unexpected top-level JSON shape from dbt show: {other}"
+            ));
+        }
     };
 
     let mut rows = Vec::with_capacity(rows_value.len());
     for row in rows_value {
         match row {
             serde_json::Value::Object(map) => rows.push(map),
-            other => return Err(format!("expected each row to be a JSON object, got: {other}")),
+            other => {
+                return Err(format!(
+                    "expected each row to be a JSON object, got: {other}"
+                ));
+            }
         }
     }
 
@@ -320,7 +330,8 @@ mod tests {
     #[test]
     fn a_brace_inside_a_string_value_does_not_confuse_the_bracket_matcher() {
         let raw = r#"[{"description": "a value with a { brace and a [ bracket inside it"}]"#;
-        let result = extract_show_result(raw).expect("should extract successfully despite the embedded brace/bracket");
+        let result = extract_show_result(raw)
+            .expect("should extract successfully despite the embedded brace/bracket");
         assert_eq!(result.rows.len(), 1);
     }
 }
