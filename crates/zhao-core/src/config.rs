@@ -109,6 +109,7 @@ pub struct Config {
     dbt_args: Option<String>,
     tool: Option<String>,
     recommended_command_subcommand: Option<String>,
+    show_default_limit: Option<u32>,
 }
 
 impl Default for Config {
@@ -125,6 +126,7 @@ impl Default for Config {
             dbt_args: None,
             recommended_command_subcommand: None,
             tool: None,
+            show_default_limit: None,
         }
     }
 }
@@ -231,6 +233,16 @@ impl Config {
         self.log_retention_days
     }
 
+    /// `zhao show`'s configured default row limit (`show.default_limit`
+    /// in `zhao.yml`), consulted only when `zhao show` isn't given an
+    /// explicit `--limit` flag. `None` (the default, if `zhao.yml` sets
+    /// no `show.default_limit` at any level of the cascade) means "fall
+    /// back to zhao-cli's own hardcoded default" -- see
+    /// `crate::show`'s row-limit resolution.
+    pub fn show_default_limit(&self) -> Option<u32> {
+        self.show_default_limit
+    }
+
     /// Loads a single `zhao.yml` from the given path. Returns
     /// [`Config::default`] (unchanged v1 defaults) if the file doesn't
     /// exist -- `zhao.yml` is optional, not mandatory.
@@ -303,6 +315,7 @@ struct ConfigLayer {
     dbt_args: Option<String>,
     tool: Option<String>,
     recommended_command_subcommand: Option<String>,
+    show_default_limit: Option<u32>,
 }
 
 impl ConfigLayer {
@@ -346,6 +359,7 @@ impl ConfigLayer {
             recommended_command_subcommand: self
                 .recommended_command_subcommand
                 .or(base.recommended_command_subcommand),
+            show_default_limit: self.show_default_limit.or(base.show_default_limit),
         }
     }
 
@@ -362,6 +376,7 @@ impl ConfigLayer {
             dbt_args: self.dbt_args,
             tool: self.tool,
             recommended_command_subcommand: self.recommended_command_subcommand,
+            show_default_limit: self.show_default_limit,
         }
     }
 }
@@ -397,6 +412,16 @@ struct RawConfig {
     tool: Option<String>,
     #[serde(rename = "recommended-command", default)]
     recommended_command: Option<RawRecommendedCommandConfig>,
+    #[serde(default)]
+    show: Option<RawShowConfig>,
+}
+
+/// The `show:` section of `zhao.yml` -- see
+/// [`Config::show_default_limit`].
+#[derive(Debug, Default, Deserialize)]
+struct RawShowConfig {
+    #[serde(default)]
+    default_limit: Option<u32>,
 }
 
 /// The `recommended-command:` section of `zhao.yml` -- see
@@ -480,6 +505,8 @@ impl RawConfig {
             })?),
         };
 
+        let show_default_limit = self.show.and_then(|show| show.default_limit);
+
         Ok(ConfigLayer {
             preset,
             overrides,
@@ -492,6 +519,7 @@ impl RawConfig {
             dbt_args: self.dbt_args,
             tool: self.tool,
             recommended_command_subcommand,
+            show_default_limit,
         })
     }
 }

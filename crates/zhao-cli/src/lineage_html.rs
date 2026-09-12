@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 use zhao_core::adapters::AdapterVocabulary;
-use zhao_core::model::{NodeId, ParsedProject, Upstream};
+use zhao_core::model::{Materialization, NodeId, ParsedProject, Upstream};
 
 /// An Origin or Node not yet assigned its final within-layer order --
 /// `generate`'s intermediate grouping step before it's sorted by name
@@ -34,7 +34,30 @@ struct UngroupedEntry {
     id: String,
     name: String,
     kind: &'static str,
+    /// The node's materialization, as a lowercase string
+    /// (`"table"`/`"view"`/`"incremental"`/`"ephemeral"`/some other,
+    /// unrecognized string verbatim) -- always `None` for `"origin"`/
+    /// `"seed"` kinds, which have no materialization of their own. See
+    /// [`materialization_str`].
+    materialization: Option<String>,
     columns: Vec<GraphColumn>,
+}
+
+/// Maps a [`Materialization`] to the lowercase string
+/// `full_lineage.json`/the embedded HTML graph data actually carry --
+/// zhao's own neutral vocabulary (matching how `kind` is already
+/// `"node"`/`"origin"`, not dbt's user-facing "model"/"source"), so a
+/// future non-dbt Transformation Tool Adapter's materializations render
+/// through this exact same mapping with no dbt-specific assumption baked
+/// in.
+fn materialization_str(materialization: &Materialization) -> String {
+    match materialization {
+        Materialization::Table => "table".to_string(),
+        Materialization::View => "view".to_string(),
+        Materialization::Incremental => "incremental".to_string(),
+        Materialization::Ephemeral => "ephemeral".to_string(),
+        Materialization::Other(value) => value.clone(),
+    }
 }
 
 /// A single column, carried into the export with whatever [`generate`]'s
@@ -59,9 +82,18 @@ struct GraphColumn {
 struct GraphNode {
     id: String,
     name: String,
-    /// `"node"` or `"origin"` -- the CSS/JS-facing discriminant; the
-    /// human-facing label still goes through `vocabulary`.
+    /// `"node"`, `"origin"`, or `"seed"` -- the CSS/JS-facing
+    /// discriminant; the human-facing label still goes through
+    /// `vocabulary`. `"seed"` is split out from `"node"` (rather than
+    /// folded into a materialization value) since a seed's "kind of
+    /// thing" -- a checked-in file loaded verbatim -- is orthogonal to
+    /// materialization, which only meaningfully varies for a real model.
     kind: &'static str,
+    /// This node's materialization (`"table"`/`"view"`/`"incremental"`/
+    /// `"ephemeral"`/some other recognized-verbatim string) -- present
+    /// only for `kind: "node"`; a `"seed"` or `"origin"` has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    materialization: Option<String>,
     layer: u32,
     columns: Vec<GraphColumn>,
 }
@@ -111,15 +143,22 @@ fn build_graph_data(project: &ParsedProject, vocabulary: &dyn AdapterVocabulary)
             id: origin.id.to_string(),
             name: origin.name.clone(),
             kind: "origin",
+            materialization: None,
             columns: Vec::new(),
         });
     }
     for node in &project.nodes {
         let layer = layers.get(&node.id).copied().unwrap_or(0);
+        let is_seed = project.seed_node_ids.contains(&node.id);
         by_layer.entry(layer).or_default().push(UngroupedEntry {
             id: node.id.to_string(),
             name: node.name.clone(),
-            kind: "node",
+            kind: if is_seed { "seed" } else { "node" },
+            materialization: if is_seed {
+                None
+            } else {
+                Some(materialization_str(&node.materialization))
+            },
             columns: node
                 .columns
                 .iter()
@@ -143,6 +182,7 @@ fn build_graph_data(project: &ParsedProject, vocabulary: &dyn AdapterVocabulary)
                 id: entry.id,
                 name: entry.name,
                 kind: entry.kind,
+                materialization: entry.materialization,
                 layer,
                 columns: entry.columns,
             });
@@ -1138,6 +1178,7 @@ mod tests {
 
     fn sample_project() -> ParsedProject {
         ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![node("model.p.a", &["x"]), node("model.p.b", &["x"])],
             origins: vec![origin("source.p.raw")],
             edges: vec![
@@ -1145,6 +1186,88 @@ mod tests {
                 column_edge("model.p.a", "x", "model.p.b", "x"),
             ],
         }
+    }
+
+    // -----------------------------------------------------------------
+    // `graph_data_json` -- kind:"seed" and materialization exposure.
+    // -----------------------------------------------------------------
+
+    /// Ticket #82 acceptance criterion: a seed resolves to `kind: "seed"`
+    /// in the JSON graph, not `kind: "node"` with a materialization.
+    #[test]
+    fn a_seed_node_serializes_with_kind_seed_and_no_materialization() {
+        let mut project = sample_project();
+        project.seed_node_ids.insert(NodeId::new("model.p.a"));
+
+        let json = graph_data_json(&project, &DbtVocabulary);
+        let data: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let seed_entry = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "model.p.a")
+            .expect("model.p.a should be present");
+
+        assert_eq!(seed_entry["kind"], "seed");
+        assert!(
+            seed_entry.get("materialization").is_none(),
+            "a seed has no materialization field at all: {seed_entry}"
+        );
+    }
+
+    /// A model node (i.e. not in `seed_node_ids`) carries its resolved
+    /// materialization, lowercased, as `kind: "node"`.
+    #[test]
+    fn a_model_node_serializes_with_kind_node_and_its_materialization() {
+        let mut project = sample_project();
+        project.nodes[1].materialization = Materialization::View;
+
+        let json = graph_data_json(&project, &DbtVocabulary);
+        let data: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let node_entry = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "model.p.b")
+            .expect("model.p.b should be present");
+
+        assert_eq!(node_entry["kind"], "node");
+        assert_eq!(node_entry["materialization"], "view");
+    }
+
+    /// An unrecognized materialization string is passed through verbatim,
+    /// not dropped or replaced with a default.
+    #[test]
+    fn an_unrecognized_materialization_is_passed_through_verbatim() {
+        let mut project = sample_project();
+        project.nodes[0].materialization = Materialization::Other("materialized_view".to_string());
+
+        let json = graph_data_json(&project, &DbtVocabulary);
+        let data: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let node_entry = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "model.p.a")
+            .expect("model.p.a should be present");
+
+        assert_eq!(node_entry["materialization"], "materialized_view");
+    }
+
+    /// An origin has no materialization of its own either.
+    #[test]
+    fn an_origin_serializes_with_no_materialization() {
+        let json = graph_data_json(&sample_project(), &DbtVocabulary);
+        let data: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let origin_entry = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "source.p.raw")
+            .expect("source.p.raw should be present");
+
+        assert_eq!(origin_entry["kind"], "origin");
+        assert!(origin_entry.get("materialization").is_none());
     }
 
     /// Acceptance criterion: the generated file is fully self-contained

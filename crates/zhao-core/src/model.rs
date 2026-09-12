@@ -270,6 +270,17 @@ pub struct ParsedProject {
     pub origins: Vec<Origin>,
     /// Every Lineage Edge found between them.
     pub edges: Vec<LineageEdge>,
+    /// The subset of `nodes` that are seeds (e.g. a dbt seed: a checked-in
+    /// file loaded verbatim) rather than a genuine model with its own
+    /// materialization strategy. Deliberately a side-set here rather than
+    /// a field on [`Node`] itself: a seed's "kind of thing" is orthogonal
+    /// to [`Materialization`] (which only meaningfully varies for real
+    /// models), and every existing Rule/diff computation over `nodes`
+    /// treats a seed as an ordinary Node on purpose (see
+    /// `resolve_dependency_id`) -- this only exists for consumers (e.g.
+    /// `full_lineage.json`) that need to render a seed distinctly from a
+    /// materialized table.
+    pub seed_node_ids: std::collections::HashSet<NodeId>,
 }
 
 impl ParsedProject {

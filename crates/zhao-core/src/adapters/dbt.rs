@@ -220,6 +220,23 @@ pub enum DbtAdapterError {
         /// `dbt deps`'s captured stderr.
         stderr: String,
     },
+    /// `dbt show` ran but exited with a failure -- a compile error in the
+    /// target, an unresolvable selector, a warehouse permissions error,
+    /// etc. See [`Self::CompileFailed`] for why both `stdout` and
+    /// `stderr` are carried, and why the `Display` impl inserts its own
+    /// separating `\n`.
+    #[error("dbt show failed for {target} in {project_dir}:\n{stdout}\n{stderr}")]
+    ShowFailed {
+        /// The project directory `dbt show` was run in.
+        project_dir: String,
+        /// The selector `zhao show` was asked to preview.
+        target: String,
+        /// `dbt show`'s captured stdout -- where dbt's own logging
+        /// (including most real error detail) actually goes.
+        stdout: String,
+        /// `dbt show`'s captured stderr.
+        stderr: String,
+    },
 }
 
 impl TransformationToolAdapter for DbtAdapter {
@@ -433,6 +450,51 @@ impl DbtAdapter {
             CatalogSchemas::new()
         };
         Ok(build_parsed_project(&manifest, &catalog))
+    }
+
+    /// Runs `dbt show --select <target> --limit <limit> [--output json]`
+    /// in `project_dir`, previewing that target's query results. See
+    /// `crate::show` (in `zhao-cli`) for row-limit resolution and the
+    /// cross-engine JSON normalization built on top of this -- this
+    /// method itself is a thin, engine-agnostic passthrough, same
+    /// division of responsibility as [`Self::compile`]/[`Self::deps`].
+    ///
+    /// Not part of [`TransformationToolAdapter`] itself, same "dbt-
+    /// specific, not generalized to a hypothetical second adapter yet"
+    /// reasoning as [`Self::adapter_type`]/[`Self::catalog_available`].
+    pub fn show(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        target: &str,
+        limit: u32,
+        output_json: bool,
+        extra_args: &[String],
+    ) -> Result<DbtCommandOutput, DbtAdapterError> {
+        let mut args = vec![
+            "--select".to_string(),
+            target.to_string(),
+            "--limit".to_string(),
+            limit.to_string(),
+        ];
+        if output_json {
+            args.push("--output".to_string());
+            args.push("json".to_string());
+        }
+        args.extend_from_slice(extra_args);
+
+        let output = run_dbt_subcommand(command, "show", project_dir, &args)?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if !output.status.success() {
+            return Err(DbtAdapterError::ShowFailed {
+                project_dir: project_dir.display().to_string(),
+                target: target.to_string(),
+                stdout,
+                stderr,
+            });
+        }
+        Ok(DbtCommandOutput { stdout, stderr })
     }
 }
 
@@ -1182,10 +1244,16 @@ fn build_parsed_project(manifest: &RawManifest, catalog: &CatalogSchemas) -> Par
         });
     }
 
+    let seed_node_ids = seeds
+        .iter()
+        .map(|seed| NodeId::new(seed.unique_id.clone()))
+        .collect();
+
     ParsedProject {
         nodes,
         origins,
         edges,
+        seed_node_ids,
     }
 }
 

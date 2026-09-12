@@ -487,6 +487,7 @@ mod tests {
     /// exercised together.
     fn diamond_project() -> ParsedProject {
         ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![
                 node("model.p.a"),
                 node("model.p.b"),
@@ -683,6 +684,7 @@ mod tests {
     #[test]
     fn downstream_order_is_genuinely_breadth_first() {
         let project = ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![
                 node("model.p.a"),
                 node("model.p.b"),
@@ -777,6 +779,7 @@ mod tests {
     /// ones), but `y` specifically has no `Some` edge naming it.
     fn column_chain_project() -> ParsedProject {
         ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![
                 node_with_columns("model.p.a", &["x"]),
                 node_with_columns("model.p.b", &["x", "y"]),
@@ -920,6 +923,7 @@ mod tests {
     #[test]
     fn downstream_column_order_is_genuinely_breadth_first() {
         let project = ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![
                 node_with_columns("model.p.a", &["x"]),
                 node_with_columns("model.p.b", &["x"]),
