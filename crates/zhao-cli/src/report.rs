@@ -1567,6 +1567,7 @@ mod tests {
     /// compiled manifest.
     fn project_with_edges(edges: Vec<zhao_core::model::LineageEdge>) -> ParsedProject {
         ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: Vec::new(),
             origins: Vec::new(),
             edges,
@@ -1596,6 +1597,7 @@ mod tests {
 
     fn project_with_nodes(nodes: Vec<zhao_core::model::Node>) -> ParsedProject {
         ParsedProject {
+            seed_node_ids: Default::default(),
             nodes,
             origins: Vec::new(),
             edges: Vec::new(),

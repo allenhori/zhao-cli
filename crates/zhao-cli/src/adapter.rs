@@ -110,6 +110,28 @@ impl ResolvedAdapter {
         }
     }
 
+    /// See [`DbtAdapter::show`].
+    ///
+    /// Deliberately *not* part of [`TransformationToolAdapter`] itself,
+    /// same "not generalized to a hypothetical second adapter yet"
+    /// reasoning as [`Self::adapter_type`]/[`Self::catalog_available`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn show(
+        &self,
+        project_dir: &Path,
+        command: &str,
+        target: &str,
+        limit: u32,
+        output_json: bool,
+        extra_args: &[String],
+    ) -> Result<DbtCommandOutput, DbtAdapterError> {
+        match self {
+            ResolvedAdapter::Dbt(adapter) => {
+                adapter.show(project_dir, command, target, limit, output_json, extra_args)
+            }
+        }
+    }
+
     /// See [`TransformationToolAdapter::query_executor`].
     pub fn query_executor<'a>(
         &self,

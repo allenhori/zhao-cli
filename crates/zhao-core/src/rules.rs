@@ -499,6 +499,7 @@ mod tests {
 
     fn empty_project() -> ParsedProject {
         ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![],
             origins: vec![],
             edges: vec![],
@@ -508,6 +509,7 @@ mod tests {
     #[test]
     fn fires_when_baseline_shows_an_active_reference_to_the_removed_column() {
         let baseline = ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![
                 Node {
                     id: node_id("model.a"),
@@ -556,6 +558,7 @@ mod tests {
     #[test]
     fn does_not_fire_when_no_downstream_node_referenced_the_removed_column() {
         let baseline = ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![Node {
                 id: node_id("model.a"),
                 name: "a".to_string(),
@@ -584,6 +587,7 @@ mod tests {
     #[test]
     fn does_not_fire_for_a_column_removal_with_no_downstream_edges_at_all() {
         let baseline = ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![Node {
                 id: node_id("model.a"),
                 name: "a".to_string(),
@@ -760,6 +764,7 @@ mod tests {
     #[test]
     fn all_four_rules_fire_together_on_a_fixture_with_simultaneous_changes() {
         let baseline = ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: vec![Node {
                 id: node_id("model.a"),
                 name: "a".to_string(),

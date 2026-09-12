@@ -95,6 +95,34 @@ fn a_seed_appears_as_its_own_node_with_real_columns_from_the_index() {
         "the seed's own Node entry should carry its real columns from the same Fusion index, \
          not an empty list"
     );
+
+    assert!(
+        project.seed_node_ids.contains(&seed.id),
+        "raw_orders is a seed -- its id should appear in seed_node_ids so a consumer (e.g. \
+         full_lineage.json) can render it distinctly from a real model"
+    );
+}
+
+/// A seed's own `Node` entry lives in `project.nodes` exactly like a real
+/// model (see `a_seed_appears_as_its_own_node_with_real_columns_from_the_index`
+/// above), but `seed_node_ids` is the only place that distinguishes it --
+/// a genuine model must never accidentally end up in that set.
+#[test]
+fn a_real_models_id_is_not_in_seed_node_ids() {
+    let project = DbtAdapter
+        .parse(fixture_path())
+        .expect("fixture should parse");
+
+    let model = project
+        .nodes
+        .iter()
+        .find(|n| n.name == "dim_customers")
+        .expect("dim_customers should exist");
+
+    assert!(
+        !project.seed_node_ids.contains(&model.id),
+        "dim_customers is a real model, not a seed -- it must not appear in seed_node_ids"
+    );
 }
 
 #[test]

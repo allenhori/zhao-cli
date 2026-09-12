@@ -188,6 +188,7 @@ mod tests {
     fn run_metadata_flattens_report_fields_alongside_lineage_edges() {
         let report = Report::new(&[], &[]);
         let current = ParsedProject {
+            seed_node_ids: Default::default(),
             nodes: Vec::new(),
             origins: Vec::new(),
             edges: vec![LineageEdge {

@@ -28,6 +28,12 @@ pub enum Command {
     /// structural query over the current project's compiled state, not a
     /// Baseline-vs-current diff. No `--state`, no git, no `dbt compile`.
     Lineage(LineageArgs),
+    /// Previews a model's/seed's/source's query results -- a thin,
+    /// wrapper-aware wrapper around dbt's own `dbt show`, capped by a
+    /// configurable row limit so an unbounded preview can't trigger an
+    /// expensive full warehouse scan. Works against both dbt-core and dbt
+    /// Fusion projects.
+    Show(ShowArgs),
     /// Replaces the current `zhao` binary with a release fetched from
     /// GitHub Releases -- the only command that reaches the network at
     /// all, and only to download the binary itself; it never sends
@@ -205,6 +211,99 @@ impl LineageArgs {
             None => (name, None),
         };
         Some((model, column, direction))
+    }
+}
+
+/// `zhao show`'s `--output` values -- `Text` (the default) relays dbt's
+/// own human-readable preview table, matching what running `dbt show`
+/// directly in a terminal would print; `Json` passes `--output json`
+/// through to the underlying `dbt show` and normalizes its result (see
+/// `crate::show::extract_show_result`) into one stable `{"columns":
+/// [...], "rows": [...]}` shape regardless of which engine (dbt-core or
+/// Fusion) produced it -- the two engines' own JSON shapes differ (a
+/// `{"node", "show"}` wrapper on dbt-core vs. a bare array on Fusion,
+/// confirmed against real installs of both), so normalizing here is what
+/// actually makes this a stable contract for a consumer like
+/// `zhao-vscode-ext`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum ShowOutputFormat {
+    /// dbt's own human-readable preview table, relayed as-is.
+    #[default]
+    Text,
+    /// A normalized `{"columns": [...], "rows": [...]}` JSON shape.
+    Json,
+}
+
+/// Arguments for `zhao show`.
+#[derive(Debug, clap::Args)]
+pub struct ShowArgs {
+    /// The model/seed/source to preview, in dbt's own selector syntax --
+    /// a single bare name only (unlike `zhao lineage`'s `target`, no
+    /// `+`-prefix/suffix graph scoping: `dbt show` previews one resolved
+    /// relation's own query, not a graph slice).
+    pub target: String,
+
+    /// The dbt project directory to preview against.
+    #[arg(long, default_value = ".")]
+    pub project_dir: PathBuf,
+
+    /// Caps how many rows the underlying `dbt show` returns. Resolution
+    /// order: this flag, if given; else `zhao.yml`'s `show.default_limit`;
+    /// else a hardcoded fallback of 50 -- deliberately capped by default
+    /// so an unbounded preview never triggers an expensive full warehouse
+    /// scan by accident.
+    #[arg(long)]
+    pub limit: Option<u32>,
+
+    /// Output format -- see [`ShowOutputFormat`].
+    #[arg(long, value_enum, default_value_t = ShowOutputFormat::Text)]
+    pub output: ShowOutputFormat,
+
+    /// Disambiguates `target` when its bare name matches more than one
+    /// model/seed/source across different dbt packages. Same convention
+    /// as `zhao lineage --package`.
+    #[arg(long)]
+    pub package: Option<String>,
+
+    /// An extra argument to append to the underlying `dbt show`
+    /// invocation -- repeat for multiple arguments, e.g. `--dbt-arg
+    /// --vars --dbt-arg '{key: value}'`. Appended verbatim, after
+    /// `--select`/`--limit`/`--output`; zhao never parses or validates
+    /// these, dbt does. Mutually exclusive with `--dbt-args`. Same
+    /// convention as `zhao lineage --dbt-arg`.
+    #[arg(
+        long = "dbt-arg",
+        conflicts_with = "dbt_args",
+        allow_hyphen_values = true
+    )]
+    pub dbt_arg: Vec<String>,
+
+    /// A single dbt-invocation-shaped string to split (shell-word-style)
+    /// into individual arguments and append to the underlying `dbt show`
+    /// invocation -- a convenience alternative to repeating `--dbt-arg`.
+    /// Mutually exclusive with `--dbt-arg`.
+    #[arg(
+        long = "dbt-args",
+        conflicts_with = "dbt_arg",
+        allow_hyphen_values = true
+    )]
+    pub dbt_args: Option<String>,
+
+    /// The executable/prefix zhao invokes for the `dbt show` subprocess --
+    /// ordinarily just `"dbt"`, resolved via `PATH`. Same convention as
+    /// `zhao lineage --dbt-command`: overrides `zhao.yml`'s `dbt-command`
+    /// when given; with neither set, defaults to `"dbt"`.
+    #[arg(long = "dbt-command", allow_hyphen_values = true)]
+    pub dbt_command: Option<String>,
+}
+
+impl ShowArgs {
+    /// Resolves the final, ordered list of extra arguments to append to
+    /// the underlying `dbt show` invocation, from whichever of
+    /// `--dbt-arg`/`--dbt-args` was given. Shares its splitting logic with
+    /// [`LineageArgs::dbt_passthrough_args`]/[`CheckArgs::dbt_passthrough_args`].
+    pub fn dbt_passthrough_args(&self) -> Result<Vec<String>, String> {
+        split_dbt_passthrough_args(&self.dbt_arg, &self.dbt_args)
     }
 }
 

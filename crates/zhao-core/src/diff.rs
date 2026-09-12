@@ -399,6 +399,7 @@ mod tests {
 
     fn project(nodes: Vec<Node>) -> ParsedProject {
         ParsedProject {
+            seed_node_ids: Default::default(),
             nodes,
             origins: Vec::new(),
             edges: Vec::new(),
