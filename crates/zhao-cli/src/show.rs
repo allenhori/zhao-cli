@@ -68,10 +68,12 @@ pub fn run(args: &ShowArgs) -> ExitCode {
     let limit = resolve_limit(args.limit, config.show_default_limit());
     let output_json = matches!(args.output, ShowOutputFormat::Json);
 
+    let target = resolve_show_target(&args.target, args.package.as_deref());
+
     let output = match adapter.show(
         &args.project_dir,
         &dbt_command,
-        &args.target,
+        &target,
         limit,
         output_json,
         &dbt_passthrough_args,
@@ -90,11 +92,8 @@ pub fn run(args: &ShowArgs) -> ExitCode {
 
     match extract_show_result(&output.stdout) {
         Ok(result) => {
-            let json = serde_json::to_string_pretty(&ShowJsonOutput {
-                columns: result.columns,
-                rows: result.rows,
-            })
-            .expect("a normalized show result should always serialize");
+            let json = serde_json::to_string_pretty(&result)
+                .expect("a normalized show result should always serialize");
             println!("{json}");
             ExitCode::from(EXIT_OK)
         }
@@ -106,33 +105,58 @@ pub fn run(args: &ShowArgs) -> ExitCode {
     }
 }
 
+/// Resolves the selector `zhao show` actually passes to `dbt show`:
+/// `target` alone, or dbt's `package:<package>,<target>` graph-selector
+/// method when `--package` was given. `--package` disambiguates a bare
+/// target matching more than one dbt package, the same as `zhao lineage
+/// --package` -- but note this is a genuinely different mechanism than
+/// `zhao lineage`'s own `--package`, which narrows resolution against
+/// an already-parsed manifest zhao-core holds in memory. `zhao show`
+/// never parses a manifest at all; it only asks `dbt show` to resolve
+/// the selector itself, so disambiguation has to be expressed in dbt's
+/// own selector syntax. **Verified against a real dbt-core install**:
+/// the intuitive `<package>.<target>` dotted form (which looks like a
+/// manifest unique-id, e.g. `model.jaffle_shop.customers`) is *not* a
+/// valid `--select` argument on its own -- dbt reports "does not match
+/// any enabled nodes." The correct selector method is
+/// `package:<package>,<target>` (a comma-separated intersection of the
+/// `package:` and bare-name selector methods).
+fn resolve_show_target(target: &str, package: Option<&str>) -> String {
+    match package {
+        Some(package) => format!("package:{package},{target}"),
+        None => target.to_string(),
+    }
+}
+
 /// Resolves `zhao show`'s effective row limit: `--limit`, if given; else
-/// `zhao.yml`'s `show.default_limit`; else [`DEFAULT_LIMIT`]. A pure
-/// function -- no I/O, easy to test every combination of directly.
+/// `zhao.yml`'s `show.default_limit`; else [`DEFAULT_LIMIT`] -- clamped
+/// to a minimum of 1 regardless of source. A `--limit`/`show.default_limit`
+/// of `0` is never a useful preview size (it directly defeats the point
+/// of this command) and, depending on the dbt engine/adapter, isn't even
+/// guaranteed to mean "zero rows" consistently -- so it's treated as a
+/// misconfiguration and raised to `1` rather than passed through
+/// verbatim. A pure function -- no I/O, easy to test every combination
+/// of directly.
 fn resolve_limit(cli_limit: Option<u32>, config_limit: Option<u32>) -> u32 {
-    cli_limit.or(config_limit).unwrap_or(DEFAULT_LIMIT)
+    cli_limit.or(config_limit).unwrap_or(DEFAULT_LIMIT).max(1)
 }
 
 /// `zhao show --output json`'s normalized, stable result shape -- see
 /// the module doc comment for why this isn't just dbt's own JSON relayed
-/// verbatim.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// verbatim. Also the exact JSON shape printed to stdout (via its
+/// `Serialize` impl) -- a consumer like `zhao-vscode-ext` parses this
+/// directly, so there's no separate internal-vs-wire-format struct to
+/// keep in sync by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ShowResult {
     /// Column names, in the same order dbt itself returned them (not
-    /// resorted) -- derived from the first row's keys; empty if there
-    /// are no rows at all.
+    /// resorted) -- the union of every row's keys, in first-seen order
+    /// (not just the first row's, since a row-specific `NULL` can omit
+    /// a key some serializers would otherwise still report); empty if
+    /// there are no rows at all.
     columns: Vec<String>,
     /// Each row, as a JSON object -- preserved key order, same reasoning
     /// as `columns`.
-    rows: Vec<serde_json::Map<String, serde_json::Value>>,
-}
-
-/// The JSON shape actually printed to stdout for `--output json` --
-/// [`ShowResult`] is `zhao-cli`-internal; this is what a consumer like
-/// `zhao-vscode-ext` actually parses.
-#[derive(Debug, Serialize)]
-struct ShowJsonOutput {
-    columns: Vec<String>,
     rows: Vec<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -146,29 +170,67 @@ fn extract_show_result(raw_stdout: &str) -> Result<ShowResult, String> {
     normalize_show_value(value)
 }
 
-/// Scans `raw` for the first well-formed JSON value (a `{...}` or
-/// `[...]`, brace/bracket-matched with string-quoting awareness so a
-/// literal `{`/`[`/`}`/`]` inside a string value doesn't throw off the
-/// scan), ignoring any non-JSON text before or after it. Both dbt-core
-/// and dbt Fusion interleave their own log/progress lines with
-/// `--output json`'s actual payload on the same stdout stream, so this
-/// can't simply parse `raw` as JSON outright -- confirmed against real
-/// installs of both engines.
+/// Scans `raw` for every well-formed JSON value (a `{...}` or `[...]`,
+/// brace/bracket-matched with string-quoting awareness so a literal
+/// `{`/`[`/`}`/`]` inside a string value doesn't throw off the scan),
+/// preferring the first candidate that actually looks like a `dbt show`
+/// result (see [`looks_like_show_result`]) over merely being valid
+/// JSON. Both dbt-core and dbt Fusion interleave their own log/progress
+/// lines with `--output json`'s actual payload on the same stdout
+/// stream, so parsing `raw` outright never works -- confirmed against
+/// real installs of both engines. Preferring a shape-matched candidate,
+/// not just the first parseable one, matters because dbt-core also
+/// supports structured JSON logging (`--log-format json`/
+/// `DBT_LOG_FORMAT=json`, common in CI): with that set, *every* log
+/// line is itself a small well-formed JSON object printed ahead of the
+/// real result, and a "first match wins" scan would return one of those
+/// instead. Falls back to the first parseable value if nothing in the
+/// whole output matches the expected shape, so a genuinely novel future
+/// dbt output shape still gets *something* passed to
+/// [`normalize_show_value`] (whose own error there is clearer than
+/// failing to extract anything at all).
+///
+/// Each candidate span is skipped over as a whole (never rescanned byte
+/// by byte) once its closing bracket is found, successful parse or not
+/// -- large noisy stdout no longer costs a rescan per nested brace.
 fn extract_json_value(raw: &str) -> Result<serde_json::Value, String> {
     let bytes = raw.as_bytes();
     let mut start = 0;
+    let mut first_parseable: Option<serde_json::Value> = None;
     while start < bytes.len() {
         if bytes[start] == b'{' || bytes[start] == b'[' {
             if let Some(end) = matching_close(raw, start) {
                 let candidate = &raw[start..=end];
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
-                    return Ok(value);
+                    if looks_like_show_result(&value) {
+                        return Ok(value);
+                    }
+                    if first_parseable.is_none() {
+                        first_parseable = Some(value);
+                    }
                 }
+                start = end + 1;
+                continue;
             }
         }
         start += 1;
     }
-    Err("no JSON value found in dbt's output".to_string())
+    first_parseable.ok_or_else(|| "no JSON value found in dbt's output".to_string())
+}
+
+/// Whether `value` has the shape a real `dbt show` result actually
+/// takes: dbt-core's `{"show": [...]}` wrapper (an object with a
+/// `"show"` array), or dbt Fusion's bare array of row objects. A JSON
+/// log line (e.g. from `--log-format json`) is a plain object with no
+/// `"show"` key, so it never matches this -- see [`extract_json_value`].
+fn looks_like_show_result(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().all(|item| item.is_object()),
+        serde_json::Value::Object(map) => {
+            matches!(map.get("show"), Some(serde_json::Value::Array(_)))
+        }
+        _ => false,
+    }
 }
 
 /// Finds the byte index of the bracket/brace that closes the one opened
@@ -240,10 +302,19 @@ fn normalize_show_value(value: serde_json::Value) -> Result<ShowResult, String> 
         }
     }
 
-    let columns = rows
-        .first()
-        .map(|row| row.keys().cloned().collect())
-        .unwrap_or_default();
+    // The union of every row's keys, in first-seen order -- not just
+    // the first row's. A dbt/warehouse JSON serializer that omits a key
+    // entirely for a `NULL` value (a real behavior for some drivers)
+    // would otherwise make `columns` silently miss a column that only
+    // happens to be null in row 0 but present in a later row.
+    let mut columns = Vec::new();
+    for row in &rows {
+        for key in row.keys() {
+            if !columns.contains(key) {
+                columns.push(key.clone());
+            }
+        }
+    }
 
     Ok(ShowResult { columns, rows })
 }
@@ -277,6 +348,29 @@ mod tests {
     fn hardcoded_default_wins_when_neither_is_set() {
         assert_eq!(resolve_limit(None, None), DEFAULT_LIMIT);
         assert_eq!(DEFAULT_LIMIT, 50);
+    }
+
+    #[test]
+    fn a_zero_limit_from_any_source_is_clamped_up_to_one() {
+        assert_eq!(resolve_limit(Some(0), None), 1);
+        assert_eq!(resolve_limit(None, Some(0)), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // `resolve_show_target` -- `--package` qualification.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn no_package_leaves_the_target_bare() {
+        assert_eq!(resolve_show_target("customers", None), "customers");
+    }
+
+    #[test]
+    fn a_package_qualifies_the_target_using_dbts_package_selector_method() {
+        assert_eq!(
+            resolve_show_target("customers", Some("analytics")),
+            "package:analytics,customers"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -333,5 +427,60 @@ mod tests {
         let result = extract_show_result(raw)
             .expect("should extract successfully despite the embedded brace/bracket");
         assert_eq!(result.rows.len(), 1);
+    }
+
+    /// dbt-core's structured JSON logging (`--log-format json`/
+    /// `DBT_LOG_FORMAT=json`, common in CI) makes every log line its
+    /// own well-formed JSON object printed *before* the real result --
+    /// a "first parseable JSON wins" scan would return one of those
+    /// instead of the actual show payload. This is a real, plausible
+    /// operational configuration, not a hypothetical one.
+    #[test]
+    fn a_leading_json_log_line_is_skipped_in_favor_of_the_real_show_result() {
+        let raw = r#"{"info": {"name": "MainReportVersion"}, "msg": "Running with dbt=1.10.23"}
+{"info": {"name": "AdapterRegistered"}, "msg": "Registered adapter: duckdb=1.10.0"}
+{
+  "node": "customers",
+  "show": [
+    {"customer_id": "abc", "customer_name": "Joy Lam"}
+  ]
+}
+"#;
+        let result = extract_show_result(raw)
+            .expect("should skip the JSON log lines and find the real show result");
+        assert_eq!(result.columns, vec!["customer_id", "customer_name"]);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0]["customer_name"], "Joy Lam");
+    }
+
+    /// Same as above for Fusion's bare-array shape, with JSON log lines
+    /// ahead of it instead of dbt-core's plain-text banner.
+    #[test]
+    fn a_leading_json_log_line_is_skipped_in_favor_of_a_real_bare_array_result() {
+        let raw = r#"{"info": {"name": "MainReportVersion"}, "msg": "dbt-fusion 2.0.0-preview.218"}
+[{"customer_id":"abc","customer_name":"Todd Burton"}]
+"#;
+        let result = extract_show_result(raw)
+            .expect("should skip the JSON log line and find the real bare-array result");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0]["customer_name"], "Todd Burton");
+    }
+
+    /// If nothing in the output actually looks like a show result, the
+    /// first parseable JSON value is still returned (so a genuinely
+    /// novel future shape reaches `normalize_show_value`'s own clearer
+    /// error) rather than failing to extract anything at all.
+    #[test]
+    fn falls_back_to_the_first_parseable_value_when_nothing_matches_the_expected_shape() {
+        let raw = r#"{"info": {"name": "SomeEvent"}}"#;
+        let err = extract_show_result(raw).expect_err("no show-shaped value exists in this input");
+        assert!(err.contains("show"), "{err}");
+    }
+
+    #[test]
+    fn columns_are_the_union_of_every_rows_keys_not_just_the_first_row() {
+        let raw = r#"[{"a": 1}, {"a": 2, "b": null}, {"a": 3, "c": "x"}]"#;
+        let result = extract_show_result(raw).expect("should extract successfully");
+        assert_eq!(result.columns, vec!["a", "b", "c"]);
     }
 }
