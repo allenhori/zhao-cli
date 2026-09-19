@@ -38,8 +38,8 @@ impl PackageManager {
     /// The command a user should run instead of `zhao update`.
     fn upgrade_command(&self) -> &'static str {
         match self {
-            PackageManager::Homebrew => "brew upgrade zhao",
-            PackageManager::Scoop => "scoop update zhao",
+            PackageManager::Homebrew => "brew upgrade zhao-cli",
+            PackageManager::Scoop => "scoop update zhao-cli",
         }
     }
 

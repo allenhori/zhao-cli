@@ -49,14 +49,14 @@ for a genuinely zero-network-call run.
 **macOS / Linux** — [Homebrew](https://brew.sh):
 
 ```bash
-brew install allenhori/zhao/zhao
+brew install allenhori/zhao/zhao-cli
 ```
 
 **Windows** — [Scoop](https://scoop.sh):
 
 ```powershell
 scoop bucket add zhao https://github.com/allenhori/zhao-scoop
-scoop install zhao
+scoop install zhao-cli
 ```
 
 **Any platform** — the install script:
@@ -72,7 +72,7 @@ Windows without Scoop: grab `zhao-x86_64-pc-windows-msvc.zip` from the same page
 `cargo install --git https://github.com/allenhori/zhao-cli` to build directly off `master`
 instead of the last tagged release.
 
-**Updating:** use the same tool you installed with — `brew upgrade zhao`, `scoop update zhao`,
+**Updating:** use the same tool you installed with — `brew upgrade zhao-cli`, `scoop update zhao-cli`,
 or `zhao update` for the install script / a manual download. `zhao update` detects a
 Homebrew- or Scoop-managed install and points you at the right command instead of touching the
 binary. Homebrew and Scoop only carry stable releases; the nightly build is install-script
@@ -103,7 +103,7 @@ fired. Full walkthrough: **[Getting started](docs/getting-started.md)**.
 | `zhao check` | The CI gate — diffs against a Baseline, fails on a breaking change. |
 | `zhao diff` | Same engine, always exits `0` — for local inspection during development. |
 | `zhao lineage` | What's upstream/downstream of a model or column, right now (no diff, no git). |
-| `zhao update` | Replaces the current binary with a release from GitHub Releases (for Homebrew/Scoop installs it tells you to use `brew upgrade zhao` / `scoop update zhao` instead). The only command that reaches the network at all — and only to download the binary itself, never to send anything from your project. See [What it doesn't do](#what-it-doesnt-do). |
+| `zhao update` | Replaces the current binary with a release from GitHub Releases (for Homebrew/Scoop installs it tells you to use `brew upgrade zhao-cli` / `scoop update zhao-cli` instead). The only command that reaches the network at all — and only to download the binary itself, never to send anything from your project. See [What it doesn't do](#what-it-doesnt-do). |
 
 Full flag reference: **[docs/commands.md](docs/commands.md)**.
 
