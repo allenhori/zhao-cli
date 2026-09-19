@@ -59,6 +59,24 @@ pub enum Change {
         /// The type documented in the current state.
         to_type: String,
     },
+    /// A column present in both states, with the same name, whose defining
+    /// expression differs -- its logic changed (`x` to `x * 1.1`, a new
+    /// `CASE` branch, a different function), even though its name and
+    /// documented type didn't. Compared on the rendered expression
+    /// ([`Column::expression`]), so whitespace, comment, and capitalisation-only
+    /// edits never register. A change between a plain passthrough
+    /// (`expression: None`) and a calculated column counts; two
+    /// passthroughs never differ by this measure.
+    ColumnExpressionChanged {
+        /// The Node the column belongs to.
+        node: NodeId,
+        /// The column whose defining expression changed.
+        column: ColumnName,
+        /// The rendered expression in the Baseline (`None` for a plain passthrough).
+        from_expression: Option<String>,
+        /// The rendered expression in the current state (`None` for a plain passthrough).
+        to_expression: Option<String>,
+    },
     /// The join at a given position in the Node's final `SELECT` changed
     /// kind, or a join was added/removed at that position (represented as
     /// `from_kind`/`to_kind` being `None`).
@@ -153,6 +171,11 @@ fn diff_columns(baseline: &Node, current: &Node) -> Vec<Change> {
             }),
             Some(baseline_col) => {
                 changes.extend(column_type_change(&current.id, baseline_col, current_col));
+                changes.extend(column_expression_change(
+                    &current.id,
+                    baseline_col,
+                    current_col,
+                ));
                 changes.extend(diff_struct_fields(&current.id, baseline_col, current_col));
             }
         }
@@ -181,6 +204,18 @@ fn column_type_change(node: &NodeId, baseline: &Column, current: &Column) -> Opt
         column: current.name.clone(),
         from_type: from_type.clone(),
         to_type: to_type.clone(),
+    })
+}
+
+fn column_expression_change(node: &NodeId, baseline: &Column, current: &Column) -> Option<Change> {
+    if baseline.expression == current.expression {
+        return None;
+    }
+    Some(Change::ColumnExpressionChanged {
+        node: node.clone(),
+        column: current.name.clone(),
+        from_expression: baseline.expression.clone(),
+        to_expression: current.expression.clone(),
     })
 }
 
@@ -404,6 +439,76 @@ mod tests {
             origins: Vec::new(),
             edges: Vec::new(),
         }
+    }
+
+    fn calculated_column(name: &str, expression: Option<&str>) -> Column {
+        Column {
+            name: ColumnName::new(name),
+            data_type: None,
+            expression: expression.map(str::to_string),
+            struct_fields: None,
+        }
+    }
+
+    #[test]
+    fn a_changed_column_expression_is_a_change() {
+        let baseline = project(vec![node(
+            "model.a",
+            vec![calculated_column("v", Some("x * 2"))],
+            vec![],
+        )]);
+        let current = project(vec![node(
+            "model.a",
+            vec![calculated_column("v", Some("x * 3"))],
+            vec![],
+        )]);
+
+        assert_eq!(
+            diff(&baseline, &current),
+            vec![Change::ColumnExpressionChanged {
+                node: NodeId::new("model.a"),
+                column: ColumnName::new("v"),
+                from_expression: Some("x * 2".to_string()),
+                to_expression: Some("x * 3".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_identical_column_expression_is_not_a_change() {
+        let n = node(
+            "model.a",
+            vec![calculated_column("v", Some("x * 2"))],
+            vec![],
+        );
+        assert_eq!(
+            diff(&project(vec![n.clone()]), &project(vec![n])),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn two_passthroughs_never_count_as_an_expression_change() {
+        let n = node("model.a", vec![calculated_column("v", None)], vec![]);
+        assert_eq!(
+            diff(&project(vec![n.clone()]), &project(vec![n])),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn a_passthrough_becoming_a_calculation_is_an_expression_change() {
+        let baseline = project(vec![node(
+            "model.a",
+            vec![calculated_column("v", None)],
+            vec![],
+        )]);
+        let current = project(vec![node(
+            "model.a",
+            vec![calculated_column("v", Some("x + 1"))],
+            vec![],
+        )]);
+        assert_eq!(diff(&baseline, &current).len(), 1);
     }
 
     #[test]

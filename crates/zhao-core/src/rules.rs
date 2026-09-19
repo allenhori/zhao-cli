@@ -58,6 +58,14 @@ pub enum RuleId {
     JoinCardinalityLoosened,
     /// A column was added. Informational by default.
     ColumnAdded,
+    /// A column's defining expression changed (its logic differs) while its
+    /// name and documented type didn't. `warn` by default -- nothing breaks,
+    /// but the data in that column, and in every downstream column derived
+    /// from it, changes. Impact follows the *current* state's column-level
+    /// lineage transitively: only Nodes that actually read the changed
+    /// column, directly or through a derived column, are reached, not the
+    /// whole downstream graph. Escalate to `error` in `zhao.yml` to gate on it.
+    ColumnExpressionChanged,
     /// A field was removed from a `STRUCT`-typed column's internal shape,
     /// where that shape was statically knowable in both the Baseline and
     /// current state (see [`crate::model::Column::struct_fields`]). The
@@ -108,6 +116,7 @@ impl RuleId {
             RuleId::ColumnTypeNarrowed => Severity::Warn,
             RuleId::JoinCardinalityLoosened => Severity::Warn,
             RuleId::ColumnAdded => Severity::Pass,
+            RuleId::ColumnExpressionChanged => Severity::Warn,
             RuleId::StructFieldRemoved => Severity::Error,
             RuleId::StructFieldAdded => Severity::Error,
             RuleId::StructFieldTypeNarrowed => Severity::Error,
@@ -121,6 +130,7 @@ impl RuleId {
             RuleId::ColumnTypeNarrowed => "column-type-narrowed",
             RuleId::JoinCardinalityLoosened => "join-cardinality-loosened",
             RuleId::ColumnAdded => "column-added",
+            RuleId::ColumnExpressionChanged => "column-expression-changed",
             RuleId::StructFieldRemoved => "struct-field-removed",
             RuleId::StructFieldAdded => "struct-field-added",
             RuleId::StructFieldTypeNarrowed => "struct-field-type-narrowed",
@@ -136,6 +146,7 @@ impl RuleId {
             "column-type-narrowed" => Some(RuleId::ColumnTypeNarrowed),
             "join-cardinality-loosened" => Some(RuleId::JoinCardinalityLoosened),
             "column-added" => Some(RuleId::ColumnAdded),
+            "column-expression-changed" => Some(RuleId::ColumnExpressionChanged),
             "struct-field-removed" => Some(RuleId::StructFieldRemoved),
             "struct-field-added" => Some(RuleId::StructFieldAdded),
             "struct-field-type-narrowed" => Some(RuleId::StructFieldTypeNarrowed),
@@ -146,12 +157,13 @@ impl RuleId {
     /// Every Rule in the v1 catalog, in declaration order. Exists so
     /// callers (e.g. an "unknown rule name" error message) can list valid
     /// names without duplicating the catalog themselves.
-    pub fn all() -> [RuleId; 7] {
+    pub fn all() -> [RuleId; 8] {
         [
             RuleId::ColumnRemovedWithActiveReferences,
             RuleId::ColumnTypeNarrowed,
             RuleId::JoinCardinalityLoosened,
             RuleId::ColumnAdded,
+            RuleId::ColumnExpressionChanged,
             RuleId::StructFieldRemoved,
             RuleId::StructFieldAdded,
             RuleId::StructFieldTypeNarrowed,
@@ -205,6 +217,19 @@ pub enum FindingDetail {
         /// The added column.
         column: ColumnName,
     },
+    /// See [`RuleId::ColumnExpressionChanged`]. One Finding for the changed
+    /// column itself (`reached == node`, `reached_column == column`) and one
+    /// per downstream column that transitively derives from it.
+    ColumnExpressionChanged {
+        /// The Node whose column expression changed.
+        node: NodeId,
+        /// The column whose expression changed.
+        column: ColumnName,
+        /// The Node reached: `node` itself, or a downstream Node.
+        reached: NodeId,
+        /// The column on `reached` derived (directly or transitively) from `column`.
+        reached_column: ColumnName,
+    },
     /// See [`RuleId::StructFieldRemoved`].
     StructFieldRemoved {
         /// The Node the column belongs to.
@@ -248,6 +273,7 @@ impl FindingDetail {
             FindingDetail::ColumnTypeNarrowed { .. } => RuleId::ColumnTypeNarrowed,
             FindingDetail::JoinCardinalityLoosened { .. } => RuleId::JoinCardinalityLoosened,
             FindingDetail::ColumnAdded { .. } => RuleId::ColumnAdded,
+            FindingDetail::ColumnExpressionChanged { .. } => RuleId::ColumnExpressionChanged,
             FindingDetail::StructFieldRemoved { .. } => RuleId::StructFieldRemoved,
             FindingDetail::StructFieldAdded { .. } => RuleId::StructFieldAdded,
             FindingDetail::StructFieldTypeNarrowed { .. } => RuleId::StructFieldTypeNarrowed,
@@ -268,18 +294,35 @@ pub struct Finding {
 /// Edges where a Rule needs to know what was actively referenced before
 /// the Change happened (a removed column's own Lineage Edge no longer
 /// exists in the current state, so only the Baseline can answer that),
-/// and `config` to resolve each Rule's configured Severity.
-pub fn evaluate(baseline: &ParsedProject, changes: &[Change], config: &Config) -> Vec<Finding> {
+/// `current`'s Lineage Edges where a Rule needs to know what still
+/// references something now (a reader already migrated off a removed
+/// column is not reported, and an expression change reaches whatever
+/// reads the column *now*), and `config` to resolve each Rule's
+/// configured Severity.
+pub fn evaluate(
+    baseline: &ParsedProject,
+    current: &ParsedProject,
+    changes: &[Change],
+    config: &Config,
+) -> Vec<Finding> {
     changes
         .iter()
-        .flat_map(|change| evaluate_change(baseline, change, config))
+        .flat_map(|change| evaluate_change(baseline, current, change, config))
         .collect()
 }
 
-fn evaluate_change(baseline: &ParsedProject, change: &Change, config: &Config) -> Vec<Finding> {
+fn evaluate_change(
+    baseline: &ParsedProject,
+    current: &ParsedProject,
+    change: &Change,
+    config: &Config,
+) -> Vec<Finding> {
     match change {
         Change::ColumnRemoved { .. } => {
-            column_removed_with_active_references(baseline, change, config)
+            column_removed_with_active_references(baseline, current, change, config)
+        }
+        Change::ColumnExpressionChanged { node, column, .. } => {
+            column_expression_changed(current, node, column, config)
         }
         Change::ColumnTypeChanged {
             node,
@@ -349,8 +392,58 @@ fn finding(config: &Config, detail: FindingDetail) -> Finding {
     }
 }
 
+/// Every downstream column that transitively derives from `(node, column)`
+/// through `current`'s column-level Lineage Edges, in discovery order, plus
+/// the changed column itself first. Unresolved lineage (an edge with no
+/// column detail) is never followed: only column-level edges count, so a
+/// Node that merely depends on `node` without reading `column` is not reached.
+fn column_expression_changed(
+    current: &ParsedProject,
+    node: &NodeId,
+    column: &ColumnName,
+    config: &Config,
+) -> Vec<Finding> {
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    let mut findings = Vec::new();
+    let mut push = |reached: &NodeId, reached_column: &ColumnName| {
+        findings.push(finding(
+            config,
+            FindingDetail::ColumnExpressionChanged {
+                node: node.clone(),
+                column: column.clone(),
+                reached: reached.clone(),
+                reached_column: reached_column.clone(),
+            },
+        ));
+    };
+    push(node, column);
+    seen.insert((node.clone(), column.clone()));
+    queue.push_back((node.clone(), column.clone()));
+    while let Some((n, c)) = queue.pop_front() {
+        for edge in &current.edges {
+            if edge.upstream != Upstream::Node(n.clone()) {
+                continue;
+            }
+            let Some(lineage) = &edge.column else {
+                continue;
+            };
+            if lineage.upstream_column != c {
+                continue;
+            }
+            let key = (edge.downstream.clone(), lineage.downstream_column.clone());
+            if seen.insert(key.clone()) {
+                push(&key.0, &key.1);
+                queue.push_back(key);
+            }
+        }
+    }
+    findings
+}
+
 fn column_removed_with_active_references(
     baseline: &ParsedProject,
+    current: &ParsedProject,
     change: &Change,
     config: &Config,
 ) -> Vec<Finding> {
@@ -364,7 +457,27 @@ fn column_removed_with_active_references(
         .filter(|edge| edge.upstream == Upstream::Node(node.clone()))
         .filter_map(|edge| {
             let lineage = edge.column.as_ref()?;
-            (&lineage.upstream_column == column).then(|| {
+            // A reader already migrated off the removed column in the same
+            // change (a rename with its readers updated) is not broken by it:
+            // its own output column is still there, and it no longer derives
+            // from the removed column. A reader whose output column vanished
+            // (e.g. a `SELECT *` reader that silently lost the column), or
+            // that still reads the removed column, is.
+            let still_derives = current.edges.iter().any(|e| {
+                e.upstream == Upstream::Node(node.clone())
+                    && e.downstream == edge.downstream
+                    && e.column.as_ref().is_some_and(|l| {
+                        l.upstream_column == lineage.upstream_column
+                            && l.downstream_column == lineage.downstream_column
+                    })
+            });
+            let reader_kept_its_column = current.node(&edge.downstream).is_some_and(|n| {
+                n.columns
+                    .iter()
+                    .any(|c| c.name == lineage.downstream_column)
+            });
+            let still_referenced = still_derives || !reader_kept_its_column;
+            (&lineage.upstream_column == column && still_referenced).then(|| {
                 finding(
                     config,
                     FindingDetail::ColumnRemovedWithActiveReferences {
@@ -506,6 +619,184 @@ mod tests {
         }
     }
 
+    fn col_edge(up: &str, up_col: &str, down: &str, down_col: &str) -> LineageEdge {
+        LineageEdge {
+            upstream: Upstream::Node(node_id(up)),
+            downstream: node_id(down),
+            column: Some(ColumnLineage {
+                upstream_column: column(up_col),
+                downstream_column: column(down_col),
+            }),
+        }
+    }
+
+    fn project_with_edges(edges: Vec<LineageEdge>) -> ParsedProject {
+        ParsedProject {
+            edges,
+            ..empty_project()
+        }
+    }
+
+    fn reader_node(id: &str, col: &str) -> Node {
+        Node {
+            id: node_id(id),
+            name: id.to_string(),
+            columns: vec![crate::model::Column {
+                name: column(col),
+                data_type: None,
+                expression: None,
+                struct_fields: None,
+            }],
+            joins: vec![],
+            materialization: Materialization::Table,
+        }
+    }
+
+    fn expression_changed(node: &str, col: &str) -> Change {
+        Change::ColumnExpressionChanged {
+            node: node_id(node),
+            column: column(col),
+            from_expression: Some("x * 2".to_string()),
+            to_expression: Some("x * 3".to_string()),
+        }
+    }
+
+    fn reached_of(findings: &[Finding]) -> Vec<(String, String)> {
+        findings
+            .iter()
+            .map(|f| match &f.detail {
+                FindingDetail::ColumnExpressionChanged {
+                    reached,
+                    reached_column,
+                    ..
+                } => (reached.to_string(), reached_column.to_string()),
+                other => panic!("unexpected finding {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn expression_change_reaches_only_transitive_column_readers() {
+        // a.v -> b.w -> c.z ; a.other -> d.q (d never reads a.v)
+        let current = project_with_edges(vec![
+            col_edge("model.a", "v", "model.b", "w"),
+            col_edge("model.b", "w", "model.c", "z"),
+            col_edge("model.a", "other", "model.d", "q"),
+        ]);
+        let findings = evaluate(
+            &empty_project(),
+            &current,
+            &[expression_changed("model.a", "v")],
+            &Config::default(),
+        );
+        assert_eq!(
+            reached_of(&findings),
+            vec![
+                ("model.a".to_string(), "v".to_string()),
+                ("model.b".to_string(), "w".to_string()),
+                ("model.c".to_string(), "z".to_string()),
+            ]
+        );
+        assert!(findings.iter().all(|f| f.severity == Severity::Warn));
+    }
+
+    #[test]
+    fn expression_change_does_not_follow_node_level_only_edges() {
+        let current = project_with_edges(vec![LineageEdge {
+            upstream: Upstream::Node(node_id("model.a")),
+            downstream: node_id("model.b"),
+            column: None,
+        }]);
+        let findings = evaluate(
+            &empty_project(),
+            &current,
+            &[expression_changed("model.a", "v")],
+            &Config::default(),
+        );
+        assert_eq!(
+            reached_of(&findings),
+            vec![("model.a".to_string(), "v".to_string())]
+        );
+    }
+
+    #[test]
+    fn expression_change_terminates_on_a_lineage_cycle() {
+        let current = project_with_edges(vec![
+            col_edge("model.a", "v", "model.b", "w"),
+            col_edge("model.b", "w", "model.a", "v"),
+        ]);
+        let findings = evaluate(
+            &empty_project(),
+            &current,
+            &[expression_changed("model.a", "v")],
+            &Config::default(),
+        );
+        assert_eq!(findings.len(), 2);
+    }
+
+    #[test]
+    fn removed_column_does_not_fire_for_a_reader_already_migrated_off_it() {
+        let baseline = project_with_edges(vec![col_edge("model.a", "x", "model.b", "y")]);
+        // In the current state b reads the renamed column, not x.
+        let current = ParsedProject {
+            nodes: vec![reader_node("model.b", "y")],
+            ..project_with_edges(vec![col_edge("model.a", "x_new", "model.b", "y")])
+        };
+        let changes = [Change::ColumnRemoved {
+            node: node_id("model.a"),
+            column: column("x"),
+        }];
+        assert_eq!(
+            evaluate(&baseline, &current, &changes, &Config::default()),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn removed_column_fires_only_for_the_reader_that_still_reads_it() {
+        let baseline = project_with_edges(vec![
+            col_edge("model.a", "x", "model.b", "y"),
+            col_edge("model.a", "x", "model.c", "y"),
+        ]);
+        // b was migrated; c still reads x.
+        let current = ParsedProject {
+            nodes: vec![reader_node("model.b", "y"), reader_node("model.c", "y")],
+            ..project_with_edges(vec![
+                col_edge("model.a", "x_new", "model.b", "y"),
+                col_edge("model.a", "x", "model.c", "y"),
+            ])
+        };
+        let changes = [Change::ColumnRemoved {
+            node: node_id("model.a"),
+            column: column("x"),
+        }];
+        let findings = evaluate(&baseline, &current, &changes, &Config::default());
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(
+            &findings[0].detail,
+            FindingDetail::ColumnRemovedWithActiveReferences { reached, .. }
+                if *reached == node_id("model.c")
+        ));
+    }
+
+    #[test]
+    fn removed_column_fires_for_a_reader_that_silently_lost_its_column() {
+        // A `SELECT *` reader: its own output column disappeared with the removal.
+        let baseline = project_with_edges(vec![col_edge("model.a", "x", "model.b", "x")]);
+        let current = ParsedProject {
+            nodes: vec![reader_node("model.b", "other")],
+            ..empty_project()
+        };
+        let changes = [Change::ColumnRemoved {
+            node: node_id("model.a"),
+            column: column("x"),
+        }];
+        assert_eq!(
+            evaluate(&baseline, &current, &changes, &Config::default()).len(),
+            1
+        );
+    }
+
     #[test]
     fn fires_when_baseline_shows_an_active_reference_to_the_removed_column() {
         let baseline = ParsedProject {
@@ -542,7 +833,7 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&baseline, &changes, &Config::default()),
+            evaluate(&baseline, &baseline, &changes, &Config::default()),
             vec![Finding {
                 severity: Severity::Error,
                 detail: FindingDetail::ColumnRemovedWithActiveReferences {
@@ -579,7 +870,7 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&baseline, &changes, &Config::default()),
+            evaluate(&baseline, &baseline, &changes, &Config::default()),
             Vec::new()
         );
     }
@@ -604,7 +895,7 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&baseline, &changes, &Config::default()),
+            evaluate(&baseline, &baseline, &changes, &Config::default()),
             Vec::new()
         );
     }
@@ -619,7 +910,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             vec![Finding {
                 severity: Severity::Warn,
                 detail: FindingDetail::ColumnTypeNarrowed {
@@ -642,7 +938,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             Vec::new()
         );
     }
@@ -658,7 +959,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             Vec::new()
         );
     }
@@ -673,7 +979,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             vec![Finding {
                 severity: Severity::Warn,
                 detail: FindingDetail::JoinCardinalityLoosened {
@@ -696,7 +1007,13 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()).len(),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            )
+            .len(),
             1
         );
     }
@@ -712,7 +1029,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             Vec::new()
         );
     }
@@ -733,11 +1055,21 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &added, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &added,
+                &Config::default()
+            ),
             Vec::new()
         );
         assert_eq!(
-            evaluate(&empty_project(), &removed, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &removed,
+                &Config::default()
+            ),
             Vec::new()
         );
     }
@@ -750,7 +1082,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             vec![Finding {
                 severity: Severity::Pass,
                 detail: FindingDetail::ColumnAdded {
@@ -805,7 +1142,7 @@ mod tests {
             },
         ];
 
-        let findings = evaluate(&baseline, &changes, &Config::default());
+        let findings = evaluate(&baseline, &baseline, &changes, &Config::default());
         assert_eq!(findings.len(), 4);
 
         let rules: Vec<RuleId> = findings.iter().map(|f| f.detail.rule()).collect();
@@ -848,7 +1185,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             vec![Finding {
                 severity: Severity::Error,
                 detail: FindingDetail::StructFieldRemoved {
@@ -875,7 +1217,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             vec![Finding {
                 severity: Severity::Error,
                 detail: FindingDetail::StructFieldAdded {
@@ -902,7 +1249,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             vec![Finding {
                 severity: Severity::Error,
                 detail: FindingDetail::StructFieldTypeNarrowed {
@@ -927,7 +1279,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             Vec::new()
         );
     }
@@ -945,7 +1302,12 @@ mod tests {
         }];
 
         assert_eq!(
-            evaluate(&empty_project(), &changes, &Config::default()),
+            evaluate(
+                &empty_project(),
+                &empty_project(),
+                &changes,
+                &Config::default()
+            ),
             Vec::new()
         );
     }
@@ -960,7 +1322,7 @@ mod tests {
     /// struct-evolution Findings, not a guessed one.
     #[test]
     fn no_struct_evolution_finding_fires_when_there_is_no_struct_field_change_to_evaluate() {
-        let findings = evaluate(&empty_project(), &[], &Config::default());
+        let findings = evaluate(&empty_project(), &empty_project(), &[], &Config::default());
         assert!(findings.is_empty());
     }
 
@@ -1006,7 +1368,12 @@ mod tests {
             },
         ];
 
-        let findings = evaluate(&empty_project(), &changes, &Config::default());
+        let findings = evaluate(
+            &empty_project(),
+            &empty_project(),
+            &changes,
+            &Config::default(),
+        );
         assert_eq!(findings.len(), 3);
 
         let rules: Vec<RuleId> = findings.iter().map(|f| f.detail.rule()).collect();

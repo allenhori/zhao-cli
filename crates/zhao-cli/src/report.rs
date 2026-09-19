@@ -86,8 +86,10 @@ impl Report {
         }
     }
 
-    /// The exact set of Nodes named in the Downstream impact section --
-    /// every non-`pass` Finding's [`FindingJson::impacted_node`],
+    /// The exact set of Nodes to rebuild for this change: every changed Node
+    /// (a Node whose own definition was edited has to be rebuilt whatever its
+    /// Findings say), followed by the Nodes named in the Downstream impact
+    /// section -- every non-`pass` Finding's [`FindingJson::impacted_node`] --
     /// deduplicated, in first-seen order. Shared by
     /// [`Report::with_impacted_models`] and [`Report::with_defer_plan`],
     /// which both need precisely this set: the former to name it in the
@@ -96,6 +98,14 @@ impl Report {
     fn impacted_node_ids(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut node_ids = Vec::new();
+        // Every changed Node comes first: its own definition was edited, so it
+        // has to be rebuilt no matter what the Rules made of the change.
+        for change in &self.changes {
+            let node_id = change.node().to_string();
+            if seen.insert(node_id.clone()) {
+                node_ids.push(node_id);
+            }
+        }
         for finding in &self.findings {
             if finding.severity() == SeverityJson::Pass {
                 continue;
@@ -448,6 +458,13 @@ pub enum ChangeJson {
         from_type: String,
         to_type: String,
     },
+    /// See [`Change::ColumnExpressionChanged`].
+    ColumnExpressionChanged {
+        node: String,
+        column: String,
+        from_expression: Option<String>,
+        to_expression: Option<String>,
+    },
     /// See [`Change::JoinChanged`].
     JoinChanged {
         node: String,
@@ -487,7 +504,8 @@ impl ChangeJson {
             | ChangeJson::JoinChanged { node, .. }
             | ChangeJson::StructFieldAdded { node, .. }
             | ChangeJson::StructFieldRemoved { node, .. }
-            | ChangeJson::StructFieldTypeChanged { node, .. } => node,
+            | ChangeJson::StructFieldTypeChanged { node, .. }
+            | ChangeJson::ColumnExpressionChanged { node, .. } => node,
         }
     }
 
@@ -497,6 +515,9 @@ impl ChangeJson {
         match self {
             ChangeJson::ColumnAdded { column, .. } => format!("+ column added: {column}"),
             ChangeJson::ColumnRemoved { column, .. } => format!("- column removed: {column}"),
+            ChangeJson::ColumnExpressionChanged { column, .. } => {
+                format!("~ column expression changed: {column}")
+            }
             ChangeJson::ColumnTypeChanged {
                 column,
                 from_type,
@@ -560,6 +581,17 @@ impl From<&Change> for ChangeJson {
                 column: column.to_string(),
                 from_type: from_type.clone(),
                 to_type: to_type.clone(),
+            },
+            Change::ColumnExpressionChanged {
+                node,
+                column,
+                from_expression,
+                to_expression,
+            } => ChangeJson::ColumnExpressionChanged {
+                node: node.to_string(),
+                column: column.to_string(),
+                from_expression: from_expression.clone(),
+                to_expression: to_expression.clone(),
             },
             Change::JoinChanged {
                 node,
@@ -669,6 +701,14 @@ pub enum FindingJson {
         node: String,
         column: String,
     },
+    /// See [`FindingDetail::ColumnExpressionChanged`].
+    ColumnExpressionChanged {
+        severity: SeverityJson,
+        node: String,
+        column: String,
+        reached: String,
+        reached_column: String,
+    },
     /// See [`FindingDetail::StructFieldRemoved`].
     StructFieldRemoved {
         severity: SeverityJson,
@@ -701,6 +741,7 @@ impl FindingJson {
             | FindingJson::ColumnTypeNarrowed { severity, .. }
             | FindingJson::JoinCardinalityLoosened { severity, .. }
             | FindingJson::ColumnAdded { severity, .. }
+            | FindingJson::ColumnExpressionChanged { severity, .. }
             | FindingJson::StructFieldRemoved { severity, .. }
             | FindingJson::StructFieldAdded { severity, .. }
             | FindingJson::StructFieldTypeNarrowed { severity, .. } => *severity,
@@ -721,6 +762,7 @@ impl FindingJson {
             FindingJson::ColumnTypeNarrowed { .. } => "column-type-narrowed",
             FindingJson::JoinCardinalityLoosened { .. } => "join-cardinality-loosened",
             FindingJson::ColumnAdded { .. } => "column-added",
+            FindingJson::ColumnExpressionChanged { .. } => "column-expression-changed",
             FindingJson::StructFieldRemoved { .. } => "struct-field-removed",
             FindingJson::StructFieldAdded { .. } => "struct-field-added",
             FindingJson::StructFieldTypeNarrowed { .. } => "struct-field-type-narrowed",
@@ -735,7 +777,8 @@ impl FindingJson {
     /// changed Node's own behavior rather than tracing further downstream.
     fn impacted_node(&self) -> &str {
         match self {
-            FindingJson::ColumnRemovedWithActiveReferences { reached, .. } => reached,
+            FindingJson::ColumnRemovedWithActiveReferences { reached, .. }
+            | FindingJson::ColumnExpressionChanged { reached, .. } => reached,
             FindingJson::ColumnTypeNarrowed { node, .. }
             | FindingJson::JoinCardinalityLoosened { node, .. }
             | FindingJson::ColumnAdded { node, .. }
@@ -785,6 +828,18 @@ impl From<&Finding> for FindingJson {
                 position: *position,
                 from_kind: join_kind_slug(*from_kind),
                 to_kind: join_kind_slug(*to_kind),
+            },
+            FindingDetail::ColumnExpressionChanged {
+                node,
+                column,
+                reached,
+                reached_column,
+            } => FindingJson::ColumnExpressionChanged {
+                severity,
+                node: node.to_string(),
+                column: column.to_string(),
+                reached: reached.to_string(),
+                reached_column: reached_column.to_string(),
             },
             FindingDetail::ColumnAdded { node, column } => FindingJson::ColumnAdded {
                 severity,
@@ -1070,6 +1125,21 @@ fn describe_impact(finding: &FindingJson, node_term: &str) -> String {
         FindingJson::ColumnAdded { column, .. } => {
             format!("{column} added")
         }
+        FindingJson::ColumnExpressionChanged {
+            node,
+            column,
+            reached,
+            reached_column,
+            ..
+        } => {
+            if node == reached {
+                format!("expression of {column} changed")
+            } else {
+                format!(
+                    "{reached_column} derives from {column}, whose expression changed in {node_term} {node}"
+                )
+            }
+        }
         FindingJson::StructFieldRemoved { column, field, .. } => {
             format!("{field} removed from struct column {column}")
         }
@@ -1113,6 +1183,15 @@ mod tests {
                     column: zhao_core::model::ColumnName::new("amount"),
                     from_type: "bigint".to_string(),
                     to_type: "int".to_string(),
+                },
+            },
+            Finding {
+                severity: Severity::Warn,
+                detail: FindingDetail::ColumnExpressionChanged {
+                    node: node.clone(),
+                    column: zhao_core::model::ColumnName::new("amount"),
+                    reached: NodeId::new("model.b"),
+                    reached_column: zhao_core::model::ColumnName::new("total"),
                 },
             },
             Finding {
@@ -1433,6 +1512,79 @@ mod tests {
         }];
         let report = Report::new(&[], &findings).with_impacted_models(&DbtVocabulary);
         assert_eq!(report.impacted_models, Vec::<String>::new());
+    }
+
+    /// A changed model is part of the set to rebuild even when every Finding on
+    /// it is pass-severity (a column added), and it comes before whatever sits
+    /// downstream of it, each model listed once.
+    #[test]
+    fn impacted_models_lists_changed_models_first_then_downstream_readers() {
+        let changes = vec![
+            Change::ColumnAdded {
+                node: NodeId::new("model.zhao_dbt_test.stg_customers"),
+                column: zhao_core::model::ColumnName::new("new_col"),
+            },
+            Change::ColumnExpressionChanged {
+                node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                column: zhao_core::model::ColumnName::new("total"),
+                from_expression: Some("a + 1".to_string()),
+                to_expression: Some("a + 2".to_string()),
+            },
+        ];
+        let findings = vec![
+            Finding {
+                severity: Severity::Warn,
+                detail: FindingDetail::ColumnExpressionChanged {
+                    node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                    column: zhao_core::model::ColumnName::new("total"),
+                    reached: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                    reached_column: zhao_core::model::ColumnName::new("total"),
+                },
+            },
+            Finding {
+                severity: Severity::Warn,
+                detail: FindingDetail::ColumnExpressionChanged {
+                    node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                    column: zhao_core::model::ColumnName::new("total"),
+                    reached: NodeId::new("model.zhao_dbt_test.fct_orders"),
+                    reached_column: zhao_core::model::ColumnName::new("amount"),
+                },
+            },
+        ];
+        let report = Report::new(&changes, &findings).with_impacted_models(&DbtVocabulary);
+        assert_eq!(
+            report.impacted_models,
+            vec!["stg_customers", "dim_customers", "fct_orders"]
+        );
+    }
+
+    #[test]
+    fn render_text_describes_a_column_expression_change_and_what_it_reaches() {
+        let changes = vec![Change::ColumnExpressionChanged {
+            node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+            column: zhao_core::model::ColumnName::new("total"),
+            from_expression: Some("a + 1".to_string()),
+            to_expression: Some("a + 2".to_string()),
+        }];
+        let findings = vec![Finding {
+            severity: Severity::Warn,
+            detail: FindingDetail::ColumnExpressionChanged {
+                node: NodeId::new("model.zhao_dbt_test.dim_customers"),
+                column: zhao_core::model::ColumnName::new("total"),
+                reached: NodeId::new("model.zhao_dbt_test.fct_orders"),
+                reached_column: zhao_core::model::ColumnName::new("amount"),
+            },
+        }];
+        let text = render_text(&Report::new(&changes, &findings), &DbtVocabulary, false);
+        assert!(
+            text.contains("~ column expression changed: total"),
+            "{text}"
+        );
+        assert!(
+            text.contains("amount derives from total, whose expression changed"),
+            "{text}"
+        );
+        assert!(text.contains("(column-expression-changed)"), "{text}");
     }
 
     /// `render_text` appends the impacted-models line as a final line when

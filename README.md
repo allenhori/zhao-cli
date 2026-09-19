@@ -33,8 +33,11 @@ reliably does across a DAG of any real size.
 
 zhao parses the SQL itself and computes *real* column-level lineage between two states of
 your project, classifies each change against a fixed Rule catalog (column removed with an
-active reference, type narrowed, join loosened, column added), and reports the exact models
-each change actually reaches — never the whole DAG, never a guess. The analysis itself is
+active reference, a column's logic changed, type narrowed, join loosened, column added), and
+reports the exact models each change actually reaches — never the whole DAG, never a guess.
+Change one column's logic and only the models that read that column, directly or through a
+column derived from it, are reported; a model that merely sits downstream of the same parent
+but reads other columns is not. The analysis itself is
 entirely local: no LLM, no account, and it never reads or sends your actual data — nothing
 installed in your warehouse beyond what `dbt run` already needs. The one place a network call
 happens is resolving a git-native Baseline (`dbt compile`/`dbt deps`, the same as running

@@ -113,7 +113,7 @@ pub(crate) fn build_report(args: &CheckArgs) -> Result<EngineOutput, String> {
         .map_err(|err| format!("{}: {err}", current_manifest.display()))?;
 
     let changes = diff(&baseline, &current);
-    let findings = evaluate(&baseline, &changes, &config);
+    let findings = evaluate(&baseline, &current, &changes, &config);
     let defer_settings = DeferSettings {
         target: args
             .defer_target
