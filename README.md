@@ -46,16 +46,37 @@ for a genuinely zero-network-call run.
 
 ## Install
 
+**macOS / Linux** — [Homebrew](https://brew.sh):
+
+```bash
+brew install allenhori/zhao/zhao
+```
+
+**Windows** — [Scoop](https://scoop.sh):
+
+```powershell
+scoop bucket add zhao https://github.com/allenhori/zhao-scoop
+scoop install zhao
+```
+
+**Any platform** — the install script:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/allenhori/zhao-cli/master/scripts/install.sh | sh
 ```
 
 Downloads the right pre-built binary for your platform from the
 [releases page](https://github.com/allenhori/zhao-cli/releases) — no Rust toolchain needed.
-Windows: grab `zhao-x86_64-pc-windows-msvc.zip` from the same page. Rust users:
+Windows without Scoop: grab `zhao-x86_64-pc-windows-msvc.zip` from the same page. Rust users:
 `cargo install zhao-cli` (via [crates.io](https://crates.io/crates/zhao-cli)), or
 `cargo install --git https://github.com/allenhori/zhao-cli` to build directly off `master`
 instead of the last tagged release.
+
+**Updating:** use the same tool you installed with — `brew upgrade zhao`, `scoop update zhao`,
+or `zhao update` for the install script / a manual download. `zhao update` detects a
+Homebrew- or Scoop-managed install and points you at the right command instead of touching the
+binary. Homebrew and Scoop only carry stable releases; the nightly build is install-script
+only.
 
 Two release channels: a tagged **stable** release (`v0.1.0`, ...) for anything you depend
 on, and a rolling **nightly** build off `master`, always available at the
@@ -82,7 +103,7 @@ fired. Full walkthrough: **[Getting started](docs/getting-started.md)**.
 | `zhao check` | The CI gate — diffs against a Baseline, fails on a breaking change. |
 | `zhao diff` | Same engine, always exits `0` — for local inspection during development. |
 | `zhao lineage` | What's upstream/downstream of a model or column, right now (no diff, no git). |
-| `zhao update` | Replaces the current binary with a release from GitHub Releases. The only command that reaches the network at all — and only to download the binary itself, never to send anything from your project. See [What it doesn't do](#what-it-doesnt-do). |
+| `zhao update` | Replaces the current binary with a release from GitHub Releases (for Homebrew/Scoop installs it tells you to use `brew upgrade zhao` / `scoop update zhao` instead). The only command that reaches the network at all — and only to download the binary itself, never to send anything from your project. See [What it doesn't do](#what-it-doesnt-do). |
 
 Full flag reference: **[docs/commands.md](docs/commands.md)**.
 

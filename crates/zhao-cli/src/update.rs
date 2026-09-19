@@ -26,8 +26,77 @@ const REPO: &str = "allenhori/zhao-cli";
 /// Exit code for "the binary was actually replaced."
 const EXIT_OK: u8 = 0;
 
+/// A package manager that owns the running binary and expects to be
+/// the only thing that updates it.
+#[derive(Debug, PartialEq, Eq)]
+enum PackageManager {
+    Homebrew,
+    Scoop,
+}
+
+impl PackageManager {
+    /// The command a user should run instead of `zhao update`.
+    fn upgrade_command(&self) -> &'static str {
+        match self {
+            PackageManager::Homebrew => "brew upgrade zhao",
+            PackageManager::Scoop => "scoop update zhao",
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            PackageManager::Homebrew => "Homebrew",
+            PackageManager::Scoop => "Scoop",
+        }
+    }
+}
+
+/// Detects whether `exe` lives inside a package manager's own install
+/// tree, from its (symlink-resolved) path alone: Homebrew keeps every
+/// formula under a `Cellar` directory (`/opt/homebrew/Cellar/zhao/...`,
+/// `/usr/local/Cellar/...`, `/home/linuxbrew/.linuxbrew/Cellar/...`),
+/// and Scoop keeps apps under `<scoop root>/apps/`. Overwriting a binary in
+/// either tree behind the manager's back leaves its own bookkeeping
+/// (versions, checksums, `cleanup`) out of sync with what's on disk.
+fn detect_package_manager(exe: &Path) -> Option<PackageManager> {
+    let parts: Vec<String> = exe
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    if parts.iter().any(|p| p == "cellar") {
+        return Some(PackageManager::Homebrew);
+    }
+    if parts.windows(2).any(|w| w[0] == "scoop" && w[1] == "apps") {
+        return Some(PackageManager::Scoop);
+    }
+    // Scoop's root can be relocated (`SCOOP` / `SCOOP_GLOBAL`), in which
+    // case the directory isn't necessarily named "scoop".
+    for var in ["SCOOP", "SCOOP_GLOBAL"] {
+        if let Some(root) = std::env::var_os(var) {
+            if !root.is_empty() && exe.starts_with(Path::new(&root).join("apps")) {
+                return Some(PackageManager::Scoop);
+            }
+        }
+    }
+    None
+}
+
 /// Runs `zhao update` and returns the process exit code.
 pub fn run(args: &UpdateArgs) -> ExitCode {
+    // `current_exe` alone isn't enough: Homebrew's `bin/zhao` is a
+    // symlink into the Cellar, so resolve it before looking at the path.
+    if let Ok(exe) = std::env::current_exe() {
+        let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
+        if let Some(manager) = detect_package_manager(&resolved) {
+            return crate::engine::fail(&format!(
+                "zhao was installed by {}, which manages its updates -- run `{}` instead of \
+                 `zhao update`",
+                manager.name(),
+                manager.upgrade_command()
+            ));
+        }
+    }
+
     let tag = if args.nightly {
         "nightly".to_string()
     } else if let Some(version) = &args.version {
@@ -361,6 +430,40 @@ fn write_new_binary_to_temp_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_homebrew_installs_by_cellar_path() {
+        for path in [
+            "/opt/homebrew/Cellar/zhao/0.5.2/bin/zhao",
+            "/usr/local/Cellar/zhao/0.5.2/bin/zhao",
+            "/home/linuxbrew/.linuxbrew/Cellar/zhao/0.5.2/bin/zhao",
+        ] {
+            assert_eq!(
+                detect_package_manager(Path::new(path)),
+                Some(PackageManager::Homebrew),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_scoop_installs_by_apps_path() {
+        assert_eq!(
+            detect_package_manager(Path::new("/Users/me/scoop/apps/zhao/current/zhao.exe")),
+            Some(PackageManager::Scoop)
+        );
+    }
+
+    #[test]
+    fn does_not_flag_ordinary_install_locations() {
+        for path in [
+            "/usr/local/bin/zhao",
+            "/Users/me/.cargo/bin/zhao",
+            "/Users/me/.local/bin/zhao",
+        ] {
+            assert_eq!(detect_package_manager(Path::new(path)), None, "{path}");
+        }
+    }
 
     #[test]
     fn download_url_for_latest_uses_the_latest_download_alias() {

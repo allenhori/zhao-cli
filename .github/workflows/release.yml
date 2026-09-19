@@ -184,3 +184,58 @@ jobs:
           make_latest: ${{ steps.channel.outputs.prerelease == 'false' }}
           body: ${{ steps.channel.outputs.prerelease == 'true' && 'Automated build from the latest `master` -- not a stable release. May be broken; use a `v*` tag for anything you depend on.' || '' }}
           files: dist/*
+
+  # Keeps the Homebrew tap and Scoop bucket in step with every stable
+  # release -- and only stable ones: both package managers version by
+  # release, so a moving nightly has no place in them. Renders the
+  # formula/manifest from this run's own archives (sha256 computed, never
+  # hand-edited) and pushes them to their repos. Runs after `publish` so
+  # the archives the formula points at already exist as a release.
+  #
+  # Needs a `PACKAGES_TOKEN` repo secret: a fine-grained PAT with
+  # Contents: read/write on allenhori/homebrew-zhao and
+  # allenhori/zhao-scoop (the default GITHUB_TOKEN can't push to other
+  # repos).
+  update-packages:
+    name: Update Homebrew tap and Scoop bucket
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Render formula and manifest
+        run: scripts/render-packages.sh "${GITHUB_REF_NAME#v}" dist packages
+
+      - name: Push to the tap and bucket
+        env:
+          PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          if [ -z "$PACKAGES_TOKEN" ]; then
+            echo "::error::PACKAGES_TOKEN secret is not set -- see the comment above this job"
+            exit 1
+          fi
+          push() {
+            local repo="$1" src="$2" dest="$3"
+            git clone --depth 1 "https://x-access-token:${PACKAGES_TOKEN}@github.com/allenhori/${repo}.git" "work/${repo}"
+            mkdir -p "work/${repo}/$(dirname "$dest")"
+            cp "$src" "work/${repo}/${dest}"
+            cd "work/${repo}"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$dest"
+            if git diff --cached --quiet; then
+              echo "${repo}: already up to date"
+            else
+              git commit -m "zhao ${GITHUB_REF_NAME}"
+              git push
+            fi
+            cd - >/dev/null
+          }
+          push homebrew-zhao packages/zhao.rb Formula/zhao.rb
+          push zhao-scoop packages/zhao.json bucket/zhao.json
