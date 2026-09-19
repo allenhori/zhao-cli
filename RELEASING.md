@@ -52,6 +52,10 @@ safety.
    [the Actions run](https://github.com/allenhori/zhao-cli/actions/workflows/release.yml) and
    the [resulting release](https://github.com/allenhori/zhao-cli/releases) once it finishes.
 
+Every release (stable and nightly) also carries a `SHA256SUMS` asset listing the SHA-256 of each
+archive. To verify a download: `sha256sum -c SHA256SUMS --ignore-missing` (Linux) or
+`shasum -a 256 -c SHA256SUMS --ignore-missing` (macOS), run next to the archive you downloaded.
+
 Since `master` now requires `ci.yml`'s checks and a PR review before anything merges (see
 [Branch protection](#branch-protection) below), every commit that could ever become a tagged
 release was already vetted before it landed -- there's no separate green-check judgment call

@@ -134,6 +134,14 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # One `SHA256SUMS` file covering every archive in the release, in the
+      # standard `sha256sum` format so `sha256sum -c SHA256SUMS` (or
+      # `shasum -a 256 -c` on macOS) verifies a download. Package managers
+      # (Homebrew, winget, Scoop) pin these same hashes.
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: sha256sum zhao-* > SHA256SUMS
+
       - name: Determine release channel (stable)
         id: stable
         if: startsWith(github.ref, 'refs/tags/v')
