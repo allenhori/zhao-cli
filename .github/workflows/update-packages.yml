@@ -74,5 +74,5 @@ jobs:
             fi
             cd - >/dev/null
           }
-          push homebrew-zhao packages/zhao.rb Formula/zhao.rb
-          push zhao-scoop packages/zhao.json bucket/zhao.json
+          push homebrew-zhao packages/zhao-cli.rb Formula/zhao-cli.rb
+          push zhao-scoop packages/zhao-cli.json bucket/zhao-cli.json

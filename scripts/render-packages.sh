@@ -7,8 +7,8 @@
 #
 # <version> has no leading "v" (e.g. 0.5.3). <archive-dir> holds the four
 # zhao-<target>.{tar.gz,zip} archives release.yml builds. Writes
-# <out-dir>/zhao.rb (for allenhori/homebrew-zhao's Formula/) and
-# <out-dir>/zhao.json (for allenhori/zhao-scoop's bucket/).
+# <out-dir>/zhao-cli.rb (for allenhori/homebrew-zhao's Formula/) and
+# <out-dir>/zhao-cli.json (for allenhori/zhao-scoop's bucket/).
 set -euo pipefail
 
 version="${1:?usage: render-packages.sh <version> <archive-dir> <out-dir>}"
@@ -37,8 +37,8 @@ win_x64="zhao-x86_64-pc-windows-msvc.zip"
 
 mkdir -p "$out"
 
-cat > "$out/zhao.rb" <<RUBY
-class Zhao < Formula
+cat > "$out/zhao-cli.rb" <<RUBY
+class ZhaoCli < Formula
   desc "${brew_desc}"
   homepage "https://github.com/${repo}"
   license "Apache-2.0"
@@ -71,7 +71,7 @@ class Zhao < Formula
 end
 RUBY
 
-cat > "$out/zhao.json" <<JSON
+cat > "$out/zhao-cli.json" <<JSON
 {
     "version": "${version}",
     "description": "${desc}",

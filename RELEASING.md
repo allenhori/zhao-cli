@@ -53,8 +53,8 @@ safety.
    the [resulting release](https://github.com/allenhori/zhao-cli/releases) once it finishes.
 
 5. On a stable tag, `release.yml`'s `update-packages` job (`update-packages.yml`, also runnable by hand for any existing tag) then regenerates the Homebrew formula
-   (`allenhori/homebrew-zhao`, `Formula/zhao.rb`) and Scoop manifest (`allenhori/zhao-scoop`,
-   `bucket/zhao.json`) from the release's archives via `scripts/render-packages.sh` and pushes
+   (`allenhori/homebrew-zhao`, `Formula/zhao-cli.rb`) and Scoop manifest (`allenhori/zhao-scoop`,
+   `bucket/zhao-cli.json`) from the release's archives via `scripts/render-packages.sh` and pushes
    them. Nightly builds never touch either. It needs a `PACKAGES_TOKEN` repo secret -- a
    fine-grained PAT with Contents read/write on those two repos -- and fails with a clear error
    if it is missing (the GitHub Release itself is unaffected).
