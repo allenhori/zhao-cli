@@ -15,6 +15,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
 
+  # `build.rs` embeds the icon and version metadata into zhao.exe, which
+  # only happens on a Windows host -- so nothing else in this workflow
+  # exercises it. Build the release binary and check the resources landed.
+  windows-build:
+    name: Windows build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p zhao-cli
+      - name: Check the embedded Windows resources
+        shell: pwsh
+        run: |
+          $info = (Get-Item target/release/zhao.exe).VersionInfo
+          if (-not $info.FileDescription) { throw "zhao.exe has no embedded version resource" }
+          $info | Format-List FileDescription, ProductVersion
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
