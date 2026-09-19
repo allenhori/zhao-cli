@@ -17,6 +17,7 @@ out="${3:?missing <out-dir>}"
 
 repo="allenhori/zhao-cli"
 desc="Deterministic, offline change-review and CI gate for data transformation projects."
+brew_desc="Offline, deterministic breaking-change gate for dbt projects"
 base="https://github.com/${repo}/releases/download/v${version}"
 
 sha() {
@@ -38,9 +39,8 @@ mkdir -p "$out"
 
 cat > "$out/zhao.rb" <<RUBY
 class Zhao < Formula
-  desc "${desc}"
+  desc "${brew_desc}"
   homepage "https://github.com/${repo}"
-  version "${version}"
   license "Apache-2.0"
 
   on_macos do
