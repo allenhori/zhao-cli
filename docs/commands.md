@@ -36,7 +36,7 @@ not found, ...).
 ### Report sections (text output)
 
 1. **Changed** — every model that actually changed, with the precise change (column
-   added/removed/type-changed, join altered).
+   added/removed/type-changed, column expression changed, join altered).
 2. **Downstream impact** — every model actually *reached* by a change (never the whole
    downstream cone), each labeled `[BREAKING]` or `[WARN]` with the specific reference and
    the Rule that fired.
@@ -45,7 +45,15 @@ not found, ...).
    `Recommended command:` line (see [Configuring
    `recommended-command`](configuration.md#recommended-command)).
 
-`Impacted models` is deliberately just the list of model names, not a constructed command —
+`Impacted models` is the complete set of models to rebuild for the change: every model that
+itself changed, first, followed by every model a finding reaches downstream of it,
+de-duplicated. Build from this list (or, in `--format json`, the `impacted_models` array) to
+verify a change — it is the right field to use, and it includes the models you edited, not only
+what sits downstream of them. A change with no downstream impact, such as a column added to a
+model nothing reads yet, still lists that model, since it has to be rebuilt for the change to
+take effect. The defer plan's `build` list is the same set.
+
+It is deliberately just the list of model names, not a constructed command —
 zhao has no way to know whether your CI actually invokes `dbt build`, `dbt run`, or a custom
 wrapper, so it never assumes one *unless you tell it to* via
 [`recommended-command.subcommand`](configuration.md#recommended-command), which turns this
@@ -54,6 +62,11 @@ command from the list instead, e.g. `dbt build --select $(echo "$names" | tr ','
 (more robustly, avoiding any shell word-splitting concerns) pull the same list straight from
 `--format json`'s `impacted_models` array — a real JSON array of strings, ready for a script
 to consume directly without any text-parsing at all.
+
+```bash
+zhao diff --state baseline/manifest.json --format json > plan.json
+dbt build --select $(jq -r '.impacted_models | join(" ")' plan.json)
+```
 
 A **Schema evolution** section appears whenever a schema-changing change (column
 added/removed/type-changed) lands on a model materialized `incremental` — phrased

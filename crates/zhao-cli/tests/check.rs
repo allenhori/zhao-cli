@@ -518,12 +518,12 @@ fn recommended_command_is_absent_from_json_when_not_configured() {
         .stdout(predicate::str::contains("\"recommended_command\"").not());
 }
 
-/// Acceptance criterion 2: a run with zero impacted Nodes still surfaces
-/// `impacted_models`, but empty -- covers both "zero Changes at all" and
-/// "a Change exists but its only Finding is pass-severity" (not
-/// Downstream impact).
+/// A run with zero Changes surfaces `impacted_models`, but empty. A run whose
+/// only Change is pass-severity (a column added) still lists the changed
+/// model itself, since it has to be rebuilt for the new column to exist, but
+/// nothing downstream of it.
 #[test]
-fn impacted_models_is_empty_when_nothing_is_impactful() {
+fn impacted_models_is_empty_with_no_changes_and_names_only_the_changed_model_for_a_pass_change() {
     Command::cargo_bin("zhao")
         .expect("binary should build")
         .arg("check")
@@ -548,7 +548,9 @@ fn impacted_models_is_empty_when_nothing_is_impactful() {
         .arg("json")
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("\"impacted_models\": []"));
+        .stdout(predicate::str::contains(
+            "\"impacted_models\": [\n    \"stg_orders\"\n  ]",
+        ));
 }
 
 /// Acceptance criterion 1: given a fixture project and a Change reaching a

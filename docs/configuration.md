@@ -17,7 +17,8 @@ not shown in Downstream impact unless something else made the model impactful):
 
 | Rule (`zhao.yml` name) | Default severity | Fires when |
 |---|---|---|
-| `column-removed-with-active-references` | `error` | A column was removed while a downstream model still actively references it (the Baseline shows a real column-level edge into it). |
+| `column-removed-with-active-references` | `error` | A column was removed while a downstream model still actively references it — the Baseline shows a real column-level edge into it, and the model either still reads the removed column now or has lost the output column it fed. A model already migrated off the column in the same change (a rename with its readers updated) is not reported. |
+| `column-expression-changed` | `warn` | A column's defining expression changed (its logic differs) while its name and documented type didn't — e.g. `x` → `x * 1.1`, or a new `CASE` branch. Nothing breaks, but the column's data, and the data of every column derived from it, changes. Reaches exactly the models that read the column in the current state, directly or through a derived column, transitively. Whitespace, comment, and capitalisation-only edits never fire it. Raise it to `error` to gate on it; under `preset: lenient` it becomes `pass`, so it stops naming downstream models (the changed model itself is still listed). |
 | `column-type-narrowed` | `warn` | A column's documented type narrowed (e.g. `bigint` → `int`) — silent truncation risk. |
 | `join-cardinality-loosened` | `warn` | A join's cardinality loosened (`INNER` → `LEFT`/`FULL`) — potential row-count/duplication regression. |
 | `column-added` | `pass` | A column was added. Informational by default — nothing downstream could already depend on a column that didn't exist. |

@@ -3398,8 +3398,12 @@ mod tests {
         let current = build_parsed_project(&current_manifest, &CatalogSchemas::new());
 
         let changes = crate::diff::diff(&baseline, &current);
-        let findings =
-            crate::rules::evaluate(&baseline, &changes, &crate::config::Config::default());
+        let findings = crate::rules::evaluate(
+            &baseline,
+            &current,
+            &changes,
+            &crate::config::Config::default(),
+        );
 
         let node_id = NodeId::new("model.p.m");
         let expected = crate::rules::Finding {
