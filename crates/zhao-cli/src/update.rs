@@ -14,7 +14,7 @@
 //! to that exact release.
 
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use crate::cli::UpdateArgs;
@@ -37,13 +37,7 @@ pub fn run(args: &UpdateArgs) -> ExitCode {
     };
 
     match update(&tag) {
-        Ok(installed_path) => {
-            println!(
-                "Updated {} to {tag} -- run `zhao --version` to confirm.",
-                installed_path.display()
-            );
-            ExitCode::from(EXIT_OK)
-        }
+        Ok(()) => ExitCode::from(EXIT_OK),
         Err(message) => crate::engine::fail(&message),
     }
 }
@@ -54,10 +48,30 @@ pub fn run(args: &UpdateArgs) -> ExitCode {
 /// place: every failure before the final rename leaves the existing
 /// binary completely untouched, and the rename itself is the one
 /// operation that actually swaps it in.
-fn update(tag: &str) -> Result<PathBuf, String> {
+fn update(tag: &str) -> Result<(), String> {
+    let current_exe = std::env::current_exe()
+        .map_err(|err| format!("could not determine the current executable's path: {err}"))?;
+    let installed_version = env!("CARGO_PKG_VERSION");
+
+    log(&format!("Current exe at {}", current_exe.display()));
     let target = platform_target()?;
+    log(&format!("Target: {target}"));
+
+    log("Checking for the requested version");
+    let resolved = resolve_version(tag);
+    match &resolved {
+        Some(version) if tag == "latest" => log(&format!(
+            "Latest available version: {}",
+            version.trim_start_matches('v')
+        )),
+        Some(version) => log(&format!("Requested version: {version}")),
+        None => log(&format!("Requested version: {tag}")),
+    }
+    log(&format!("Current installed version: {installed_version}"));
+
     let archive_name = archive_name(&target);
     let url = download_url(tag, &archive_name);
+    log(&format!("Downloading: {url}"));
 
     let archive_bytes = download(&url).map_err(|err| {
         format!(
@@ -67,12 +81,43 @@ fn update(tag: &str) -> Result<PathBuf, String> {
     })?;
 
     let binary_bytes = extract_binary(&archive_bytes, &target)?;
-
-    let current_exe = std::env::current_exe()
-        .map_err(|err| format!("could not determine the current executable's path: {err}"))?;
+    log(&format!("Installing zhao to {}", current_exe.display()));
     replace_binary(&current_exe, &binary_bytes)?;
 
-    Ok(current_exe)
+    let new_version = resolved.as_deref().unwrap_or(tag);
+    log(&format!(
+        "Successfully updated zhao from {installed_version} to {}",
+        new_version.trim_start_matches('v')
+    ));
+    Ok(())
+}
+
+/// One progress line, prefixed the way `dbt system update` prefixes its
+/// own installer's output so it's obvious which tool is talking.
+fn log(message: &str) {
+    println!("zhao update: {message}");
+}
+
+/// Best-effort lookup of the concrete version `tag` points at, purely
+/// for display. `latest` follows GitHub's `/releases/latest` redirect to
+/// its `/releases/tag/<tag>` URL; any other tag is already concrete. A
+/// failed lookup returns `None` rather than an error -- the download
+/// itself is what decides success, this only makes the output nicer.
+fn resolve_version(tag: &str) -> Option<String> {
+    if tag != "latest" {
+        return Some(tag.to_string());
+    }
+    let response = ureq::head(&format!("https://github.com/{REPO}/releases/latest"))
+        .call()
+        .ok()?;
+    tag_from_release_url(response.get_url())
+}
+
+/// Extracts `<tag>` from a `.../releases/tag/<tag>` URL.
+fn tag_from_release_url(url: &str) -> Option<String> {
+    url.rsplit_once("/releases/tag/")
+        .map(|(_, tag)| tag.trim_end_matches('/').to_string())
+        .filter(|tag| !tag.is_empty())
 }
 
 /// The four target triples zhao actually publishes release binaries
@@ -341,6 +386,18 @@ mod tests {
             download_url("nightly", "zhao-x86_64-unknown-linux-gnu.tar.gz"),
             "https://github.com/allenhori/zhao-cli/releases/download/nightly/\
              zhao-x86_64-unknown-linux-gnu.tar.gz"
+        );
+    }
+
+    #[test]
+    fn tag_from_release_url_extracts_the_tag() {
+        assert_eq!(
+            tag_from_release_url("https://github.com/allenhori/zhao-cli/releases/tag/v0.5.2"),
+            Some("v0.5.2".to_string())
+        );
+        assert_eq!(
+            tag_from_release_url("https://github.com/allenhori/zhao-cli/releases"),
+            None
         );
     }
 
