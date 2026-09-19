@@ -70,6 +70,7 @@ jobs:
               echo "${repo}: already up to date"
             else
               git commit -m "zhao ${TAG}"
+              git pull --rebase -q origin main
               git push
             fi
             cd - >/dev/null
