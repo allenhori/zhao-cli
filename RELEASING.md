@@ -52,7 +52,7 @@ safety.
    [the Actions run](https://github.com/allenhori/zhao-cli/actions/workflows/release.yml) and
    the [resulting release](https://github.com/allenhori/zhao-cli/releases) once it finishes.
 
-5. On a stable tag, `release.yml`'s `update-packages` job then regenerates the Homebrew formula
+5. On a stable tag, `release.yml`'s `update-packages` job (`update-packages.yml`, also runnable by hand for any existing tag) then regenerates the Homebrew formula
    (`allenhori/homebrew-zhao`, `Formula/zhao.rb`) and Scoop manifest (`allenhori/zhao-scoop`,
    `bucket/zhao.json`) from the release's archives via `scripts/render-packages.sh` and pushes
    them. Nightly builds never touch either. It needs a `PACKAGES_TOKEN` repo secret -- a

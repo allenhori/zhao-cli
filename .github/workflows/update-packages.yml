@@ -1,0 +1,78 @@
+name: Update packages
+
+# Renders the Homebrew formula and Scoop manifest for a published release
+# (from that release's own archives -- sha256 computed, never hand-edited)
+# and pushes them to allenhori/homebrew-zhao and allenhori/zhao-scoop.
+#
+# Called by release.yml on every stable tag, and runnable by hand
+# (Actions -> Update packages -> Run workflow) to re-run for any existing
+# release, e.g. if a push failed. Re-running for the current release is a
+# no-op; running it for an older tag rolls the tap/bucket back to it.
+#
+# Needs a `PACKAGES_TOKEN` repo secret: a fine-grained PAT with
+# Contents: read/write on those two repos (the default GITHUB_TOKEN can't
+# push to other repos).
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.5.3
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.5.3
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  update-packages:
+    name: Update Homebrew tap and Scoop bucket
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download the release's archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist --pattern 'zhao-*'
+
+      - name: Render formula and manifest
+        env:
+          TAG: ${{ inputs.tag }}
+        run: scripts/render-packages.sh "${TAG#v}" dist packages
+
+      - name: Push to the tap and bucket
+        env:
+          PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ -z "$PACKAGES_TOKEN" ]; then
+            echo "::error::PACKAGES_TOKEN secret is not set -- see the comment at the top of this workflow"
+            exit 1
+          fi
+          push() {
+            local repo="$1" src="$2" dest="$3"
+            git clone --depth 1 "https://x-access-token:${PACKAGES_TOKEN}@github.com/allenhori/${repo}.git" "work/${repo}"
+            mkdir -p "work/${repo}/$(dirname "$dest")"
+            cp "$src" "work/${repo}/${dest}"
+            cd "work/${repo}"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$dest"
+            if git diff --cached --quiet; then
+              echo "${repo}: already up to date"
+            else
+              git commit -m "zhao ${TAG}"
+              git push
+            fi
+            cd - >/dev/null
+          }
+          push homebrew-zhao packages/zhao.rb Formula/zhao.rb
+          push zhao-scoop packages/zhao.json bucket/zhao.json
