@@ -96,6 +96,11 @@ zhao check --against main
 get a Baseline, diffs it against your current state, and exits non-zero if anything breaking
 fired. Full walkthrough: **[Getting started](docs/getting-started.md)**.
 
+Rather have your coding agent wire it into your CI (GitHub Actions, Buildkite, Jenkins, GitLab,
+...) and `zhao.yml`? Tell it: *"Read
+https://raw.githubusercontent.com/allenhori/zhao-cli/master/docs/ai-setup.md and set up zhao for
+this repository."* See **[Set up with an AI agent](docs/ai-setup.md)**.
+
 ## Commands
 
 | Command | What it does |
@@ -165,6 +170,7 @@ Full example and notes: **[docs/ci-integration.md](docs/ci-integration.md)**.
 ## Documentation
 
 - [Getting started](docs/getting-started.md)
+- [Set up with an AI agent](docs/ai-setup.md) — hand your agent one URL to wire zhao into local dev and CI
 - [Command reference](docs/commands.md)
 - [Configuring `zhao.yml`](docs/configuration.md)
 - [CI integration](docs/ci-integration.md)
