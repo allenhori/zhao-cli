@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/allenhori/zhao-cli/master/docs/assets/logo.png" alt="zhao logo" width="128">
+</p>
+
 # zhao (曌)
 
 [![Crates.io](https://img.shields.io/crates/v/zhao-cli.svg)](https://crates.io/crates/zhao-cli)
