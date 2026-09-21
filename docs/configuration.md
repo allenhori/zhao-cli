@@ -125,6 +125,16 @@ does with any flags placed
 ahead of the subcommand; zhao never interprets them. The CLI `--dbt-command` flag overrides
 this when given; with neither set, zhao falls back to `"dbt"`.
 
+A program path in `zhao.yml` may be **relative**, so a shared config works on every machine and
+checkout: `dbt-command: .venv/bin/dbt` resolves against the directory of the `zhao.yml` that
+set it, not the working directory. With a root `zhao.yml` and project-level overrides, a value
+set at the root stays anchored at the root (even from a nested project whose own `zhao.yml`
+leaves `dbt-command` unset), and a project-local value is anchored at that project. A leading
+`~/` expands to your home directory. Only the first word is treated as a path, and only when it
+contains a `/`; `dbt`, `uv run dbt` and absolute paths behave exactly as before. Write relative
+paths with forward slashes (they work on Windows too). A relative path given on the CLI via
+`--dbt-command` is resolved like any shell argument, against the directory you run `zhao` from.
+
 `dbt-args` (or the CLI's `--dbt-arg`/`--dbt-args`) is separate and additive — extra arguments
 appended *after* the subcommand (`--target`, `--vars`, ...), not part of the command prefix
 itself:

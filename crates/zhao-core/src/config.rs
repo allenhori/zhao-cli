@@ -266,8 +266,14 @@ impl Config {
     /// project isn't inside a git repository), this behaves identically to
     /// [`Config::load`] on `project_dir`'s own `zhao.yml`.
     pub fn load_for_project(project_dir: &Path) -> Result<Config, ConfigError> {
+        // A relative `project_dir` (the CLI's default is `.`) has no
+        // ancestors to walk -- `Path::new(".").parent()` is empty -- so the
+        // search for the repo root, and with it every root-level
+        // `zhao.yml`, would silently never leave the current directory.
+        let project_dir =
+            std::path::absolute(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
         let mut layer = ConfigLayer::default();
-        for dir in ancestor_dirs_from_repo_root(project_dir) {
+        for dir in ancestor_dirs_from_repo_root(&project_dir) {
             layer = ConfigLayer::load(&dir.join("zhao.yml"))?.onto(layer);
         }
         Ok(layer.into_config())
@@ -515,13 +521,70 @@ impl RawConfig {
             against: self.against,
             log_level,
             log_retention_days,
-            dbt_command: self.dbt_command,
+            dbt_command: self.dbt_command.map(|command| {
+                anchor_dbt_command(&command, path.parent().unwrap_or(Path::new(".")))
+            }),
             dbt_args: self.dbt_args,
             tool: self.tool,
             recommended_command_subcommand,
             show_default_limit,
         })
     }
+}
+
+/// Anchors a relative program path in a `zhao.yml`'s `dbt-command` to the
+/// directory containing that file, so a shared config like
+/// `dbt-command: .venv/bin/dbt` works from any checkout and any working
+/// directory. Done while each layer is loaded (where its own directory is
+/// known) because the merged [`Config`] no longer remembers which file a
+/// value came from.
+///
+/// Only the program (first shell word) is touched, and only when it names
+/// a path: it contains a `/`, or starts with `~/`. Bare commands (`dbt`),
+/// wrappers (`uv run dbt`), absolute paths and `~user/...` are left as-is.
+fn anchor_dbt_command(command: &str, config_dir: &Path) -> String {
+    let config_dir = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+
+    // The whole string naming one real file (e.g. a path with spaces) is a
+    // single program, mirroring the dbt adapter's own command splitting.
+    let whole = config_dir.join(command);
+    if command.contains('/') && !Path::new(command).is_absolute() && whole.is_file() {
+        return whole.display().to_string();
+    }
+
+    let Ok(mut words) = shell_words::split(command) else {
+        return command.to_string();
+    };
+    let resolved = words
+        .first()
+        .and_then(|program| resolve_program_path(program, &config_dir));
+    match resolved {
+        Some(path) => {
+            words[0] = path.display().to_string();
+            shell_words::join(&words)
+        }
+        None => command.to_string(),
+    }
+}
+
+/// The absolute path `program` should run as, or `None` when it should be
+/// left alone (see [`anchor_dbt_command`]).
+fn resolve_program_path(program: &str, config_dir: &Path) -> Option<PathBuf> {
+    if let Some(rest) = program.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        return Some(PathBuf::from(home).join(rest));
+    }
+    if program.starts_with('~') || !program.contains('/') || Path::new(program).is_absolute() {
+        return None;
+    }
+    // `./x` and `x` are the same place; skip the no-op `.` segments.
+    let mut resolved = config_dir.to_path_buf();
+    resolved.extend(
+        Path::new(program)
+            .components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir)),
+    );
+    Some(resolved)
 }
 
 /// Everything that can go wrong while reading and parsing `zhao.yml`.
@@ -1029,6 +1092,93 @@ mod tests {
         let config = Config::load_for_project(&repo.project_dir).expect("should parse");
 
         assert_eq!(config.dbt_command(), Some("myshell custom-flag"));
+    }
+
+    #[test]
+    fn relative_program_keeps_its_arguments_and_is_anchored_at_the_declaring_file() {
+        let repo = fake_repo();
+        fs::write(
+            repo.root.join("zhao.yml"),
+            "dbt-command: ./.venv/bin/dbt --flag\n",
+        )
+        .expect("should write root config");
+        fs::write(repo.project_dir.join("zhao.yml"), "preset: strict\n")
+            .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        let expected = format!("{} --flag", repo.root.join(".venv/bin/dbt").display());
+        assert_eq!(config.dbt_command(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn tilde_program_expands_to_the_home_directory() {
+        let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        else {
+            return;
+        };
+        let file = write_temp_yaml("dbt-command: \"~/venvs/dbt/bin/dbt --flag\"\n");
+
+        let config = Config::load(file.path()).expect("should parse");
+
+        let expected = format!(
+            "{} --flag",
+            PathBuf::from(home).join("venvs/dbt/bin/dbt").display()
+        );
+        assert_eq!(config.dbt_command(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn existing_relative_path_containing_spaces_is_kept_as_one_program() {
+        let repo = fake_repo();
+        fs::create_dir_all(repo.root.join("my env/bin")).expect("should create dirs");
+        fs::write(repo.root.join("my env/bin/dbt"), "").expect("should create file");
+        fs::write(repo.root.join("zhao.yml"), "dbt-command: my env/bin/dbt\n")
+            .expect("should write root config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        assert_eq!(
+            config.dbt_command(),
+            Some(repo.root.join("my env/bin/dbt").to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn bare_wrapper_and_absolute_dbt_commands_are_left_untouched() {
+        for command in ["dbt", "uv run dbt", "/opt/venv/bin/dbt --flag"] {
+            let file = write_temp_yaml(&format!("dbt-command: \"{command}\"\n"));
+            let config = Config::load(file.path()).expect("should parse");
+            assert_eq!(config.dbt_command(), Some(command));
+        }
+    }
+
+    #[test]
+    fn project_local_relative_dbt_command_is_anchored_at_the_project_directory() {
+        let repo = fake_repo();
+        fs::write(repo.root.join("zhao.yml"), "dbt-command: .venv/bin/dbt\n")
+            .expect("should write root config");
+        fs::write(
+            repo.project_dir.join("zhao.yml"),
+            "dbt-command: bin/mydbt\n",
+        )
+        .expect("should write project-local config");
+
+        let config = Config::load_for_project(&repo.project_dir).expect("should parse");
+
+        assert_eq!(
+            config.dbt_command(),
+            Some(repo.project_dir.join("bin/mydbt").to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn other_users_tilde_paths_are_left_untouched() {
+        let file = write_temp_yaml("dbt-command: \"~otheruser/bin/dbt\"\n");
+
+        let config = Config::load(file.path()).expect("should parse");
+
+        assert_eq!(config.dbt_command(), Some("~otheruser/bin/dbt"));
     }
 
     #[test]
