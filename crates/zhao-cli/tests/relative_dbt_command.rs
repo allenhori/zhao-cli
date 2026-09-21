@@ -108,3 +108,27 @@ fn a_relative_dbt_command_pointing_nowhere_fails_naming_the_resolved_path() {
         "error should name the resolved path, got: {stderr}"
     );
 }
+
+#[test]
+fn root_level_relative_dbt_command_works_with_the_default_project_dir() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    write_stub(&repo.path().join(".venv/bin/dbt"));
+    std::fs::write(repo.path().join("zhao.yml"), "dbt-command: .venv/bin/dbt\n").unwrap();
+    let project = repo.path().join("analytics/project-a");
+    std::fs::create_dir_all(&project).unwrap();
+    write_dbt_project_marker(&project);
+
+    // No `--project-dir`: the default `.` is a relative path, so the
+    // `zhao.yml` paths that layering reads are relative too.
+    let output = Command::cargo_bin("zhao")
+        .expect("binary should build")
+        .current_dir(&project)
+        .arg("lineage")
+        .arg("--compile")
+        .output()
+        .expect("command should run");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(project.join("stub-ran").exists());
+}

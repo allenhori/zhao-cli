@@ -266,8 +266,14 @@ impl Config {
     /// project isn't inside a git repository), this behaves identically to
     /// [`Config::load`] on `project_dir`'s own `zhao.yml`.
     pub fn load_for_project(project_dir: &Path) -> Result<Config, ConfigError> {
+        // A relative `project_dir` (the CLI's default is `.`) has no
+        // ancestors to walk -- `Path::new(".").parent()` is empty -- so the
+        // search for the repo root, and with it every root-level
+        // `zhao.yml`, would silently never leave the current directory.
+        let project_dir =
+            std::path::absolute(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
         let mut layer = ConfigLayer::default();
-        for dir in ancestor_dirs_from_repo_root(project_dir) {
+        for dir in ancestor_dirs_from_repo_root(&project_dir) {
             layer = ConfigLayer::load(&dir.join("zhao.yml"))?.onto(layer);
         }
         Ok(layer.into_config())
@@ -528,41 +534,57 @@ impl RawConfig {
 
 /// Anchors a relative program path in a `zhao.yml`'s `dbt-command` to the
 /// directory containing that file, so a shared config like
-/// `dbt-command: .venv/bin/dbt` works from any checkout. Done while each
-/// layer is loaded (where its own directory is known) because the merged
-/// [`Config`] no longer remembers which file a value came from.
+/// `dbt-command: .venv/bin/dbt` works from any checkout and any working
+/// directory. Done while each layer is loaded (where its own directory is
+/// known) because the merged [`Config`] no longer remembers which file a
+/// value came from.
+///
+/// Only the program (first shell word) is touched, and only when it names
+/// a path: it contains a `/`, or starts with `~/`. Bare commands (`dbt`),
+/// wrappers (`uv run dbt`), absolute paths and `~user/...` are left as-is.
 fn anchor_dbt_command(command: &str, config_dir: &Path) -> String {
+    let config_dir = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+
     // The whole string naming one real file (e.g. a path with spaces) is a
     // single program, mirroring the dbt adapter's own command splitting.
     let whole = config_dir.join(command);
-    if !Path::new(command).is_absolute() && command.contains('/') && whole.is_file() {
+    if command.contains('/') && !Path::new(command).is_absolute() && whole.is_file() {
         return whole.display().to_string();
     }
+
     let Ok(mut words) = shell_words::split(command) else {
         return command.to_string();
     };
-    let Some(program) = words.first() else {
-        return command.to_string();
-    };
-    let mut resolved = if let Some(rest) = program.strip_prefix("~/") {
-        let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-        else {
-            return command.to_string();
-        };
-        words[0] = PathBuf::from(home).join(rest).display().to_string();
-        return shell_words::join(&words);
-    } else if !program.contains('/') || Path::new(program).is_absolute() {
-        return command.to_string();
-    } else {
-        config_dir.to_path_buf()
-    };
-    for component in Path::new(program).components() {
-        if !matches!(component, std::path::Component::CurDir) {
-            resolved.push(component);
+    let resolved = words
+        .first()
+        .and_then(|program| resolve_program_path(program, &config_dir));
+    match resolved {
+        Some(path) => {
+            words[0] = path.display().to_string();
+            shell_words::join(&words)
         }
+        None => command.to_string(),
     }
-    words[0] = resolved.display().to_string();
-    shell_words::join(&words)
+}
+
+/// The absolute path `program` should run as, or `None` when it should be
+/// left alone (see [`anchor_dbt_command`]).
+fn resolve_program_path(program: &str, config_dir: &Path) -> Option<PathBuf> {
+    if let Some(rest) = program.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        return Some(PathBuf::from(home).join(rest));
+    }
+    if program.starts_with('~') || !program.contains('/') || Path::new(program).is_absolute() {
+        return None;
+    }
+    // `./x` and `x` are the same place; skip the no-op `.` segments.
+    let mut resolved = config_dir.to_path_buf();
+    resolved.extend(
+        Path::new(program)
+            .components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir)),
+    );
+    Some(resolved)
 }
 
 /// Everything that can go wrong while reading and parsing `zhao.yml`.
@@ -1148,6 +1170,15 @@ mod tests {
             config.dbt_command(),
             Some(repo.project_dir.join("bin/mydbt").to_str().unwrap())
         );
+    }
+
+    #[test]
+    fn other_users_tilde_paths_are_left_untouched() {
+        let file = write_temp_yaml("dbt-command: \"~otheruser/bin/dbt\"\n");
+
+        let config = Config::load(file.path()).expect("should parse");
+
+        assert_eq!(config.dbt_command(), Some("~otheruser/bin/dbt"));
     }
 
     #[test]
