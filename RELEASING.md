@@ -59,6 +59,19 @@ safety.
    fine-grained PAT with Contents read/write on those two repos -- and fails with a clear error
    if it is missing (the GitHub Release itself is unaffected).
 
+6. On a stable tag, `release.yml`'s `publish-pypi` job also uploads the wheels built by
+   `wheels.yml` (maturin, per `pyproject.toml`) to [PyPI](https://pypi.org/project/zhao-cli/).
+   Wheels are built on every run, nightly included, and on PRs that touch the packaging, so
+   breaks surface early, but only stable tags publish. The version comes from `Cargo.toml`, so there's nothing extra to bump.
+   Publishing uses PyPI trusted publishing, so there's no token secret: PyPI is configured to
+   trust `allenhori/zhao-cli`'s `release.yml` running in the `pypi` GitHub environment. Like
+   crates.io, a published version is permanent (yankable, never reusable).
+
+   The wheel's binary is built with the `pypi` Cargo feature (`[tool.maturin] features`), which
+   makes `zhao update` refuse and point at `uv tool upgrade` / `pip install --upgrade` instead.
+   To try a wheel locally: `uvx maturin build --release --locked`, then install the file from
+   `target/wheels/` into a throwaway venv.
+
 Every release (stable and nightly) also carries a `SHA256SUMS` asset listing the SHA-256 of each
 archive. To verify a download: `sha256sum -c SHA256SUMS --ignore-missing` (Linux) or
 `shasum -a 256 -c SHA256SUMS --ignore-missing` (macOS), run next to the archive you downloaded.

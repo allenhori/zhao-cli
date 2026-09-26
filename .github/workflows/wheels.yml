@@ -1,0 +1,58 @@
+name: Wheels
+
+# Builds the PyPI wheels: the same `zhao` binary, packaged by maturin per
+# `pyproject.toml`. Called from release.yml (which publishes them on stable
+# tags); also runs on PRs that touch the packaging itself, so a broken
+# target shows up in review rather than at the next release.
+#
+# Linux aarch64 is here even though the GitHub Release doesn't carry it:
+# Python users routinely run on ARM Linux (Graviton CI, Docker on Apple
+# Silicon), and maturin-action cross-compiles it in a manylinux container.
+
+on:
+  workflow_call: {}
+  pull_request:
+    paths:
+      - pyproject.toml
+      - .github/workflows/wheels.yml
+
+jobs:
+  build:
+    name: Build wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # `manylinux: auto` builds Linux wheels inside a manylinux2014
+      # container, so they run on any glibc from 2.17 up rather than only
+      # on the runner's own newer glibc. Ignored on macOS/Windows.
+      - uses: PyO3/maturin-action@v1
+        env:
+          # The manylinux2014 aarch64 cross gcc is too old to define
+          # __ARM_ARCH itself, which `ring` (via ureq's TLS) needs to
+          # assemble. Only read when building that one target.
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: --release --locked --out wheels
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: wheel-${{ matrix.target }}
+          path: wheels/*.whl
+          if-no-files-found: error

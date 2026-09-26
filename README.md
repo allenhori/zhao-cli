@@ -63,6 +63,17 @@ scoop bucket add zhao https://github.com/allenhori/zhao-scoop
 scoop install zhao-cli
 ```
 
+**Python / dbt projects** — [PyPI](https://pypi.org/project/zhao-cli/), with
+[uv](https://docs.astral.sh/uv/) or pip:
+
+```bash
+uv tool install zhao-cli      # or: pip install zhao-cli
+```
+
+A pre-built binary in a wheel, no Rust toolchain needed. Handy for pinning zhao next to
+`dbt-core` in your project's own dependencies (`zhao-cli==0.5.5`), so local dev and CI get
+the same version.
+
 **Any platform** — the install script:
 
 ```bash
@@ -77,10 +88,10 @@ Windows without Scoop: grab `zhao-x86_64-pc-windows-msvc.zip` from the same page
 instead of the last tagged release.
 
 **Updating:** use the same tool you installed with — `brew upgrade zhao-cli`, `scoop update zhao-cli`,
-or `zhao update` for the install script / a manual download. `zhao update` detects a
-Homebrew- or Scoop-managed install and points you at the right command instead of touching the
-binary. Homebrew and Scoop only carry stable releases; the nightly build is install-script
-only.
+`uv tool upgrade zhao-cli` / `pip install --upgrade zhao-cli`, or `zhao update` for the install
+script / a manual download. `zhao update` detects a Homebrew-, Scoop- or pip/uv-managed install
+and points you at the right command instead of touching the binary. Homebrew, Scoop and PyPI
+only carry stable releases; the nightly build is install-script only.
 
 Two release channels: a tagged **stable** release (`v0.1.0`, ...) for anything you depend
 on, and a rolling **nightly** build off `master`, always available at the
@@ -112,7 +123,7 @@ this repository."* See **[Set up with an AI agent](docs/ai-setup.md)**.
 | `zhao check` | The CI gate — diffs against a Baseline, fails on a breaking change. |
 | `zhao diff` | Same engine, always exits `0` — for local inspection during development. |
 | `zhao lineage` | What's upstream/downstream of a model or column, right now (no diff, no git). |
-| `zhao update` | Replaces the current binary with a release from GitHub Releases (for Homebrew/Scoop installs it tells you to use `brew upgrade zhao-cli` / `scoop update zhao-cli` instead). The only command that reaches the network at all — and only to download the binary itself, never to send anything from your project. See [What it doesn't do](#what-it-doesnt-do). |
+| `zhao update` | Replaces the current binary with a release from GitHub Releases (for Homebrew, Scoop and pip/uv installs it tells you to use that tool's upgrade command instead). The only command that reaches the network at all — and only to download the binary itself, never to send anything from your project. See [What it doesn't do](#what-it-doesnt-do). |
 
 Full flag reference: **[docs/commands.md](docs/commands.md)**.
 

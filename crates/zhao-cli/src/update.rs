@@ -32,14 +32,20 @@ const EXIT_OK: u8 = 0;
 enum PackageManager {
     Homebrew,
     Scoop,
+    /// pip, uv, or any other installer of the PyPI wheel.
+    Pypi,
 }
 
 impl PackageManager {
-    /// The command a user should run instead of `zhao update`.
-    fn upgrade_command(&self) -> &'static str {
+    /// What a user should do instead of `zhao update`.
+    fn upgrade_instruction(&self) -> &'static str {
         match self {
-            PackageManager::Homebrew => "brew upgrade zhao-cli",
-            PackageManager::Scoop => "scoop update zhao-cli",
+            PackageManager::Homebrew => "run `brew upgrade zhao-cli`",
+            PackageManager::Scoop => "run `scoop update zhao-cli`",
+            PackageManager::Pypi => {
+                "run `uv tool upgrade zhao-cli` or `pip install --upgrade zhao-cli`, or bump the \
+                 version pinned in your project's dependencies"
+            }
         }
     }
 
@@ -47,8 +53,22 @@ impl PackageManager {
         match self {
             PackageManager::Homebrew => "Homebrew",
             PackageManager::Scoop => "Scoop",
+            PackageManager::Pypi => "pip/uv (PyPI)",
         }
     }
+}
+
+/// The package manager that owns the running binary, if any. A PyPI
+/// wheel's binary is marked at build time (maturin enables the `pypi`
+/// feature, see `pyproject.toml`) rather than detected from its path:
+/// pip and uv install into arbitrary virtualenvs and prefixes, and on
+/// Windows `uv tool` copies the exe into `~/.local/bin`, so no path
+/// pattern identifies them reliably.
+fn managing_package_manager(exe: &Path) -> Option<PackageManager> {
+    if cfg!(feature = "pypi") {
+        return Some(PackageManager::Pypi);
+    }
+    detect_package_manager(exe)
 }
 
 /// Detects whether `exe` lives inside a package manager's own install
@@ -87,12 +107,12 @@ pub fn run(args: &UpdateArgs) -> ExitCode {
     // symlink into the Cellar, so resolve it before looking at the path.
     if let Ok(exe) = std::env::current_exe() {
         let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
-        if let Some(manager) = detect_package_manager(&resolved) {
+        if let Some(manager) = managing_package_manager(&resolved) {
             return crate::engine::fail(&format!(
-                "zhao was installed by {}, which manages its updates -- run `{}` instead of \
-                 `zhao update`",
+                "zhao was installed by {}, which manages its updates -- instead of \
+                 `zhao update`, {}",
                 manager.name(),
-                manager.upgrade_command()
+                manager.upgrade_instruction()
             ));
         }
     }
