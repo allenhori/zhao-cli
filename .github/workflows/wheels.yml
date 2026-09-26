@@ -41,6 +41,11 @@ jobs:
       # container, so they run on any glibc from 2.17 up rather than only
       # on the runner's own newer glibc. Ignored on macOS/Windows.
       - uses: PyO3/maturin-action@v1
+        env:
+          # The manylinux2014 aarch64 cross gcc is too old to define
+          # __ARM_ARCH itself, which `ring` (via ureq's TLS) needs to
+          # assemble. Only read when building that one target.
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
         with:
           target: ${{ matrix.target }}
           manylinux: auto
