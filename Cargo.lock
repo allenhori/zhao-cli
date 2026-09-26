@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "zhao-cli"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "zhao-core"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "parquet",
  "serde",

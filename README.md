@@ -71,7 +71,7 @@ uv tool install zhao-cli      # or: pip install zhao-cli
 ```
 
 A pre-built binary in a wheel, no Rust toolchain needed. Handy for pinning zhao next to
-`dbt-core` in your project's own dependencies (`zhao-cli==0.5.5`), so local dev and CI get
+`dbt-core` in your project's own dependencies (e.g. `zhao-cli==X.Y.Z`), so local dev and CI get
 the same version.
 
 **Any platform** — the install script:
