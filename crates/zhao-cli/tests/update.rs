@@ -42,6 +42,7 @@ fn copy_zhao_binary_to_a_fresh_temp_file() -> tempfile::TempPath {
 /// than "latest," so this test's expectations don't drift as new
 /// stable releases are cut.
 #[test]
+#[cfg(not(feature = "pypi"))]
 fn update_to_a_pinned_version_replaces_the_binary() {
     let temp_copy = copy_zhao_binary_to_a_fresh_temp_file();
     let before = std::fs::read(&temp_copy).expect("should read the pre-update binary");
@@ -63,6 +64,7 @@ fn update_to_a_pinned_version_replaces_the_binary() {
 /// Acceptance criterion: a clear, actionable error when the requested
 /// tag doesn't exist -- and the existing binary is left untouched.
 #[test]
+#[cfg(not(feature = "pypi"))]
 fn update_to_a_nonexistent_tag_produces_a_clear_error_and_leaves_the_binary_untouched() {
     let temp_copy = copy_zhao_binary_to_a_fresh_temp_file();
     let before = std::fs::read(&temp_copy).expect("should read the pre-update binary");
@@ -95,4 +97,30 @@ fn nightly_and_a_version_argument_are_mutually_exclusive() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// A PyPI-wheel build (`pypi` feature) belongs to pip/uv: `zhao update`
+/// refuses before touching the network or the binary, and names the
+/// commands to use instead.
+#[test]
+#[cfg(feature = "pypi")]
+fn pypi_builds_refuse_to_self_update() {
+    let temp_copy = copy_zhao_binary_to_a_fresh_temp_file();
+    let before = std::fs::read(&temp_copy).expect("should read the pre-update binary");
+
+    Command::from_std(std::process::Command::new(&temp_copy))
+        .arg("update")
+        .assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("pip/uv (PyPI)")
+                .and(predicate::str::contains("uv tool upgrade zhao-cli"))
+                .and(predicate::str::contains("pip install --upgrade zhao-cli")),
+        );
+
+    let after = std::fs::read(&temp_copy).expect("should read the binary after the refusal");
+    assert_eq!(
+        before, after,
+        "a refused update should leave the binary untouched"
+    );
 }
