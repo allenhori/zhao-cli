@@ -5,7 +5,7 @@ name: Release
 #
 #   - Stable: triggered by pushing a `v*` tag (e.g. `v0.1.0`). Creates a
 #     permanent, semver-tagged GitHub Release. Never overwritten.
-#   - Nightly: triggered on a daily schedule (and manually, via
+#   - Nightly: triggered manually (daily schedule currently off), via
 #     workflow_dispatch) off `master`'s current tip. The `nightly` git tag
 #     is force-moved to that commit each run, and the "nightly" GitHub
 #     Release (marked as a prerelease) is updated in place -- always the
@@ -19,11 +19,8 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  schedule:
-    # 07:00 UTC daily. A schedule trigger always runs against the
-    # workflow file on the default branch, at that branch's current tip
-    # -- exactly the "latest master" semantics a nightly channel wants.
-    - cron: "0 7 * * *"
+  # The daily nightly schedule (cron "0 7 * * *") was removed because
+  # master isn't being updated. Re-add a `schedule:` trigger to resume it.
   workflow_dispatch: {}
 
 jobs:
