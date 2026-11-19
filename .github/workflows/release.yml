@@ -6,7 +6,7 @@ name: Release
 #   - Stable: triggered by pushing a `v*` tag (e.g. `v0.1.0`). Creates a
 #     permanent, semver-tagged GitHub Release. Never overwritten.
 #   - Nightly: triggered manually (daily schedule currently off), via
-#     workflow_dispatch) off `master`'s current tip. The `nightly` git tag
+#     workflow_dispatch, off `master`'s current tip. The `nightly` git tag
 #     is force-moved to that commit each run, and the "nightly" GitHub
 #     Release (marked as a prerelease) is updated in place -- always the
 #     latest buildable `master`, not a permanent artifact.
